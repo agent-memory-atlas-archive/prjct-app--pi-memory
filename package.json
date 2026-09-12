@@ -19,7 +19,8 @@
   "exports": {
     ".": "./index.ts",
     "./vector": "./src/vector/index.ts",
-    "./contracts": "./src/contracts/index.ts"
+    "./contracts": "./src/contracts/index.ts",
+    "./sources": "./src/sources/index.ts"
   },
   "scripts": {
     "build": "rm -rf build && mkdir -p build && npm pack --ignore-scripts --pack-destination build >/dev/null && tar -xzf build/*.tgz -C build --strip-components=1 && rm -f build/*.tgz",

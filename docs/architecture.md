@@ -134,10 +134,35 @@ the active agent. Staging is not memory and disappears with the session.
 reusable decision, correction, constraint, preference, failure, or procedure.
 Routine reads and progress are never automatically vectorized.
 
-`SourceAdapter` is the application-neutral ingress boundary. The built-in prjct
-adapter reads its observation records, and the pi-team adapter reads settled
-journal threads plus content-addressed artifacts. Both communicate through files
-and contracts, not package imports.
+`SourceAdapter` is the application-neutral ingress boundary, and the built-in
+sources are mappings over one generic adapter rather than a class per
+publisher. `JsonRecordAdapter` walks a tree of JSON or JSONL records and reads
+each through a `RecordMapping`: dot paths with `*` fan-out say where the id,
+text, title, timestamp and metadata live, rules derive the kind and trust from
+the record's own values, and `keep`/`drop` rules decide what is worth storing.
+Undeclared fields fall back to the conventional names, so an ordinary publisher
+needs no mapping and an unusual one needs configuration rather than code.
+
+Neither prjct nor pi-team is imported. The shared surface is the directory rule
+prjct publishes — `$PRJCT_HOME/teams/<id>/<component>`, which pi-team follows
+independently — and the `settings.json` marker each scope carries. Teams are
+discovered by reading those markers, which is also what binds a team's id to its
+name: the mailbox is keyed by name under the Pi agent directory while the
+artifact store is keyed by id under prjct's home, and taking them as separate
+arguments let a caller index one team's artifacts into another's scope.
+
+Every adapter declares the scope it belongs to and sync resolves an engine for
+that scope, so team knowledge is written to the team's projection. Retrieval
+filters on `scopeId`, so an adapter routed at the wrong engine would otherwise
+write rows that can never be returned; both the routing and the documents are
+checked, and a mismatch fails loudly.
+
+Two selections are deliberate rather than incidental. prjct records an
+observation per tool call, most of them routine reads, so only failures,
+verifications and explicit user statements are kept. pi-team's journal carries
+`message`, `thread`, `checkin` and `control` entries; only the settled `thread`
+and `checkin` are durable knowledge, and the turn-by-turn message traffic is
+narration. Both are rule sets a caller can replace.
 
 ## Consolidation and garbage collection
 

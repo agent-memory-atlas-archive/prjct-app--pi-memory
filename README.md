@@ -39,10 +39,67 @@ progress narration, secrets, or generic summaries.
 
 ```text
 /memory status
+/memory sources
+/memory sync [adapter]
 /memory replay
 /memory rebuild
 /memory gc
 ```
+
+## Sources
+
+`/memory sync` pulls in the siblings that publish into this machine's prjct
+home. Nothing is imported from them: the shared surface is the directory rule
+prjct publishes and the `settings.json` marker each scope carries.
+
+- **prjct observations** — the project's own observation stream.
+- **pi-team** — for every team discovered under `$PRJCT_HOME/teams/*/settings.json`,
+  the settled journal (from the mailbox under `$PI_CODING_AGENT_DIR/teams`) and
+  the content-addressed artifact store.
+
+Each adapter declares the scope it belongs to, and sync indexes it into that
+scope's own projection — team knowledge into the team, project observations into
+the project. Routing an adapter at the wrong scope is refused rather than
+silently writing rows retrieval can never return.
+
+Two selections are deliberate. prjct records an observation per tool call, so
+only failures, verifications and explicit user statements are kept; on a real
+machine that is 4 of 50. pi-team's journal carries `message`, `thread`,
+`checkin` and `control` entries, and only the settled `thread` and `checkin`
+become memory — the turn-by-turn traffic is narration.
+
+### Connecting anything else
+
+Sources are described, not coded. `JsonRecordAdapter` walks a tree of `.json`
+and `.jsonl` files and maps records with a `RecordMapping`; when a field is not
+declared it is found under the conventional names, so an ordinary publisher
+needs no mapping at all:
+
+```ts
+import { JsonRecordAdapter, SourceRegistry } from '@prjct.app/pi-memory/sources';
+
+const adapter = new JsonRecordAdapter({
+  id: 'my-source',
+  scope: { kind: 'project', id: projectId },
+  root: '/path/to/records',
+  mapping: {
+    namespace: 'my.source',
+    container: 'envelope.items',          // where records live inside a .json
+    id: ['ref'], text: ['blurb'], observedAt: ['when'],
+    kind: { rules: [{ when: [{ field: 'level', equals: 'high' }], kind: 'decision' }], fallback: 'note' },
+    trust: { from: 'level', when: { high: 'host' }, fallback: 'agent' },
+    metadata: { level: 'level' },
+    select: { keep: [{ field: 'level', oneOf: ['high', 'medium'] }] },
+  },
+});
+```
+
+Paths support nesting and `*` fan-out (`replies.*.state`). Timestamps are
+accepted as ISO strings, epoch seconds or epoch milliseconds. Selection is a
+rule set — `keep` is a disjunction, `drop` vetoes — so what a source contributes
+is configuration, not a code change. Pass extra adapters through
+`installMemory(pi, { extra: [...] })`, and override any built-in selection with
+`{ observations, teamJournal, mappings }`.
 
 ## One product, reusable vector layer
 
