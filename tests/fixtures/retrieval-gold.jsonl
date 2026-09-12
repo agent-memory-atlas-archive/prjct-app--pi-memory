@@ -1,0 +1,30 @@
+{"type":"document","id":"storage-sqlite","kind":"decision","text":"The project uses SQLite as its durable local database and single source of truth.","trust":"user"}
+{"type":"document","id":"storage-json","kind":"obsolete","text":"Old snapshots stored mutable state in large JSON files and caused quadratic disk growth.","trust":"host","validTo":"2025-12-31T00:00:00.000Z"}
+{"type":"document","id":"auth-oauth","kind":"failure","text":"OAuth token refresh fails when two login requests rotate the same refresh token concurrently.","trust":"host"}
+{"type":"document","id":"auth-cookie","kind":"procedure","text":"Browser sessions use secure HTTP-only cookies with same-site protection.","trust":"host"}
+{"type":"document","id":"release-policy","kind":"constraint","text":"Never push directly to protected branches; changes reach develop through a pull request.","trust":"user"}
+{"type":"document","id":"test-command","kind":"procedure","text":"Run npm run check, npm test, and npm pack --dry-run before review.","trust":"host"}
+{"type":"document","id":"memory-selective","kind":"decision","text":"Capture corrections, decisions, verified failures, and reusable evidence; do not memorize routine file reads.","trust":"user"}
+{"type":"document","id":"memory-temporal","kind":"decision","text":"Facts carry valid-at and invalid-at timestamps so historical answers do not overwrite current truth.","trust":"user"}
+{"type":"document","id":"team-mailbox","kind":"architecture","text":"Independent Pi sessions coordinate through a local append-only team mailbox journal.","trust":"host"}
+{"type":"document","id":"vector-local","kind":"architecture","text":"Semantic retrieval uses an offline multilingual sentence encoder and SQLite vector index.","trust":"host"}
+{"type":"document","id":"context-budget","kind":"constraint","text":"Retrieved context is bounded by bytes, diversified by source, and explicitly reports omitted candidates.","trust":"user"}
+{"type":"document","id":"gc-policy","kind":"procedure","text":"Garbage collection first removes rebuildable embeddings, obsolete chunks, and unreferenced projections while preserving supported evidence.","trust":"host"}
+{"type":"document","id":"ui-style","kind":"preference","text":"The interface uses high contrast typography and avoids decorative gradients.","trust":"user"}
+{"type":"document","id":"cache-invalidation","kind":"failure","text":"A stale cache survived file replacement because it was keyed only by modification time instead of inode, size, and timestamp.","trust":"host"}
+{"type":"document","id":"migration-safety","kind":"procedure","text":"Database schema migrations are additive, idempotent, and rebuild disposable indexes from the event journal.","trust":"host"}
+{"type":"query","query":"Which persistent database should we use?","expansions":["SQLite durable local storage single source of truth"],"positives":["storage-sqlite"]}
+{"type":"query","query":"¿Cuál es la fuente de verdad para almacenamiento local?","positives":["storage-sqlite"]}
+{"type":"query","query":"Why can concurrent sign-in renewal break?","positives":["auth-oauth"]}
+{"type":"query","query":"How are web sessions protected?","positives":["auth-cookie"]}
+{"type":"query","query":"Can the agent commit to main directly?","positives":["release-policy"]}
+{"type":"query","query":"What validation is required before code review?","positives":["test-command"]}
+{"type":"query","query":"Should every source-code read become long-term knowledge?","expansions":["capture routine file reads memory"],"positives":["memory-selective"]}
+{"type":"query","query":"How do we remember what was true in the past?","expansions":["temporal facts valid-at invalid-at historical truth"],"positives":["memory-temporal"]}
+{"type":"query","query":"How do separate agents communicate without a broker?","expansions":["independent Pi sessions local append-only mailbox journal"],"positives":["team-mailbox"]}
+{"type":"query","query":"Does semantic search require a hosted embeddings API?","positives":["vector-local"]}
+{"type":"query","query":"How do we prevent retrieved memories from consuming the prompt?","expansions":["bounded context bytes omitted candidates prompt"],"positives":["context-budget"]}
+{"type":"query","query":"What should disk cleanup discard first?","positives":["gc-policy"]}
+{"type":"query","query":"What visual appearance does the user prefer?","positives":["ui-style"]}
+{"type":"query","query":"Why did file cache invalidation return old content?","positives":["cache-invalidation"]}
+{"type":"query","query":"Can we reconstruct search state after corruption?","expansions":["rebuild disposable indexes from event journal migration"],"positives":["migration-safety"]}
