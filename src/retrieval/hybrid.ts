@@ -47,6 +47,7 @@ const jaccard = (a: Set<string>, b: Set<string>): number => {
   const union = new Set([...a, ...b]).size;
   return union ? intersection / union : 0;
 };
+const GRAPH_ITEM_SCORE = 0.01;
 const trustWeight = (trust: SourceDocument['trust']): number => ({ host: 1, user: 0.95, imported: 0.8, agent: 0.65 })[trust];
 
 const addRanking = (scores: Map<string, number>, reasons: Map<string, string[]>, ids: readonly string[], label: string, weight: number): void => {
@@ -119,17 +120,26 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
     return [{ item, tokenSet: tokens(chunk.text), fact }];
   }).sort((a, b) => b.item.score - a.item.score || a.item.id.localeCompare(b.item.id));
 
+  // Source capping only makes sense when there is more than one source to
+  // balance. Applied unconditionally it silently truncates every result set in a
+  // single-source scope to limit/3 items, which costs recall and buys nothing.
+  const sourceCount = new Set(ranked.map(candidate => candidate.item.source)).size;
+  const perSourceCap = sourceCount > 1 ? Math.max(2, Math.ceil(limit / 3)) : limit;
   const diverse = ranked.reduce<typeof ranked>((selected, candidate) => {
     if (selected.length >= limit) return selected;
     const redundancy = selected.reduce((highest, prior) => Math.max(highest, jaccard(candidate.tokenSet, prior.tokenSet)), 0);
     const sameSource = selected.filter(prior => prior.item.source === candidate.item.source).length;
-    return redundancy > 0.82 || sameSource >= Math.max(2, Math.ceil(limit / 3)) ? selected : [...selected, candidate];
+    return redundancy > 0.82 || sameSource >= perSourceCap ? selected : [...selected, candidate];
   }, []);
+  // Graph neighbours carry a fixed low score, so they have to clear the same
+  // threshold as everything else. Before, they were merged after the filter and
+  // a caller asking for high-confidence hits got them anyway.
   const factIds = diverse.flatMap(candidate => candidate.fact?.id ?? []);
-  const graph = projection.graphNeighbors(factIds, Math.min(6, limit)).filter(fact => factIsValidAt(fact, asOf));
+  const graph = GRAPH_ITEM_SCORE < threshold ? []
+    : projection.graphNeighbors(factIds, Math.min(6, limit)).filter(fact => factIsValidAt(fact, asOf));
   const graphItems: MemoryHit[] = graph.map((fact: StoredFact) => ({
     id: fact.id, chunkId: `graph:${fact.id}`, statement: fact.statement, namespace: 'memory', source: 'graph',
-    kind: fact.kind, score: 0.01, standing: fact.standing, ...(fact.validAt ? { validAt: fact.validAt } : {}),
+    kind: fact.kind, score: GRAPH_ITEM_SCORE, standing: fact.standing, ...(fact.validAt ? { validAt: fact.validAt } : {}),
     ...(fact.invalidAt ? { invalidAt: fact.invalidAt } : {}), provenance: fact.evidence.some(item => item.provenance === 'native_observation')
       ? 'native_observation' : fact.evidence.some(item => item.provenance === 'declared') ? 'declared' : 'agent_report',
     evidenceIds: fact.evidence.map(item => item.id), reason: ['temporal-graph'],

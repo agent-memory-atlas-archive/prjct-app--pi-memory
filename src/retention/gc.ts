@@ -9,7 +9,7 @@ export type GcPlan = Readonly<{
 }>;
 
 export const planGc = (engine: MemoryEngine, now = Date.now()): GcPlan => {
-  const documents = engine.projection.activeDocuments();
+  const documents = [...engine.projection.eachActiveDocument()];
   const candidates = new Set(engine.projection.gcCandidates(now));
   const assessments = engine.projection.activeFacts(engine.scopeId).map(fact => assessValue(fact, now));
   const protectedIds = new Set(assessments.filter(item => item.protected && item.score >= 35).map(item => item.id));

@@ -41,8 +41,12 @@ test('host tool results expose session-local evidence ids to the active agent', 
 test('memory tool results do not stage evidence and staged excerpts are redacted', async () => {
   const { runtime, handlers } = hookHarness();
   const ctx = { sessionManager: { getSessionId: () => 'session_1' } };
-  const memoryResult = await handlers.get('tool_result')!({ toolName: 'memory_context', toolCallId: 'call_0', isError: false, content: [] }, ctx);
-  assert.equal(memoryResult, undefined);
+  // Both memory tools must be excluded, not just the one that happened to be
+  // covered: memory_record is in the production condition too.
+  for (const toolName of ['memory_context', 'memory_record']) {
+    assert.equal(await handlers.get('tool_result')!({ toolName, toolCallId: 'call_0', isError: false, content: [] }, ctx), undefined);
+  }
+  assert.equal(runtime.stagedEvidence().size, 0);
   const patched = await handlers.get('tool_result')!({ toolName: 'bash', toolCallId: 'call_1', isError: true,
     content: [{ type: 'text', text: 'Authorization: Bearer abcdefghijklmnop' }] }, ctx);
   const id = (patched.content.at(-1).text as string).slice('[pi-memory evidence: '.length, -1);

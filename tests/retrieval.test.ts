@@ -31,6 +31,25 @@ test('hybrid retrieval beats lexical-only on cross-vocabulary cases without losi
   assert.equal(candidate.recallAtK, 1);
 });
 
+// Source diversity capped every result set at ceil(limit/3) even when every
+// document came from the same source, which is the normal case for a project
+// scope. Ten matching documents from one source must still fill a limit of ten.
+test('a single-source scope is not truncated by the source diversity cap', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-diversity-'));
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
+  const topics = ['sqlite', 'oauth', 'cache', 'deploy', 'search', 'memory', 'team', 'schema', 'vector', 'release'];
+  for (const topic of topics) {
+    const text = `The ${topic} decision was recorded for later retrieval.`;
+    await engine.index({ namespace: 'test', externalId: topic, scopeId: 'p_test', scopeKind: 'project',
+      source: 'fixture', kind: 'fact', text, version: sha256(text), contentHash: sha256(text),
+      observedAt: new Date().toISOString(), trust: 'host', metadata: {} });
+  }
+  const found = await engine.search({ queries: ['decision recorded retrieval'], dense: false, limit: 10, maxBytes: 32_768 });
+  assert.equal(new Set(found.items.map(item => item.source)).size, 1);
+  assert.equal(found.items.length, 10);
+});
+
 test('score thresholds filter automatic candidates without hiding ordinary lookup results', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-threshold-'));
   const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });

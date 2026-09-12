@@ -60,14 +60,27 @@ try {
   }
   const report = { bm25: metrics(lexical), hashing: metrics(hashing), fused: metrics(fused),
     candidateNoExpansion: metrics(candidateNoExpansion), candidate: metrics(candidate) };
-  const worstCases = cases.map((item, index) => ({ query: item.query, positive: item.positives[0],
-    candidateRank: candidate[index]!.findIndex(id => item.positives.includes(id)) + 1,
+  const worstCases = cases.map((item, index) => ({ query: item.query, positives: item.positives,
+    rank: candidateNoExpansion[index]!.findIndex(id => item.positives.includes(id)) + 1,
+    rankWithExpansions: candidate[index]!.findIndex(id => item.positives.includes(id)) + 1,
     fusedRank: fused[index]!.findIndex(id => item.positives.includes(id)) + 1,
-    top: candidate[index]!.slice(0, 3) })).filter(item => item.candidateRank !== 1);
-  const best = [report.bm25, report.hashing, report.fused].sort((a, b) => b.ndcgAt10 - a.ndcgAt10)[0]!;
-  const passed = report.candidate.ndcgAt10 >= best.ndcgAt10 * 1.2
-    && report.candidate.recallAt10 >= best.recallAt10 && report.candidate.mrr >= best.mrr;
-  console.log(JSON.stringify({ suite, corpus: docs.length, ...report, worstCases, gate: { passed, requiredNdcgAt10: best.ndcgAt10 * 1.2 } }, null, 2));
+    top: candidateNoExpansion[index]!.slice(0, 3) })).filter(item => item.rank !== 1);
+
+  // The gate measures candidateNoExpansion, not candidate. Expansions are
+  // written into the fixture by hand; scoring the system on them measures how
+  // well the fixture author paraphrased the answer, not how well retrieval
+  // works. Each baseline metric is the best any baseline achieved on that
+  // metric, so a baseline cannot hide a strong recall behind a weak nDCG.
+  const baselines = [report.bm25, report.hashing, report.fused];
+  const best = { ndcgAt10: Math.max(...baselines.map(item => item.ndcgAt10)),
+    recallAt10: Math.max(...baselines.map(item => item.recallAt10)), mrr: Math.max(...baselines.map(item => item.mrr)) };
+  const measured = report.candidateNoExpansion;
+  const passed = measured.ndcgAt10 >= best.ndcgAt10 * 1.2
+    && measured.recallAt10 >= best.recallAt10 && measured.mrr >= best.mrr;
+  console.log(JSON.stringify({ suite, corpus: docs.length, queries: cases.length, ...report, worstCases,
+    gate: { passed, measures: 'candidateNoExpansion', best, requiredNdcgAt10: Number((best.ndcgAt10 * 1.2).toFixed(4)),
+      actualNdcgAt10: Number(measured.ndcgAt10.toFixed(4)),
+      expansionLift: Number((report.candidate.ndcgAt10 - measured.ndcgAt10).toFixed(4)) } }, null, 2));
   if (!passed) process.exitCode = 1;
 } finally {
   await engine.dispose();

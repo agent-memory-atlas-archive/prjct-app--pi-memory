@@ -12,7 +12,9 @@
     "local-first"
   ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "exports": {
     ".": "./index.ts",
@@ -23,7 +25,7 @@
   "scripts": {
     "build": "rm -rf build && mkdir -p build && npm pack --ignore-scripts --pack-destination build >/dev/null && tar -xzf build/*.tgz -C build --strip-components=1 && rm -f build/*.tgz",
     "check": "tsc --noEmit && npm run check:immutable",
-    "check:immutable": "! grep -rn '\\blet\\b' src/ || (echo 'Use immutable values: no let bindings in src/' && exit 1)",
+    "check:immutable": "node --import tsx scripts/check-immutable.ts",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:integration": "node --import tsx --test tests/integration/*.test.ts",
     "eval": "node --import tsx scripts/eval.ts",

@@ -18,7 +18,13 @@ const textContent = (content: readonly unknown[]): string => content.flatMap(par
 
 const clip = (text: string, max = 2048): string => text.length <= max ? text : `${text.slice(0, max)}…`;
 
-export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string } = {}) => {
+// Score a candidate must reach before it is injected into the system prompt
+// unasked. Low enough to let a solid lexical-only match through, high enough to
+// keep a single weak signal out.
+export const DEFAULT_RECALL_THRESHOLD = 0.055;
+
+export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; recallThreshold?: number } = {}) => {
+  const recallThreshold = options.recallThreshold ?? DEFAULT_RECALL_THRESHOLD;
   const slot: { current: MemorySession } = { current: { prompt: '', evidence: new Map() } };
   const get = (): MemorySession => slot.current;
   const set = (update: Partial<MemorySession>): MemorySession => (slot.current = { ...slot.current, ...update });
@@ -26,7 +32,8 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string } 
     const current = get();
     if (current.engine) return current.engine;
     if (!current.ctx) throw new Error('Memory session has not started.');
-    const pending = MemoryEngine.forProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(), options);
+    const pending = MemoryEngine.forProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(),
+      options.home === undefined ? {} : { home: options.home });
     set({ engine: pending });
     return pending;
   };
@@ -37,7 +44,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string } 
 
   pi.on('before_agent_start', async (event, ctx) => {
     set({ ctx, prompt: event.prompt });
-    const recalled = await engine().then(memory => memory.search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: 0.055 })).catch(() => undefined);
+    const recalled = await engine().then(memory => memory.search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: recallThreshold })).catch(() => undefined);
     const highConfidence = recalled?.items.slice(0, 4) ?? [];
     const memoryBlock = highConfidence.length
       ? `\n\nRetained memory candidates for this turn (the active agent must rerank and verify them):\n${highConfidence.map(item =>

@@ -24,6 +24,7 @@ export class EmbeddingUnavailableError extends Error {
 export interface VectorIndex {
   readonly provider: EmbeddingProvider;
   upsert(document: SourceDocument, signal?: AbortSignal): Promise<{ chunks: number; embedded: number }>;
+  upsertAll(documents: readonly SourceDocument[], signal?: AbortSignal): Promise<{ chunks: number; embedded: number }>;
   remove(namespace: string, externalId: string): void;
   search(query: VectorQuery): Promise<VectorSearchHit[]>;
   backfill(signal?: AbortSignal): Promise<number>;
@@ -44,7 +45,7 @@ export class SqliteVectorIndex implements VectorIndex {
   async upsert(document: SourceDocument, signal?: AbortSignal): Promise<{ chunks: number; embedded: number }> {
     assertSourceDocument(document);
     signal?.throwIfAborted();
-    const existing = this.projection.activeDocuments().find(item => item.namespace === document.namespace && item.externalId === document.externalId);
+    const existing = this.projection.documentByKey(document);
     if (!existing || existing.contentHash !== document.contentHash || existing.version !== document.version) this.projection.upsertDocument(document);
     const chunks = chunkDocument(document, this.chunkOptions);
     // The lexical index is committed before optional model work. If the local
@@ -56,6 +57,35 @@ export class SqliteVectorIndex implements VectorIndex {
     if (vectors.length !== chunks.length) throw new EmbeddingUnavailableError('Provider returned an incomplete batch.');
     this.projection.storeVectors(chunks.map((chunk, index) => ({ chunkId: chunk.id, vector: vectors[index]! })), this.provider.model);
     return { chunks: chunks.length, embedded: vectors.length };
+  }
+
+  // Same work as upsert() but with one projection transaction for the whole run
+  // and provider batches of 64, so a bulk ingest pays neither a transaction nor
+  // a model round-trip per document.
+  async upsertAll(documents: readonly SourceDocument[], signal?: AbortSignal): Promise<{ chunks: number; embedded: number }> {
+    if (!documents.length) return { chunks: 0, embedded: 0 };
+    for (const document of documents) assertSourceDocument(document);
+    signal?.throwIfAborted();
+    this.projection.transaction(() => {
+      for (const document of documents) {
+        const existing = this.projection.documentByKey(document);
+        if (!existing || existing.contentHash !== document.contentHash || existing.version !== document.version) this.projection.upsertDocument(document);
+      }
+    });
+    const chunks = documents.flatMap(document => chunkDocument(document, this.chunkOptions));
+    const titles = new Map(documents.flatMap(document => document.title ? [[documentKey(document), document.title] as const] : []));
+    this.projection.replaceChunksBatch(chunks, titles);
+    const batches = Array.from({ length: Math.ceil(chunks.length / 64) }, (_, index) => chunks.slice(index * 64, (index + 1) * 64));
+    const progress = { embedded: 0 };
+    for (const batch of batches) {
+      signal?.throwIfAborted();
+      const vectors = await this.provider.embed(batch.map(chunk => chunk.text), { signal, inputType: 'passage' })
+        .catch(error => { throw new EmbeddingUnavailableError(error); });
+      if (vectors.length !== batch.length) throw new EmbeddingUnavailableError('Provider returned an incomplete batch.');
+      this.projection.storeVectors(batch.map((chunk, index) => ({ chunkId: chunk.id, vector: vectors[index]! })), this.provider.model);
+      progress.embedded += batch.length;
+    }
+    return { chunks: chunks.length, embedded: progress.embedded };
   }
 
   remove(namespace: string, externalId: string): void {

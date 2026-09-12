@@ -48,6 +48,9 @@ export const migrate = (db: DatabaseSync): void => {
     );
     CREATE INDEX IF NOT EXISTS ix_documents_scope ON documents(scope_id, namespace, kind) WHERE deleted_at IS NULL;
     CREATE INDEX IF NOT EXISTS ix_documents_hash ON documents(content_hash) WHERE deleted_at IS NULL;
+    -- UNIQUE(namespace, external_id) cannot serve a lookup on external_id alone,
+    -- which left exactSearch scanning the whole table on every query.
+    CREATE INDEX IF NOT EXISTS ix_documents_external ON documents(external_id) WHERE deleted_at IS NULL;
 
     CREATE TABLE IF NOT EXISTS chunks (
       id TEXT PRIMARY KEY,

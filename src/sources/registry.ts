@@ -22,7 +22,7 @@ export class SourceRegistry {
     const adapter = this.adapters.get(id);
     if (!adapter) throw new Error(`Unknown source adapter: ${id}`);
     const documents = await adapter.scan(signal);
-    const current = new Map(engine.projection.activeDocuments().map(document => [documentKey(document), document.contentHash]));
+    const current = new Map([...engine.projection.eachDocumentHash()].map(row => [row.documentKey, row.contentHash]));
     const changed = documents.filter(document => current.get(documentKey(document)) !== document.contentHash);
     const results = [] as Array<{ dense: boolean }>;
     for (const document of changed) results.push(await engine.index(document, signal));

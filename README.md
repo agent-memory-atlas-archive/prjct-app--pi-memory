@@ -87,15 +87,37 @@ npm run check
 npm test
 npm run test:integration
 npm run eval -- --suite tests/fixtures/retrieval-gold.jsonl
-npm run bench -- --documents 100000 --queries 1000
+npm run bench -- --documents 5000 --queries 1000
 npm pack --dry-run --ignore-scripts
 
-# Real Pi load smoke test, without calling an LLM provider.
+# Real Pi load smoke test. /memory status is a slash command, so no provider is
+# called; note the "id" field, which the RPC response is matched on.
 PRJCT_HOME=$(mktemp -d) pi --mode rpc --no-session --no-extensions -e ./index.ts <<'EOF'
-{"type":"prompt","message":"/memory status"}
+{"id":"memory","type":"prompt","message":"/memory status"}
 EOF
 ```
 
 The evaluation gate requires at least 20% relative nDCG@10 improvement over the
-best BM25, feature-hash, or old-style RRF baseline without Recall@10 or MRR
-regression.
+best BM25, feature-hash, or old-style RRF baseline, with no Recall@10 or MRR
+regression. It scores the system **without** the fixture's hand-written query
+expansions; see [Architecture](docs/architecture.md) for why.
+
+### Measured on an M-series laptop
+
+At 5,000 documents (10,000 chunks) of ~1.1 KB prose, with a deterministic
+stand-in encoder:
+
+| | |
+|---|---|
+| ingest, `index()` one at a time | ~185 documents/s |
+| ingest, `indexAll()` in batches | ~2,300 documents/s |
+| KNN p95 | ~1.3 ms |
+| whole hybrid query p50 | ~33 ms |
+| resting size | ~5.3 KB per chunk |
+
+Single-document ingest is bounded by one `fsync` per journal entry (~3.8 ms),
+which is the durability guarantee, not overhead to be optimized away.
+`indexAll()` trades it for one `fsync` per batch: a crash can lose the tail of a
+run, which is then re-ingested. Use `index()` when a single write has to survive
+on its own. Real encoder inference is not included in these figures and will
+dominate them.

@@ -147,19 +147,40 @@ replay or rebuild.
 
 ## Quality gates
 
-The gold suite covers paraphrases, bilingual queries, temporal policy, failures,
-constraints, and query expansion. Every retrieval change is compared on the same
-corpus against BM25, the former feature-hash semantic leg, old-style RRF, and
-the current dense index without agent-authored expansions. Acceptance requires
-at least +20% relative nDCG@10 over the best baseline with no Recall@10 or MRR
-regression. The suite is intentionally deterministic and is a regression gate,
-not proof of broad retrieval quality; it must grow with observed production
-failures.
+The gold suite is 113 documents and 42 queries. Documents are grouped into
+topic clusters so that most of a cluster is a *distractor* sharing the target's
+vocabulary, and several queries carry more than one correct answer. It covers
+paraphrases, a bilingual query, temporal policy, failures and constraints.
 
-The synthetic warm-index benchmark reports write time, p50/p95 KNN latency, and
-bytes per chunk at 100,000 chunks and 1,000 queries. Cold model download and
-provider network time are deliberately reported separately from SQLite query
-latency.
+The gate scores `candidateNoExpansion` — the system given only the user's query
+— against the best score any baseline achieved on each metric, where the
+baselines are BM25, the former feature-hash semantic leg, and old-style RRF.
+Acceptance requires at least +20% relative nDCG@10 with no Recall@10 or MRR
+regression.
+
+Scoring the no-expansion run is deliberate. Query expansions in the fixture are
+written by hand, so a gate that scores the run *with* them measures how closely
+the fixture author paraphrased the answer. An earlier version of this suite did
+exactly that and reported nDCG@10 = 1.0000; its expansions repeated the target
+document nearly verbatim, and the system scored 0.8216 without them against a
+0.8623 bar. The current expansions restate the *question*, never the answer, and
+are worth about +0.007 — which is roughly what an honest expansion is worth on a
+corpus this size.
+
+The suite is a regression gate, not proof of broad retrieval quality. 42 queries
+over 113 documents is small; it must grow with observed production failures.
+
+The benchmark drives the real ingest path (`MemoryEngine.index` and
+`indexAll`) over ~1.1 KB documents, with a deterministic stand-in encoder that
+gives every chunk a distinct vector. It reports single-document and batched
+ingest separately, KNN latency, whole-query latency, and bytes per chunk.
+Encoder inference is deliberately near-free so the throughput figure is the cost
+of the storage path; a real local encoder is orders of magnitude slower and
+would dominate, so model time is measured separately and never folded in.
+
+An earlier benchmark bypassed the engine, wrote through projection methods that
+nothing else used, and stored the identical one-hot vector for all 100,000
+chunks against 22-byte documents. Its numbers described none of the above.
 
 ## Boundaries
 

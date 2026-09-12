@@ -1,6 +1,6 @@
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
-import { mkdirSync, rmSync, renameSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
+import { mkdirSync, readdirSync, rmSync, renameSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import type { DocumentChunk, SourceDocument } from '../contracts/documents.ts';
 import { documentKey } from '../contracts/documents.ts';
@@ -14,6 +14,16 @@ export type LexicalHit = Readonly<{ chunkId: string; documentKey: string; score:
 export type VectorHit = Readonly<{ chunkId: string; documentKey: string; distance: number }>;
 export type StoredFact = TemporalFact & Readonly<{ usefulness: number }>;
 
+// Longest query still treated as a possible literal by exactSearch. Above this
+// a query is prose, and prose is the lexical and dense legs' job.
+const EXACT_SCAN_MAX_CHARS = 64;
+const PAGE_SIZE = 1_000;
+const MAX_PAGE_SIZE = 10_000;
+// Cap on rows pulled for one fact's evidence, entities or episodes.
+const RELATION_LIMIT = 256;
+const DOCUMENT_COLUMNS = 'document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,'
+  + ' version, content_hash, observed_at, valid_from, valid_to, trust, metadata';
+
 type Row = Record<string, SQLInputValue>;
 const json = (value: unknown): string => JSON.stringify(value);
 const parse = <T>(value: unknown, fallback: T): T => {
@@ -24,22 +34,62 @@ const iso = (value: unknown): string | undefined => typeof value === 'number' &&
 const vectorBlob = (vector: readonly number[]): Uint8Array => new Uint8Array(Float32Array.from(vector).buffer);
 const tableNameFor = (model: string, dims: number): string => `vec_${sha256(`${model}\u0000${dims}`).slice(0, 16)}`;
 
+const documentFromRow = (row: Row, text: string): SourceDocument => ({
+  namespace: String(row.namespace), externalId: String(row.external_id), scopeId: String(row.scope_id),
+  scopeKind: String(row.scope_kind) as SourceDocument['scopeKind'], source: String(row.source), kind: String(row.kind),
+  ...(row.title ? { title: String(row.title) } : {}), text, ...(row.uri ? { uri: String(row.uri) } : {}),
+  version: String(row.version), contentHash: String(row.content_hash), observedAt: new Date(Number(row.observed_at)).toISOString(),
+  ...(iso(row.valid_from) ? { validFrom: iso(row.valid_from)! } : {}), ...(iso(row.valid_to) ? { validTo: iso(row.valid_to)! } : {}),
+  trust: String(row.trust) as SourceDocument['trust'], metadata: parse<Record<string, string>>(row.metadata, {}),
+});
+
 export class Projection {
   readonly path: string;
   readonly db: DatabaseSync;
+  private depth = 0;
+  private readonly statements = new Map<string, StatementSync>();
 
   constructor(path: string) {
     this.path = path;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path, { allowExtension: true });
-    sqliteVec.load(this.db);
-    migrate(this.db);
+    try {
+      sqliteVec.load(this.db);
+      migrate(this.db);
+    } catch (error) {
+      // Opening leaves an fd and a file lock held; migrate() rejects a schema
+      // from a newer build, and that rejection must not leak the handle.
+      this.db.close();
+      throw error;
+    }
   }
 
-  close(): void { this.db.close(); }
+  // Compiling a statement costs ~11 µs, which is several times the cost of
+  // running a point lookup. Every query here has a fixed SQL shape, so they are
+  // compiled once per connection and reused.
+  private stmt(sql: string): StatementSync {
+    const cached = this.statements.get(sql);
+    if (cached) return cached;
+    const prepared = this.db.prepare(sql);
+    this.statements.set(sql, prepared);
+    return prepared;
+  }
 
+  close(): void {
+    this.statements.clear();
+    this.db.close();
+  }
+
+  // Re-entrant: a batch caller can wrap many apply() calls, each of which opens
+  // its own logical transaction, in one physical transaction. The outermost
+  // scope owns the commit, so an inner failure still rolls the whole run back.
   transaction<T>(action: () => T): T {
+    if (this.depth > 0) {
+      this.depth += 1;
+      try { return action(); } finally { this.depth -= 1; }
+    }
     this.db.exec('BEGIN IMMEDIATE');
+    this.depth = 1;
     try {
       const result = action();
       this.db.exec('COMMIT');
@@ -47,11 +97,13 @@ export class Projection {
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
+    } finally {
+      this.depth = 0;
     }
   }
 
   hasEvent(id: string): boolean {
-    return Boolean(this.db.prepare('SELECT 1 FROM applied_events WHERE id = ?').get(id));
+    return Boolean(this.stmt('SELECT 1 FROM applied_events WHERE id = ?').get(id));
   }
 
   apply(event: MemoryEvent): boolean {
@@ -68,21 +120,15 @@ export class Projection {
       if (payload.type === 'gc.compacted') {
         for (const key of payload.removed) this.deleteDocumentKey(key, event.recordedAt);
       }
-      this.db.prepare('INSERT INTO applied_events(id, event_hash, recorded_at) VALUES (?, ?, ?)')
+      this.stmt('INSERT INTO applied_events(id, event_hash, recorded_at) VALUES (?, ?, ?)')
         .run(event.id, event.eventHash, Date.parse(event.recordedAt));
       return true;
     });
   }
 
-  upsertDocuments(documents: readonly SourceDocument[]): void {
-    this.transaction(() => {
-      for (const document of documents) this.upsertDocument(document);
-    });
-  }
-
   upsertDocument(document: SourceDocument): void {
     const key = documentKey(document);
-    this.db.prepare(`INSERT INTO documents(
+    this.stmt(`INSERT INTO documents(
       document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,
       version, content_hash, observed_at, valid_from, valid_to, trust, metadata, deleted_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
@@ -104,7 +150,7 @@ export class Projection {
 
   private deleteDocumentKey(key: string, at: string): void {
     this.deleteChunksForDocument(key);
-    this.db.prepare('UPDATE documents SET deleted_at = ? WHERE document_key = ?').run(Date.parse(at), key);
+    this.stmt('UPDATE documents SET deleted_at = ? WHERE document_key = ?').run(Date.parse(at), key);
   }
 
   replaceChunks(key: string, chunks: readonly DocumentChunk[], title?: string): void {
@@ -115,8 +161,8 @@ export class Projection {
     this.transaction(() => {
       const keys = [...new Set(chunks.map(chunk => chunk.documentKey))];
       for (const key of keys) this.deleteChunksForDocument(key);
-      const insert = this.db.prepare('INSERT INTO chunks(id, document_key, namespace, ordinal, title, text, content_hash, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-      const insertFts = this.db.prepare('INSERT INTO chunks_fts(chunk_id, title, text, metadata) VALUES (?, ?, ?, ?)');
+      const insert = this.stmt('INSERT INTO chunks(id, document_key, namespace, ordinal, title, text, content_hash, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+      const insertFts = this.stmt('INSERT INTO chunks_fts(chunk_id, title, text, metadata) VALUES (?, ?, ?, ?)');
       for (const chunk of chunks) {
         const title = titles?.get(chunk.documentKey);
         insert.run(chunk.id, chunk.documentKey, chunk.namespace, chunk.ordinal, title ?? null, chunk.text, chunk.contentHash, json(chunk.metadata));
@@ -126,15 +172,15 @@ export class Projection {
   }
 
   private deleteChunksForDocument(key: string): void {
-    const ids = this.db.prepare('SELECT id FROM chunks WHERE document_key = ?').all(key).map(row => String((row as Row).id));
+    const ids = this.stmt('SELECT id FROM chunks WHERE document_key = ? LIMIT ?').all(key, MAX_PAGE_SIZE).map(row => String((row as Row).id));
     for (const id of ids) this.deleteVectorForChunk(id);
-    const removeFts = this.db.prepare('DELETE FROM chunks_fts WHERE chunk_id = ?');
+    const removeFts = this.stmt('DELETE FROM chunks_fts WHERE chunk_id = ?');
     for (const id of ids) removeFts.run(id);
-    this.db.prepare('DELETE FROM chunks WHERE document_key = ?').run(key);
+    this.stmt('DELETE FROM chunks WHERE document_key = ?').run(key);
   }
 
   private insertEvidence(evidence: EvidenceRef): void {
-    this.db.prepare(`INSERT INTO evidence(id, origin, provenance, uri, content_hash, excerpt, observed_at, actor_id, session_id, tool_call_id)
+    this.stmt(`INSERT INTO evidence(id, origin, provenance, uri, content_hash, excerpt, observed_at, actor_id, session_id, tool_call_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING`).run(evidence.id, evidence.origin, evidence.provenance, evidence.uri ?? null,
       evidence.contentHash, evidence.excerpt, Date.parse(evidence.observedAt), evidence.actorId ?? null,
@@ -142,18 +188,18 @@ export class Projection {
   }
 
   private insertEpisode(episode: Episode): void {
-    this.db.prepare(`INSERT INTO episodes(id, scope_id, kind, summary, observed_at, actor_id, session_id, source)
+    this.stmt(`INSERT INTO episodes(id, scope_id, kind, summary, observed_at, actor_id, session_id, source)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
       .run(episode.id, episode.scopeId, episode.kind, episode.summary, Date.parse(episode.observedAt),
         episode.actorId ?? null, episode.sessionId ?? null, episode.source);
     for (const evidence of episode.evidence) {
       this.insertEvidence(evidence);
-      this.db.prepare('INSERT OR IGNORE INTO episode_evidence(episode_id, evidence_id) VALUES (?, ?)').run(episode.id, evidence.id);
+      this.stmt('INSERT OR IGNORE INTO episode_evidence(episode_id, evidence_id) VALUES (?, ?)').run(episode.id, evidence.id);
     }
   }
 
   private insertEntity(entity: Entity): void {
-    this.db.prepare(`INSERT INTO entities(id, scope_id, name, type, aliases, summary) VALUES (?, ?, ?, ?, ?, ?)
+    this.stmt(`INSERT INTO entities(id, scope_id, name, type, aliases, summary) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, aliases=excluded.aliases,
       summary=COALESCE(excluded.summary, entities.summary)`)
       .run(entity.id, entity.scopeId, entity.name, entity.type, json(entity.aliases), entity.summary ?? null);
@@ -167,7 +213,7 @@ export class Projection {
       ...(fact.validAt ? { validFrom: fact.validAt } : {}), ...(fact.invalidAt ? { validTo: fact.invalidAt } : {}),
       trust: fact.evidence.some(item => item.provenance === 'native_observation') ? 'host'
         : fact.evidence.some(item => item.provenance === 'declared') ? 'user' : 'agent', metadata: fact.tags });
-    this.db.prepare(`INSERT INTO facts(id, scope_id, kind, statement, subject, predicate, object, standing,
+    this.stmt(`INSERT INTO facts(id, scope_id, kind, statement, subject, predicate, object, standing,
       confidence, valid_at, invalid_at, recorded_at, expired_at, tags, replacement_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
       ON CONFLICT(id) DO NOTHING`).run(fact.id, fact.scopeId, fact.kind, fact.statement,
@@ -175,31 +221,31 @@ export class Projection {
       millis(fact.validAt), millis(fact.invalidAt), Date.parse(fact.recordedAt), millis(fact.expiredAt), json(fact.tags));
     for (const evidence of fact.evidence) {
       this.insertEvidence(evidence);
-      this.db.prepare('INSERT OR IGNORE INTO fact_evidence(fact_id, evidence_id) VALUES (?, ?)').run(fact.id, evidence.id);
+      this.stmt('INSERT OR IGNORE INTO fact_evidence(fact_id, evidence_id) VALUES (?, ?)').run(fact.id, evidence.id);
     }
     for (const entity of fact.entities) {
       this.insertEntity(entity);
-      this.db.prepare('INSERT OR IGNORE INTO fact_entities(fact_id, entity_id) VALUES (?, ?)').run(fact.id, entity.id);
+      this.stmt('INSERT OR IGNORE INTO fact_entities(fact_id, entity_id) VALUES (?, ?)').run(fact.id, entity.id);
     }
-    for (const episodeId of fact.episodeIds) this.db.prepare('INSERT OR IGNORE INTO fact_episodes(fact_id, episode_id) VALUES (?, ?)').run(fact.id, episodeId);
+    for (const episodeId of fact.episodeIds) this.stmt('INSERT OR IGNORE INTO fact_episodes(fact_id, episode_id) VALUES (?, ?)').run(fact.id, episodeId);
     for (const replaced of fact.supersedes ?? []) {
-      this.db.prepare("INSERT OR IGNORE INTO fact_links(from_fact_id, to_fact_id, relation) VALUES (?, ?, 'supersedes')").run(fact.id, replaced);
+      this.stmt("INSERT OR IGNORE INTO fact_links(from_fact_id, to_fact_id, relation) VALUES (?, ?, 'supersedes')").run(fact.id, replaced);
       this.resolveFact(replaced, 'superseded', fact.id, fact.recordedAt);
     }
   }
 
   private resolveFact(id: string, standing: MemoryStanding, replacementId: string | undefined, at: string): void {
     const terminal = ['superseded', 'contradicted'].includes(standing);
-    this.db.prepare(`UPDATE facts SET standing = ?, replacement_id = ?, expired_at = ?,
+    this.stmt(`UPDATE facts SET standing = ?, replacement_id = ?, expired_at = ?,
       invalid_at = CASE WHEN ?=1 AND (invalid_at IS NULL OR invalid_at > ?) THEN ? ELSE invalid_at END WHERE id = ?`)
       .run(standing, replacementId ?? null, terminal ? Date.parse(at) : null,
         terminal ? 1 : 0, Date.parse(at), Date.parse(at), id);
-    if (replacementId) this.db.prepare("INSERT OR IGNORE INTO fact_links(from_fact_id, to_fact_id, relation) VALUES (?, ?, 'resolves')").run(replacementId, id);
+    if (replacementId) this.stmt("INSERT OR IGNORE INTO fact_links(from_fact_id, to_fact_id, relation) VALUES (?, ?, 'resolves')").run(replacementId, id);
   }
 
   private feedback(id: string, signal: 'used' | 'helpful' | 'wrong' | 'stale', at: string): void {
     const column = signal;
-    this.db.prepare(`INSERT INTO usefulness(fact_id, ${column}, last_signal_at) VALUES (?, 1, ?)
+    this.stmt(`INSERT INTO usefulness(fact_id, ${column}, last_signal_at) VALUES (?, 1, ?)
       ON CONFLICT(fact_id) DO UPDATE SET ${column}=${column}+1, last_signal_at=excluded.last_signal_at`)
       .run(id, Date.parse(at));
   }
@@ -211,7 +257,7 @@ export class Projection {
     // Unit-normalized provider vectors are scalar-quantized by sqlite-vec to
     // int8: four times less disk and memory than float32 with the same shape.
     this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${table} USING vec0(embedding int8[${dims}])`);
-    this.db.prepare(`INSERT INTO vector_collections(model_key, model, dims, table_name, created_at, active)
+    this.stmt(`INSERT INTO vector_collections(model_key, model, dims, table_name, created_at, active)
       VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(model_key) DO UPDATE SET active=1`)
       .run(key, model, dims, table, Date.now());
     return { key, table };
@@ -228,10 +274,10 @@ export class Projection {
     if (rows.some(row => row.vector.some(value => !Number.isFinite(value)))) throw new Error('Embedding vectors must be finite.');
     const collection = this.ensureVectorCollection(model, dims);
     this.transaction(() => {
-      const find = this.db.prepare('SELECT rowid FROM vector_map WHERE chunk_id = ? AND model_key = ?');
-      const addMap = this.db.prepare('INSERT INTO vector_map(chunk_id, model_key) VALUES (?, ?)');
-      const addVector = this.db.prepare(`INSERT INTO ${collection.table}(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))`);
-      const removeVector = this.db.prepare(`DELETE FROM ${collection.table} WHERE rowid = ?`);
+      const find = this.stmt('SELECT rowid FROM vector_map WHERE chunk_id = ? AND model_key = ?');
+      const addMap = this.stmt('INSERT INTO vector_map(chunk_id, model_key) VALUES (?, ?)');
+      const addVector = this.stmt(`INSERT INTO ${collection.table}(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))`);
+      const removeVector = this.stmt(`DELETE FROM ${collection.table} WHERE rowid = ?`);
       for (const item of rows) {
         const prior = find.get(item.chunkId, collection.key) as Row | undefined;
         if (prior) removeVector.run(prior.rowid!);
@@ -245,63 +291,97 @@ export class Projection {
   }
 
   private deleteVectorForChunk(chunkId: string): void {
-    const rows = this.db.prepare(`SELECT vm.rowid, vc.table_name FROM vector_map vm
-      JOIN vector_collections vc ON vc.model_key=vm.model_key WHERE vm.chunk_id=?`).all(chunkId) as Row[];
-    for (const row of rows) this.db.prepare(`DELETE FROM ${String(row.table_name)} WHERE rowid = ?`).run(row.rowid!);
-    this.db.prepare('DELETE FROM vector_map WHERE chunk_id = ?').run(chunkId);
+    const rows = this.stmt(`SELECT vm.rowid, vc.table_name FROM vector_map vm
+      JOIN vector_collections vc ON vc.model_key=vm.model_key WHERE vm.chunk_id=? LIMIT ?`).all(chunkId, RELATION_LIMIT) as Row[];
+    for (const row of rows) this.stmt(`DELETE FROM ${String(row.table_name)} WHERE rowid = ?`).run(row.rowid!);
+    this.stmt('DELETE FROM vector_map WHERE chunk_id = ?').run(chunkId);
   }
 
+  // None of the three search legs joins `documents` any more. Soft-deleting a
+  // document runs deleteChunksForDocument, which physically removes its chunks,
+  // its FTS rows and its vectors — so a `d.deleted_at IS NULL` filter could
+  // never exclude anything, and the join was pure cost: four tables deep on the
+  // dense leg, three on the lexical one.
   vectorSearch(model: string, dims: number, vector: readonly number[], limit: number): VectorHit[] {
     if (vector.some(value => !Number.isFinite(value))) throw new Error('Embedding query must be finite.');
     const collection = this.ensureVectorCollection(model, dims);
-    const rows = this.db.prepare(`SELECT v.rowid, v.distance, vm.chunk_id, c.document_key
+    const rows = this.stmt(`SELECT v.distance, vm.chunk_id, c.document_key
       FROM ${collection.table} v
       JOIN vector_map vm ON vm.rowid=v.rowid AND vm.model_key=?
       JOIN chunks c ON c.id=vm.chunk_id
-      JOIN documents d ON d.document_key=c.document_key
-      WHERE v.embedding MATCH vec_quantize_int8(?, 'unit') AND k=? AND d.deleted_at IS NULL
+      WHERE v.embedding MATCH vec_quantize_int8(?, 'unit') AND k=?
       ORDER BY v.distance`).all(collection.key, vectorBlob(vector), Math.max(1, Math.min(1000, limit))) as Row[];
     return rows.map(row => ({ chunkId: String(row.chunk_id), documentKey: String(row.document_key), distance: Number(row.distance) }));
   }
 
+  // Ranking happens inside a subquery over chunks_fts alone. Scoring the match
+  // set after joining chunks made SQLite bm25-score and sort every joined row
+  // before applying the limit.
   lexicalSearch(query: string, limit: number): LexicalHit[] {
     const tokens = query.toLocaleLowerCase().match(/[\p{L}\p{N}_./:-]{2,}/gu) ?? [];
     if (!tokens.length) return [];
     const expression = [...new Set(tokens.slice(0, 24))].map(token => `"${token.replaceAll('"', '""')}"`).join(' OR ');
-    const rows = this.db.prepare(`SELECT f.chunk_id, c.document_key, bm25(chunks_fts, 8.0, 2.0, 1.0) AS rank
-      FROM chunks_fts f JOIN chunks c ON c.id=f.chunk_id JOIN documents d ON d.document_key=c.document_key
-      WHERE chunks_fts MATCH ? AND d.deleted_at IS NULL ORDER BY rank LIMIT ?`).all(expression, limit) as Row[];
+    const capped = Math.max(1, Math.min(1000, limit));
+    const rows = this.stmt(`SELECT m.chunk_id, m.rank, c.document_key FROM (
+        SELECT f.chunk_id AS chunk_id, bm25(chunks_fts, 8.0, 2.0, 1.0) AS rank
+        FROM chunks_fts f WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?
+      ) m JOIN chunks c ON c.id=m.chunk_id ORDER BY m.rank LIMIT ?`).all(expression, capped, capped) as Row[];
     return rows.map(row => ({ chunkId: String(row.chunk_id), documentKey: String(row.document_key), score: 1 / (1 + Math.abs(Number(row.rank))) }));
   }
 
+  // The substring leg is an unindexed scan of every chunk, so it is reserved for
+  // queries short enough to plausibly BE a literal — an identifier, a path, a
+  // quoted phrase. Running it with a whole natural-language prompt as the
+  // pattern scanned the entire corpus on every turn and essentially never
+  // matched; that made query latency grow linearly with corpus size.
   exactSearch(query: string, limit: number): LexicalHit[] {
+    const capped = Math.max(1, Math.min(1000, limit));
+    // Two indexed point lookups instead of an OR across a join: the OR forced a
+    // scan, and external_id had no usable index of its own.
+    const byChunk = this.stmt('SELECT id AS chunk_id, document_key FROM chunks WHERE id=? LIMIT 1').all(query) as Row[];
+    const byDocument = this.stmt(`SELECT c.id AS chunk_id, c.document_key FROM documents d
+      JOIN chunks c ON c.document_key=d.document_key
+      WHERE d.external_id=? AND d.deleted_at IS NULL LIMIT ?`).all(query, capped) as Row[];
+    const literal = query.length <= EXACT_SCAN_MAX_CHARS ? this.literalScan(query, capped) : [];
+    const rows = [...byChunk, ...byDocument, ...literal];
+    const seen = new Set<string>();
+    return rows.flatMap(row => {
+      const chunkId = String(row.chunk_id);
+      if (seen.has(chunkId)) return [];
+      seen.add(chunkId);
+      return [{ chunkId, documentKey: String(row.document_key), score: 1 }];
+    }).slice(0, limit);
+  }
+
+  private literalScan(query: string, limit: number): Row[] {
     const escaped = query.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
-    const rows = this.db.prepare(`SELECT c.id AS chunk_id, c.document_key FROM chunks c
-      JOIN documents d ON d.document_key=c.document_key
-      WHERE d.deleted_at IS NULL AND (c.text LIKE ? ESCAPE '\\' OR c.id=? OR d.external_id=? OR d.uri LIKE ? ESCAPE '\\')
-      LIMIT ?`).all(`%${escaped}%`, query, query, `%${escaped}%`, limit) as Row[];
-    return rows.map(row => ({ chunkId: String(row.chunk_id), documentKey: String(row.document_key), score: 1 }));
+    const inText = this.stmt(`SELECT id AS chunk_id, document_key FROM chunks
+      WHERE text LIKE ? ESCAPE '\\' LIMIT ?`).all(`%${escaped}%`, limit) as Row[];
+    const inUri = this.stmt(`SELECT c.id AS chunk_id, c.document_key FROM documents d
+      JOIN chunks c ON c.document_key=d.document_key
+      WHERE d.uri LIKE ? ESCAPE '\\' AND d.deleted_at IS NULL LIMIT ?`).all(`%${escaped}%`, limit) as Row[];
+    return [...inText, ...inUri];
   }
 
   chunkCount(document: Pick<SourceDocument, 'namespace' | 'externalId'>): number {
-    const row = this.db.prepare('SELECT COUNT(*) AS n FROM chunks WHERE document_key=?').get(documentKey(document)) as Row;
+    const row = this.stmt('SELECT COUNT(*) AS n FROM chunks WHERE document_key=?').get(documentKey(document)) as Row;
     return Number(row.n);
   }
 
   unembeddedChunks(model: string): Array<DocumentChunk & { document: SourceDocument }> {
-    const rows = this.db.prepare(`SELECT c.id FROM chunks c
+    const rows = this.stmt(`SELECT c.id FROM chunks c
       JOIN documents d ON d.document_key=c.document_key
       WHERE d.deleted_at IS NULL AND NOT EXISTS (
         SELECT 1 FROM vector_map vm JOIN vector_collections vc ON vc.model_key=vm.model_key
         WHERE vm.chunk_id=c.id AND vc.model=?
-      ) ORDER BY c.id`).all(model) as Row[];
+      ) ORDER BY c.id LIMIT ?`).all(model, MAX_PAGE_SIZE) as Row[];
     return this.chunks(rows.map(row => String(row.id)));
   }
 
   chunks(ids: readonly string[]): Array<DocumentChunk & { document: SourceDocument }> {
     if (!ids.length) return [];
     const placeholders = ids.map(() => '?').join(',');
-    const rows = this.db.prepare(`SELECT c.id AS chunk_id, c.document_key AS chunk_document_key, c.namespace AS chunk_namespace,
+    const rows = this.stmt(`SELECT c.id AS chunk_id, c.document_key AS chunk_document_key, c.namespace AS chunk_namespace,
       c.ordinal AS chunk_ordinal, c.text AS chunk_text, c.content_hash AS chunk_hash, c.metadata AS chunk_metadata,
       d.namespace, d.external_id, d.scope_id, d.scope_kind, d.source, d.kind, d.title, d.text AS document_text,
       d.uri, d.version, d.content_hash, d.observed_at, d.valid_from, d.valid_to, d.trust, d.metadata
@@ -310,26 +390,24 @@ export class Projection {
     return ids.flatMap(id => {
       const row = byId.get(id);
       if (!row) return [];
-      const document: SourceDocument = {
-        namespace: String(row.namespace), externalId: String(row.external_id), scopeId: String(row.scope_id),
-        scopeKind: String(row.scope_kind) as SourceDocument['scopeKind'], source: String(row.source), kind: String(row.kind),
-        ...(row.title ? { title: String(row.title) } : {}), text: String(row.document_text), ...(row.uri ? { uri: String(row.uri) } : {}),
-        version: String(row.version), contentHash: String(row.content_hash), observedAt: new Date(Number(row.observed_at)).toISOString(),
-        ...(iso(row.valid_from) ? { validFrom: iso(row.valid_from)! } : {}), ...(iso(row.valid_to) ? { validTo: iso(row.valid_to)! } : {}),
-        trust: String(row.trust) as SourceDocument['trust'], metadata: parse<Record<string, string>>(row.metadata, {}),
-      };
+      const document = documentFromRow(row, String(row.document_text));
       return [{ id, documentKey: String(row.chunk_document_key), namespace: String(row.chunk_namespace), ordinal: Number(row.chunk_ordinal),
         text: String(row.chunk_text), contentHash: String(row.chunk_hash), metadata: parse<Record<string, string>>(row.chunk_metadata, {}), document }];
     });
   }
 
   getFact(id: string): StoredFact | undefined {
-    const row = this.db.prepare(`SELECT f.*, COALESCE(u.used + 2*u.helpful - 3*u.wrong - 2*u.stale, 0) AS utility
-      FROM facts f LEFT JOIN usefulness u ON u.fact_id=f.id WHERE f.id=?`).get(id) as Row | undefined;
+    const row = this.stmt(`SELECT f.scope_id, f.kind, f.statement, f.subject, f.predicate, f.object, f.standing,
+      f.confidence, f.valid_at, f.invalid_at, f.recorded_at, f.expired_at, f.tags, f.replacement_id,
+      COALESCE(u.used + 2*u.helpful - 3*u.wrong - 2*u.stale, 0) AS utility
+      FROM facts f LEFT JOIN usefulness u ON u.fact_id=f.id WHERE f.id=? LIMIT 1`).get(id) as Row | undefined;
     if (!row) return undefined;
-    const evidenceRows = this.db.prepare(`SELECT e.* FROM evidence e JOIN fact_evidence fe ON fe.evidence_id=e.id WHERE fe.fact_id=?`).all(id) as Row[];
-    const entityRows = this.db.prepare(`SELECT e.* FROM entities e JOIN fact_entities fe ON fe.entity_id=e.id WHERE fe.fact_id=?`).all(id) as Row[];
-    const episodeRows = this.db.prepare('SELECT episode_id FROM fact_episodes WHERE fact_id=?').all(id) as Row[];
+    const evidenceRows = this.stmt(`SELECT e.id, e.origin, e.provenance, e.uri, e.content_hash, e.excerpt,
+      e.observed_at, e.actor_id, e.session_id, e.tool_call_id
+      FROM evidence e JOIN fact_evidence fe ON fe.evidence_id=e.id WHERE fe.fact_id=? LIMIT ?`).all(id, RELATION_LIMIT) as Row[];
+    const entityRows = this.stmt(`SELECT e.id, e.scope_id, e.name, e.type, e.aliases, e.summary
+      FROM entities e JOIN fact_entities fe ON fe.entity_id=e.id WHERE fe.fact_id=? LIMIT ?`).all(id, RELATION_LIMIT) as Row[];
+    const episodeRows = this.stmt('SELECT episode_id FROM fact_episodes WHERE fact_id=? LIMIT ?').all(id, RELATION_LIMIT) as Row[];
     return {
       id, scopeId: String(row.scope_id), kind: String(row.kind) as StoredFact['kind'], statement: String(row.statement),
       ...(row.subject ? { subject: String(row.subject) } : {}), ...(row.predicate ? { predicate: String(row.predicate) } : {}),
@@ -352,7 +430,7 @@ export class Projection {
   graphNeighbors(factIds: readonly string[], limit: number): StoredFact[] {
     if (!factIds.length) return [];
     const placeholders = factIds.map(() => '?').join(',');
-    const rows = this.db.prepare(`SELECT DISTINCT f2.id FROM fact_entities a
+    const rows = this.stmt(`SELECT DISTINCT f2.id FROM fact_entities a
       JOIN fact_entities b ON b.entity_id=a.entity_id AND b.fact_id<>a.fact_id
       JOIN facts f2 ON f2.id=b.fact_id
       WHERE a.fact_id IN (${placeholders})
@@ -360,54 +438,92 @@ export class Projection {
     return rows.flatMap(row => this.getFact(String(row.id)) ?? []);
   }
 
-  activeFacts(scopeId: string): StoredFact[] {
-    const rows = this.db.prepare("SELECT id FROM facts WHERE scope_id=? AND standing IN ('supported','needs_review','candidate') ORDER BY recorded_at DESC").all(scopeId) as Row[];
+  activeFacts(scopeId: string, limit = PAGE_SIZE): StoredFact[] {
+    const rows = this.stmt(`SELECT id FROM facts WHERE scope_id=? AND standing IN ('supported','needs_review','candidate')
+      ORDER BY recorded_at DESC LIMIT ?`).all(scopeId, Math.max(1, Math.min(MAX_PAGE_SIZE, limit))) as Row[];
     return rows.flatMap(row => this.getFact(String(row.id)) ?? []);
   }
 
-  activeDocuments(): SourceDocument[] {
-    const rows = this.db.prepare('SELECT * FROM documents WHERE deleted_at IS NULL ORDER BY document_key').all() as Row[];
-    return rows.map(row => ({ namespace: String(row.namespace), externalId: String(row.external_id), scopeId: String(row.scope_id),
-      scopeKind: String(row.scope_kind) as SourceDocument['scopeKind'], source: String(row.source), kind: String(row.kind),
-      ...(row.title ? { title: String(row.title) } : {}), text: String(row.text), ...(row.uri ? { uri: String(row.uri) } : {}),
-      version: String(row.version), contentHash: String(row.content_hash), observedAt: new Date(Number(row.observed_at)).toISOString(),
-      ...(iso(row.valid_from) ? { validFrom: iso(row.valid_from)! } : {}), ...(iso(row.valid_to) ? { validTo: iso(row.valid_to)! } : {}),
-      trust: String(row.trust) as SourceDocument['trust'], metadata: parse<Record<string, string>>(row.metadata, {}) }));
+  // Keyset-paginated and column-explicit. This used to be an unbounded
+  // `SELECT *` that materialized every row, full text included, for callers
+  // that only ever streamed over it. Use eachActiveDocument() to walk them all.
+  activeDocuments(options: { limit?: number; after?: string } = {}): SourceDocument[] {
+    const limit = Math.max(1, Math.min(MAX_PAGE_SIZE, options.limit ?? PAGE_SIZE));
+    const rows = (options.after === undefined
+      ? this.stmt(`SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE deleted_at IS NULL ORDER BY document_key LIMIT ?`).all(limit)
+      : this.stmt(`SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE deleted_at IS NULL AND document_key > ?
+          ORDER BY document_key LIMIT ?`).all(options.after, limit)) as Row[];
+    return rows.map(row => documentFromRow(row, String(row.text)));
+  }
+
+  *eachActiveDocument(batch = PAGE_SIZE): Generator<SourceDocument> {
+    const cursor: { after?: string } = {};
+    for (;;) {
+      const page = this.activeDocuments({ limit: batch, ...(cursor.after === undefined ? {} : { after: cursor.after }) });
+      for (const document of page) yield document;
+      if (page.length < batch) return;
+      cursor.after = documentKey(page[page.length - 1]!);
+    }
+  }
+
+  // Two columns instead of the whole row: a source sync only needs to know
+  // which keys changed, not to load the corpus it is about to compare against.
+  *eachDocumentHash(batch = PAGE_SIZE): Generator<{ documentKey: string; contentHash: string }> {
+    const cursor: { after?: string } = {};
+    for (;;) {
+      const rows = (cursor.after === undefined
+        ? this.stmt('SELECT document_key, content_hash FROM documents WHERE deleted_at IS NULL ORDER BY document_key LIMIT ?').all(batch)
+        : this.stmt(`SELECT document_key, content_hash FROM documents WHERE deleted_at IS NULL AND document_key > ?
+            ORDER BY document_key LIMIT ?`).all(cursor.after, batch)) as Row[];
+      for (const row of rows) yield { documentKey: String(row.document_key), contentHash: String(row.content_hash) };
+      if (rows.length < batch) return;
+      cursor.after = String(rows[rows.length - 1]!.document_key);
+    }
+  }
+
+  // Point lookup on the documents primary key. The write path used to call
+  // activeDocuments() and scan for one row, which made every upsert O(n) in the
+  // size of the whole corpus.
+  documentByKey(document: Pick<SourceDocument, 'namespace' | 'externalId'>): SourceDocument | undefined {
+    const row = this.stmt(`SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE document_key=? AND deleted_at IS NULL LIMIT 1`)
+      .get(documentKey(document)) as Row | undefined;
+    return row ? documentFromRow(row, String(row.text)) : undefined;
   }
 
   stats(): { documents: number; chunks: number; vectors: number; facts: number; events: number; bytes: number } {
-    const count = (table: string): number => Number((this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as Row).n);
-    const pageCount = Number((this.db.prepare('PRAGMA page_count').get() as Row).page_count);
-    const pageSize = Number((this.db.prepare('PRAGMA page_size').get() as Row).page_size);
+    const count = (table: string): number => Number((this.stmt(`SELECT COUNT(*) AS n FROM ${table}`).get() as Row).n);
+    const pageCount = Number((this.stmt('PRAGMA page_count').get() as Row).page_count);
+    const pageSize = Number((this.stmt('PRAGMA page_size').get() as Row).page_size);
     return { documents: count('documents'), chunks: count('chunks'), vectors: count('vector_map'), facts: count('facts'), events: count('applied_events'), bytes: pageCount * pageSize };
   }
 
   gcCandidates(now = Date.now()): string[] {
-    const rows = this.db.prepare(`SELECT d.document_key, d.namespace, f.standing, f.recorded_at,
+    const rows = this.stmt(`SELECT d.document_key, d.namespace, f.standing, f.recorded_at,
       COALESCE(u.used + u.helpful, 0) AS positive
       FROM documents d LEFT JOIN facts f ON d.namespace='memory' AND f.id=d.external_id
       LEFT JOIN usefulness u ON u.fact_id=f.id
       WHERE d.deleted_at IS NOT NULL
          OR (d.namespace='memory' AND f.standing IN ('superseded','contradicted') AND f.recorded_at < ?)
-         OR (d.namespace='memory' AND f.standing IN ('candidate','needs_review') AND COALESCE(u.used + u.helpful, 0)=0 AND f.recorded_at < ?)`)
-      .all(now - 7 * 86_400_000, now - 30 * 86_400_000) as Row[];
+         OR (d.namespace='memory' AND f.standing IN ('candidate','needs_review') AND COALESCE(u.used + u.helpful, 0)=0 AND f.recorded_at < ?)
+      LIMIT ?`)
+      .all(now - 7 * 86_400_000, now - 30 * 86_400_000, MAX_PAGE_SIZE) as Row[];
     return rows.map(row => String(row.document_key));
   }
 
   gcProjection(reachableDocumentKeys: ReadonlySet<string>, activeModel?: string): string[] {
-    const rows = this.db.prepare('SELECT document_key FROM documents WHERE deleted_at IS NOT NULL').all() as Row[];
+    const rows = this.stmt('SELECT document_key FROM documents WHERE deleted_at IS NOT NULL LIMIT ?').all(MAX_PAGE_SIZE) as Row[];
     const removable = rows.map(row => String(row.document_key)).filter(key => !reachableDocumentKeys.has(key));
     this.transaction(() => {
       for (const key of removable) {
         this.deleteChunksForDocument(key);
-        this.db.prepare('DELETE FROM documents WHERE document_key=?').run(key);
+        this.stmt('DELETE FROM documents WHERE document_key=?').run(key);
       }
       if (activeModel) {
-        const stale = this.db.prepare('SELECT model_key, table_name FROM vector_collections WHERE model<>?').all(activeModel) as Row[];
+        const stale = this.stmt('SELECT model_key, table_name FROM vector_collections WHERE model<>? LIMIT ?').all(activeModel, RELATION_LIMIT) as Row[];
         for (const collection of stale) {
           this.db.exec(`DROP TABLE IF EXISTS ${String(collection.table_name)}`);
-          this.db.prepare('DELETE FROM vector_map WHERE model_key=?').run(collection.model_key!);
-          this.db.prepare('DELETE FROM vector_collections WHERE model_key=?').run(collection.model_key!);
+          this.stmt('DELETE FROM vector_map WHERE model_key=?').run(collection.model_key!);
+          this.stmt('DELETE FROM vector_collections WHERE model_key=?').run(collection.model_key!);
         }
       }
       this.db.exec('PRAGMA incremental_vacuum(200)');
@@ -415,26 +531,44 @@ export class Projection {
     return removable;
   }
 
+  // Sweeps temporaries left behind by a rebuild that crashed. The name carries
+  // the pid that created it, and only that pid used to clean it, so a crash
+  // orphaned the file permanently.
+  static discardStaleRebuilds(path: string): number {
+    const directory = dirname(path);
+    const prefix = `${basename(path)}.rebuild-`;
+    const stale = readdirSync(directory).filter(name => name.startsWith(prefix));
+    for (const name of stale) rmSync(join(directory, name), { force: true });
+    return stale.length;
+  }
+
   static rebuild(path: string, events: readonly MemoryEvent[]): Projection {
+    Projection.discardStaleRebuilds(path);
     const temporary = `${path}.rebuild-${process.pid}`;
-    rmSync(temporary, { force: true });
-    rmSync(`${temporary}-wal`, { force: true });
-    rmSync(`${temporary}-shm`, { force: true });
+    const scrub = (target: string): void => {
+      rmSync(target, { force: true });
+      rmSync(`${target}-wal`, { force: true });
+      rmSync(`${target}-shm`, { force: true });
+    };
+    scrub(temporary);
     const projection = new Projection(temporary);
     try {
       for (const event of events) projection.apply(event);
-      projection.close();
     } catch (error) {
-      projection.close();
-      rmSync(temporary, { force: true });
-      rmSync(`${temporary}-wal`, { force: true });
-      rmSync(`${temporary}-shm`, { force: true });
+      // close() can throw in its own right; that must not mask the real failure
+      // or skip the cleanup, which is what a bare second close() in the catch
+      // used to do.
+      try { projection.close(); } catch { /* the original error is the one that matters */ }
+      scrub(temporary);
       throw error;
     }
-    rmSync(path, { force: true });
+    projection.close();
+    // rename() replaces the destination atomically, so the old file is never
+    // unlinked first. Deleting it beforehand left a window in which the scope
+    // had no projection at all.
+    renameSync(temporary, path);
     rmSync(`${path}-wal`, { force: true });
     rmSync(`${path}-shm`, { force: true });
-    renameSync(temporary, path);
     rmSync(`${temporary}-wal`, { force: true });
     rmSync(`${temporary}-shm`, { force: true });
     return new Projection(path);
