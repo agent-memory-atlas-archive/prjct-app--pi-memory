@@ -144,13 +144,22 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
       ? 'native_observation' : fact.evidence.some(item => item.provenance === 'declared') ? 'declared' : 'agent_report',
     evidenceIds: fact.evidence.map(item => item.id), reason: ['temporal-graph'],
   }));
-  const unique = [...new Map([...diverse.map(candidate => candidate.item), ...graphItems].map(item => [item.id, item])).values()];
-  const clipped = clipItems(unique, Math.max(512, Math.min(32_768, request.maxBytes ?? 4096)));
+  // Keyed by id with the RANKED item winning. Building the map the other way
+  // round let a graph neighbour that also surfaced through ranking replace a
+  // properly scored hit with its fixed-score stub.
   const selectedRankedIds = new Set(diverse.map(candidate => candidate.item.id));
+  const unique = [...diverse.map(candidate => candidate.item),
+    ...graphItems.filter(item => !selectedRankedIds.has(item.id))];
+  const clipped = clipItems(unique, Math.max(512, Math.min(32_768, request.maxBytes ?? 4096)));
   const diversityOmitted = [...new Set(ranked.map(candidate => candidate.item.id))]
     .filter(id => !selectedRankedIds.has(id)).length;
   const omitted = diversityOmitted + clipped.omitted;
   const gaps = [...new Set(denseGaps)];
-  return { status: clipped.items.length ? (gaps.length || omitted ? 'partial' : 'ok') : 'abstained',
+  // 'partial' means the answer is degraded — a retrieval leg failed, or the byte
+  // budget cut results the caller asked for. Having more matches than `limit` is
+  // ordinary and still reported through `omitted`; folding it into the status
+  // made 'ok' unreachable for any query that matched more than it returned.
+  const degraded = gaps.length > 0 || clipped.omitted > 0;
+  return { status: clipped.items.length ? (degraded ? 'partial' : 'ok') : 'abstained',
     items: clipped.items, gaps: clipped.items.length ? gaps : [...gaps, 'No active memory matched the requested scope and time.'], omitted };
 };

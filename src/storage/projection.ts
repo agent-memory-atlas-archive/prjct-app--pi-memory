@@ -21,6 +21,8 @@ const PAGE_SIZE = 1_000;
 const MAX_PAGE_SIZE = 10_000;
 // Cap on rows pulled for one fact's evidence, entities or episodes.
 const RELATION_LIMIT = 256;
+// Most selective query terms kept by lexicalSearch.
+const LEXICAL_TERM_LIMIT = 12;
 const DOCUMENT_COLUMNS = 'document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,'
   + ' version, content_hash, observed_at, valid_from, valid_to, trust, metadata';
 
@@ -317,10 +319,26 @@ export class Projection {
   // Ranking happens inside a subquery over chunks_fts alone. Scoring the match
   // set after joining chunks made SQLite bm25-score and sort every joined row
   // before applying the limit.
+  // Keeps the most selective terms of a query and discards the rest. OR-ing
+  // every token of a prose prompt makes FTS5 bm25-score most of the corpus
+  // before the limit applies, so cost grew with corpus size while the extra
+  // terms — the ones in almost every document — carried almost no signal.
+  selectiveTerms(tokens: readonly string[]): string[] {
+    const unique = [...new Set(tokens)];
+    if (unique.length <= LEXICAL_TERM_LIMIT) return unique;
+    const frequency = this.stmt(`SELECT term, doc FROM chunks_fts_vocab WHERE term IN (${unique.map(() => '?').join(',')})`)
+      .all(...unique) as Row[];
+    const counts = new Map(frequency.map(row => [String(row.term), Number(row.doc)]));
+    // A term absent from the vocabulary matches nothing, which is maximally
+    // selective, so it sorts first and costs nothing to include.
+    return [...unique].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0)).slice(0, LEXICAL_TERM_LIMIT);
+  }
+
   lexicalSearch(query: string, limit: number): LexicalHit[] {
     const tokens = query.toLocaleLowerCase().match(/[\p{L}\p{N}_./:-]{2,}/gu) ?? [];
     if (!tokens.length) return [];
-    const expression = [...new Set(tokens.slice(0, 24))].map(token => `"${token.replaceAll('"', '""')}"`).join(' OR ');
+    const expression = this.selectiveTerms(tokens.slice(0, 64)).map(token => `"${token.replaceAll('"', '""')}"`).join(' OR ');
+    if (!expression) return [];
     const capped = Math.max(1, Math.min(1000, limit));
     const rows = this.stmt(`SELECT m.chunk_id, m.rank, c.document_key FROM (
         SELECT f.chunk_id AS chunk_id, bm25(chunks_fts, 8.0, 2.0, 1.0) AS rank

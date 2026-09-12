@@ -69,6 +69,10 @@ export const migrate = (db: DatabaseSync): void => {
       chunk_id UNINDEXED, title, text, metadata,
       tokenize='unicode61 remove_diacritics 2', prefix='2 3 4'
     );
+    -- Per-term document frequency, read straight off the existing FTS index.
+    -- lexicalSearch uses it to keep the informative terms of a prose query and
+    -- drop the near-ubiquitous ones instead of OR-ing all of them.
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, 'row');
 
     CREATE TABLE IF NOT EXISTS episodes (
       id TEXT PRIMARY KEY,
