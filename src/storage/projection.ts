@@ -1,5 +1,5 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
-import { mkdirSync, readdirSync, rmSync, renameSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync, renameSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import type { DocumentChunk, SourceDocument } from '../contracts/documents.ts';
@@ -23,6 +23,8 @@ const MAX_PAGE_SIZE = 10_000;
 const RELATION_LIMIT = 256;
 // Most selective query terms kept by lexicalSearch.
 const LEXICAL_TERM_LIMIT = 12;
+// Age past which an orphaned rebuild temporary is assumed abandoned.
+const STALE_TEMP_MS = 10 * 60_000;
 const DOCUMENT_COLUMNS = 'document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,'
   + ' version, content_hash, observed_at, valid_from, valid_to, trust, metadata';
 
@@ -551,11 +553,16 @@ export class Projection {
 
   // Sweeps temporaries left behind by a rebuild that crashed. The name carries
   // the pid that created it, and only that pid used to clean it, so a crash
-  // orphaned the file permanently.
-  static discardStaleRebuilds(path: string): number {
+  // orphaned the file permanently. Recently touched files are left alone: the
+  // rebuild lock is advisory, so a sibling process may legitimately be writing
+  // one right now.
+  static discardStaleRebuilds(path: string, olderThanMs = STALE_TEMP_MS): number {
     const directory = dirname(path);
     const prefix = `${basename(path)}.rebuild-`;
-    const stale = readdirSync(directory).filter(name => name.startsWith(prefix));
+    const cutoff = Date.now() - olderThanMs;
+    const stale = readdirSync(directory)
+      .filter(name => name.startsWith(prefix) && name !== `${basename(path)}.rebuild-${process.pid}`)
+      .filter(name => (statSync(join(directory, name), { throwIfNoEntry: false })?.mtimeMs ?? 0) < cutoff);
     for (const name of stale) rmSync(join(directory, name), { force: true });
     return stale.length;
   }
