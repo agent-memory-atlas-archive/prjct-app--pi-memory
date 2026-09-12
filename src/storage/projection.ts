@@ -318,9 +318,6 @@ export class Projection {
     return rows.map(row => ({ chunkId: String(row.chunk_id), documentKey: String(row.document_key), distance: Number(row.distance) }));
   }
 
-  // Ranking happens inside a subquery over chunks_fts alone. Scoring the match
-  // set after joining chunks made SQLite bm25-score and sort every joined row
-  // before applying the limit.
   // Keeps the most selective terms of a query and discards the rest. OR-ing
   // every token of a prose prompt makes FTS5 bm25-score most of the corpus
   // before the limit applies, so cost grew with corpus size while the extra
@@ -336,6 +333,9 @@ export class Projection {
     return [...unique].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0)).slice(0, LEXICAL_TERM_LIMIT);
   }
 
+  // Ranking happens inside a subquery over chunks_fts alone. Scoring the match
+  // set after joining chunks made SQLite bm25-score and sort every joined row
+  // before applying the limit.
   lexicalSearch(query: string, limit: number): LexicalHit[] {
     const tokens = query.toLocaleLowerCase().match(/[\p{L}\p{N}_./:-]{2,}/gu) ?? [];
     if (!tokens.length) return [];
