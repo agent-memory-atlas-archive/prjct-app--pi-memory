@@ -26,4 +26,4 @@ export default function memoryExtension(pi: ExtensionAPI): void {
   installMemory(pi);
 }
 
-export * from './engine.ts';
+export { hostEvidence, MemoryEngine } from './engine.ts';

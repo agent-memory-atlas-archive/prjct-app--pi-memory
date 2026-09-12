@@ -12,6 +12,7 @@ export type MemoryQuery = Readonly<{
   limit?: number;
   maxBytes?: number;
   dense?: boolean;
+  scoreThreshold?: number;
   signal?: AbortSignal;
 }>;
 
@@ -85,6 +86,7 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
       }
     }
   }
+  const threshold = Math.max(0, Math.min(1, request.scoreThreshold ?? 0));
   const chunks = projection.chunks([...scores.keys()]);
   const asOf = request.asOf ? Date.parse(request.asOf) : Date.now();
   if (!Number.isFinite(asOf)) throw new Error('asOf must be ISO-8601.');
@@ -102,6 +104,7 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
     const evidenceBoost = fact?.evidence.some(evidence => ['native_observation', 'declared'].includes(evidence.provenance)) ? 0.08 : 0;
     const confidence = fact?.confidence ?? trustWeight(document.trust);
     const score = base * (0.65 + 0.35 * confidence) + utility + evidenceBoost;
+    if (score < threshold) return [];
     const item: MemoryHit = {
       id: fact?.id ?? document.externalId, chunkId: chunk.id, statement: chunk.text,
       ...(document.title ? { title: document.title } : {}), ...(document.uri ? { uri: document.uri } : {}),

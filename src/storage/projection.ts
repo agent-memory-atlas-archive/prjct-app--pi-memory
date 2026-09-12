@@ -1,5 +1,5 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import type { DocumentChunk, SourceDocument } from '../contracts/documents.ts';
@@ -416,11 +416,27 @@ export class Projection {
   }
 
   static rebuild(path: string, events: readonly MemoryEvent[]): Projection {
+    const temporary = `${path}.rebuild-${process.pid}`;
+    rmSync(temporary, { force: true });
+    rmSync(`${temporary}-wal`, { force: true });
+    rmSync(`${temporary}-shm`, { force: true });
+    const projection = new Projection(temporary);
+    try {
+      for (const event of events) projection.apply(event);
+      projection.close();
+    } catch (error) {
+      projection.close();
+      rmSync(temporary, { force: true });
+      rmSync(`${temporary}-wal`, { force: true });
+      rmSync(`${temporary}-shm`, { force: true });
+      throw error;
+    }
     rmSync(path, { force: true });
     rmSync(`${path}-wal`, { force: true });
     rmSync(`${path}-shm`, { force: true });
-    const projection = new Projection(path);
-    for (const event of events) projection.apply(event);
-    return projection;
+    renameSync(temporary, path);
+    rmSync(`${temporary}-wal`, { force: true });
+    rmSync(`${temporary}-shm`, { force: true });
+    return new Projection(path);
   }
 }

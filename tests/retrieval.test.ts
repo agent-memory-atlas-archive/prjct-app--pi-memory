@@ -30,3 +30,14 @@ test('hybrid retrieval beats lexical-only on cross-vocabulary cases without losi
   assert.ok(candidate.ndcgAtK > baseline.ndcgAtK);
   assert.equal(candidate.recallAtK, 1);
 });
+
+test('score thresholds filter automatic candidates without hiding ordinary lookup results', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-threshold-'));
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
+  await engine.index({ namespace: 'test', externalId: 'db', scopeId: 'p_test', scopeKind: 'project',
+    source: 'fixture', kind: 'fact', text: 'SQLite is durable project storage', version: 'v1', contentHash: sha256('storage'),
+    observedAt: new Date().toISOString(), trust: 'host', metadata: {} });
+  assert.equal((await engine.search({ queries: ['storage'], dense: true })).items.length, 1);
+  assert.equal((await engine.search({ queries: ['storage'], dense: true, scoreThreshold: 0.9 })).items.length, 0);
+});

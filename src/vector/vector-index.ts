@@ -44,7 +44,8 @@ export class SqliteVectorIndex implements VectorIndex {
   async upsert(document: SourceDocument, signal?: AbortSignal): Promise<{ chunks: number; embedded: number }> {
     assertSourceDocument(document);
     signal?.throwIfAborted();
-    this.projection.upsertDocument(document);
+    const existing = this.projection.activeDocuments().find(item => item.namespace === document.namespace && item.externalId === document.externalId);
+    if (!existing || existing.contentHash !== document.contentHash || existing.version !== document.version) this.projection.upsertDocument(document);
     const chunks = chunkDocument(document, this.chunkOptions);
     // The lexical index is committed before optional model work. If the local
     // model cannot be downloaded or a remote provider is unavailable, recall

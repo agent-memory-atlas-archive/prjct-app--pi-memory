@@ -1,4 +1,4 @@
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, open, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ScopeKind, SourceDocument } from './contracts/documents.ts';
@@ -136,14 +136,16 @@ export class MemoryEngine {
   }
 
   async rebuild(signal?: AbortSignal): Promise<{ events: number; documents: number }> {
-    const events = await this.journal.readAll();
-    this.projection.close();
-    const rebuilt = Projection.rebuild(join(this.root, 'index.sqlite'), events);
-    Object.defineProperty(this, 'projection', { value: rebuilt });
-    Object.defineProperty(this, 'vector', { value: createVectorIndex(rebuilt, this.vector.provider) });
-    const documents = rebuilt.activeDocuments();
-    for (const document of documents) await this.indexProjectionDocument(document, signal);
-    return { events: events.length, documents: documents.length };
+    return withRebuildLock(this.root, async () => {
+      const events = await this.journal.readAll();
+      this.projection.close();
+      const rebuilt = Projection.rebuild(join(this.root, 'index.sqlite'), events);
+      Object.defineProperty(this, 'projection', { value: rebuilt });
+      Object.defineProperty(this, 'vector', { value: createVectorIndex(rebuilt, this.vector.provider) });
+      const documents = rebuilt.activeDocuments();
+      for (const document of documents) await this.indexProjectionDocument(document, signal);
+      return { events: events.length, documents: documents.length };
+    });
   }
 
   async dispose(): Promise<void> {
@@ -183,6 +185,26 @@ const readConfig = async (root: string): Promise<EmbeddingConfig> => {
     baseUrl: process.env.PI_MEMORY_EMBEDDINGS_BASE_URL ?? parsed.baseUrl,
     apiKey: process.env.PI_MEMORY_EMBEDDINGS_API_KEY,
     cacheDir: parsed.cacheDir ?? join(prjctHomeFor(), 'shared', 'memory', 'models') };
+};
+
+const withRebuildLock = async <T>(root: string, action: () => Promise<T>): Promise<T> => {
+  const lockPath = join(root, 'rebuild.lock');
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const acquire = async (): Promise<void> => {
+    try {
+      const handle = await open(lockPath, 'wx', 0o600);
+      await handle.writeFile(JSON.stringify({ pid: process.pid, at: Date.now() }));
+      await handle.close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const info = await stat(lockPath).catch(() => undefined);
+      if (!info || Date.now() - info.mtimeMs < 10 * 60_000) throw new Error('A pi-memory rebuild is already running for this scope.');
+      await rm(lockPath, { force: true });
+      return acquire();
+    }
+  };
+  await acquire();
+  try { return await action(); } finally { await rm(lockPath, { force: true }); }
 };
 
 export const hostEvidence = (input: Readonly<{ excerpt: string; observedAt?: string; uri?: string; actorId?: string; sessionId?: string; toolCallId?: string }>): EvidenceRef => ({

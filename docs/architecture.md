@@ -106,9 +106,10 @@ candidates. The final list is serialized under a caller-supplied hard byte
 budget and reports omissions and unavailable legs.
 
 `before_agent_start` runs lexical-only retrieval over the raw prompt and adds at
-most four high-confidence candidates to that turn's system prompt. It does not
-append a persistent session message or block startup on a model download. The
-agent calls `memory_context` when semantic expansion is warranted.
+most four candidates above the documented automatic-injection threshold
+(`scoreThreshold: 0.055`) to that turn's system prompt. It does not append a
+persistent session message or block startup on a model download. The agent calls
+`memory_context` when semantic expansion is warranted.
 
 ## Selective capture
 
@@ -137,13 +138,23 @@ roots, removes only unreferenced or low-value hot projections and stale vector
 collections, records the removed keys in a `gc.compacted` event, and incrementally
 vacuums SQLite. Facts and evidence remain replayable from the append-only log.
 
+`/memory rebuild` is an operator action for a quiet scope. It uses an advisory
+lock against another rebuild, builds the replacement SQLite file beside the live
+projection, and swaps it only after the full journal has applied. It cannot
+fence another already-open Pi process that keeps writing during the swap; any
+such writes remain in the append-only journal and are recovered by a later
+replay or rebuild.
+
 ## Quality gates
 
 The gold suite covers paraphrases, bilingual queries, temporal policy, failures,
 constraints, and query expansion. Every retrieval change is compared on the same
-corpus against BM25, the former feature-hash semantic leg, and old-style RRF.
-Acceptance requires at least +20% relative nDCG@10 over the best baseline with no
-Recall@10 or MRR regression.
+corpus against BM25, the former feature-hash semantic leg, old-style RRF, and
+the current dense index without agent-authored expansions. Acceptance requires
+at least +20% relative nDCG@10 over the best baseline with no Recall@10 or MRR
+regression. The suite is intentionally deterministic and is a regression gate,
+not proof of broad retrieval quality; it must grow with observed production
+failures.
 
 The synthetic warm-index benchmark reports write time, p50/p95 KNN latency, and
 bytes per chunk at 100,000 chunks and 1,000 queries. Cold model download and

@@ -64,6 +64,11 @@ OpenAI-compatible embedding endpoint can be selected in the scope's
 `memory/config.json`; credentials are read from the host environment and are
 never persisted by pi-memory.
 
+Known supply-chain caveat: `@huggingface/transformers` currently brings
+`onnxruntime-node` and image-processing dependencies whose audit advisories may
+report no fixed release. pi-memory uses the text feature-extraction path only;
+review `npm audit --omit=dev` before publishing or deploying.
+
 ## Storage
 
 Project data lives at `~/.prjct/<projectId>/memory` (or `$PRJCT_HOME`). Team and
@@ -84,6 +89,11 @@ npm run test:integration
 npm run eval -- --suite tests/fixtures/retrieval-gold.jsonl
 npm run bench -- --documents 100000 --queries 1000
 npm pack --dry-run --ignore-scripts
+
+# Real Pi load smoke test, without calling an LLM provider.
+PRJCT_HOME=$(mktemp -d) pi --mode rpc --no-session --no-extensions -e ./index.ts <<'EOF'
+{"type":"prompt","message":"/memory status"}
+EOF
 ```
 
 The evaluation gate requires at least 20% relative nDCG@10 improvement over the

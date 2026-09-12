@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -57,6 +57,18 @@ test('dense outages leave lexical chunks available for an explicit backfill', as
   assert.equal(await engine.vector.backfill(), 1);
   assert.equal(await engine.vector.backfill(), 0);
   assert.equal((await engine.search({ queries: ['recover'], dense: true })).items[0]?.id, 'offline');
+});
+
+test('rebuild is locked and still reconstructs the projection', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-rebuild-'));
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
+  await engine.recordFact({ kind: 'decision', statement: 'Use SQLite for memory', entities: [], evidence: [], episodeIds: [], confidence: 0.8, tags: {} });
+  await writeFile(join(root, 'rebuild.lock'), '{}');
+  await assert.rejects(engine.rebuild(), /already running/);
+  await rm(join(root, 'rebuild.lock'), { force: true });
+  const rebuilt = await engine.rebuild();
+  assert.equal(rebuilt.documents, 1);
 });
 
 test('replay repairs an event committed before its projection and remains idempotent', async t => {

@@ -27,6 +27,7 @@ const contextParameters = Type.Object({
   kinds: Type.Optional(Type.Array(Type.String({ maxLength: 64 }), { maxItems: 16 })),
   signal: Type.Optional(StringEnum(['used', 'helpful', 'wrong', 'stale'] as const)),
   maxBytes: Type.Optional(Type.Integer({ minimum: 512, maximum: 32768 })),
+  scoreThreshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   dense: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 
@@ -80,6 +81,7 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
       if (params.action === 'lookup') return result(await engine.search({ queries: params.queries ?? [],
         ...(params.asOf ? { asOf: params.asOf } : {}), ...(params.namespaces ? { namespaces: params.namespaces } : {}),
         ...(params.kinds ? { kinds: params.kinds } : {}), maxBytes: params.maxBytes ?? 4096,
+        ...(params.scoreThreshold !== undefined ? { scoreThreshold: params.scoreThreshold } : {}),
         dense: params.dense ?? true, signal }));
       if (params.action === 'inspect') {
         const items = (params.ids ?? []).flatMap(id => engine.projection.getFact(id) ?? []);

@@ -20,6 +20,7 @@ const privateDirectory = async (path: string): Promise<void> => {
 
 export const validateEvent = (event: MemoryEvent, previous?: MemoryEvent): MemoryEvent => {
   if (event.schemaVersion !== 1 || !/^evt_[0-9a-f-]{36}$/.test(event.id)) throw new Error('Invalid memory event.');
+  if (!event.writerId.startsWith('writer_') || event.sequence < 1 || !Number.isSafeInteger(event.sequence)) throw new Error('Invalid memory event.');
   const unsigned: UnsignedMemoryEvent = {
     schemaVersion: event.schemaVersion,
     id: event.id,
@@ -109,6 +110,7 @@ export class MemoryJournal {
         return { events: [...state.events, event], previous: event };
       }, { events: [] }).events;
     }));
-    return streams.flat().sort((a, b) => a.recordedAt.localeCompare(b.recordedAt) || a.id.localeCompare(b.id));
+    return streams.flat().sort((a, b) => a.recordedAt.localeCompare(b.recordedAt) || a.writerId.localeCompare(b.writerId)
+      || a.sequence - b.sequence || a.id.localeCompare(b.id));
   }
 }

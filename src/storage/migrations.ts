@@ -2,7 +2,16 @@ import type { DatabaseSync } from 'node:sqlite';
 
 export const SCHEMA_VERSION = 1;
 
+const readVersion = (db: DatabaseSync): number => {
+  db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+  const row = db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value?: unknown } | undefined;
+  const version = Number(row?.value ?? 0);
+  if (!Number.isSafeInteger(version) || version < 0 || version > SCHEMA_VERSION) throw new Error(`Unsupported memory projection schema: ${row?.value}`);
+  return version;
+};
+
 export const migrate = (db: DatabaseSync): void => {
+  readVersion(db);
   db.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
@@ -156,7 +165,6 @@ export const migrate = (db: DatabaseSync): void => {
       model_key TEXT NOT NULL REFERENCES vector_collections(model_key) ON DELETE CASCADE,
       UNIQUE(chunk_id, model_key)
     );
-    INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value;
   `);
+  db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(SCHEMA_VERSION));
 };

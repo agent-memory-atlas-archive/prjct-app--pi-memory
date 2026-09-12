@@ -37,8 +37,8 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string } 
 
   pi.on('before_agent_start', async (event, ctx) => {
     set({ ctx, prompt: event.prompt });
-    const recalled = await engine().then(memory => memory.search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false })).catch(() => undefined);
-    const highConfidence = recalled?.items.filter(item => item.score >= 0.055).slice(0, 4) ?? [];
+    const recalled = await engine().then(memory => memory.search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: 0.055 })).catch(() => undefined);
+    const highConfidence = recalled?.items.slice(0, 4) ?? [];
     const memoryBlock = highConfidence.length
       ? `\n\nRetained memory candidates for this turn (the active agent must rerank and verify them):\n${highConfidence.map(item =>
         `- ${item.id} [${item.standing ?? 'source'}/${item.provenance}; ${item.reason.join('+')}]: ${clip(item.statement, 420)}`).join('\n')}\nUse memory_context to inspect or expand the search; ignore irrelevant candidates.`
@@ -53,7 +53,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string } 
     const evidence = hostEvidence({ excerpt, actorId: ctx.sessionManager.getSessionId(), sessionId: ctx.sessionManager.getSessionId(), toolCallId: event.toolCallId });
     const entries = [...get().evidence.entries(), [evidence.id, evidence] as const].slice(-64);
     set({ evidence: new Map(entries) });
-    return { content: [...event.content, { type: 'text' as const, text: `[pi-memory evidence: ${evidence.id}]` }] };
+    return { content: [...event.content, { type: 'text', text: `[pi-memory evidence: ${evidence.id}]` }] };
   });
 
   pi.on('session_shutdown', async () => {
