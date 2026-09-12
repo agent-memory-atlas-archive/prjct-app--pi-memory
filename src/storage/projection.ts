@@ -25,6 +25,8 @@ const RELATION_LIMIT = 256;
 const LEXICAL_TERM_LIMIT = 12;
 // Age past which an orphaned rebuild temporary is assumed abandoned.
 const STALE_TEMP_MS = 10 * 60_000;
+// Cached term frequencies before the cache is dropped wholesale.
+const TERM_CACHE_LIMIT = 20_000;
 const DOCUMENT_COLUMNS = 'document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,'
   + ' version, content_hash, observed_at, valid_from, valid_to, trust, metadata';
 
@@ -52,6 +54,7 @@ export class Projection {
   readonly db: DatabaseSync;
   private depth = 0;
   private readonly statements = new Map<string, StatementSync>();
+  private readonly termFrequency = new Map<string, number>();
 
   constructor(path: string) {
     this.path = path;
@@ -81,6 +84,7 @@ export class Projection {
 
   close(): void {
     this.statements.clear();
+    this.termFrequency.clear();
     this.db.close();
   }
 
@@ -325,12 +329,23 @@ export class Projection {
   selectiveTerms(tokens: readonly string[]): string[] {
     const unique = [...new Set(tokens)];
     if (unique.length <= LEXICAL_TERM_LIMIT) return unique;
-    const frequency = this.stmt(`SELECT term, doc FROM chunks_fts_vocab WHERE term IN (${unique.map(() => '?').join(',')})`)
-      .all(...unique) as Row[];
-    const counts = new Map(frequency.map(row => [String(row.term), Number(row.doc)]));
-    // A term absent from the vocabulary matches nothing, which is maximally
-    // selective, so it sorts first and costs nothing to include.
-    return [...unique].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0)).slice(0, LEXICAL_TERM_LIMIT);
+    // fts5vocab has no index of its own, so asking it about a term is not a
+    // seek. Frequencies are cached per connection: they only decide which terms
+    // to keep, so drifting slightly behind new writes costs nothing but a
+    // marginally worse choice, and vocabulary repeats heavily across prompts.
+    const missing = unique.filter(term => !this.termFrequency.has(term));
+    if (missing.length) {
+      const rows = this.stmt(`SELECT term, doc FROM chunks_fts_vocab WHERE term IN (${missing.map(() => '?').join(',')})`)
+        .all(...missing) as Row[];
+      const found = new Map(rows.map(row => [String(row.term), Number(row.doc)]));
+      if (this.termFrequency.size + missing.length > TERM_CACHE_LIMIT) this.termFrequency.clear();
+      // A term absent from the vocabulary matches nothing, which is maximally
+      // selective, so it records as 0 and sorts first.
+      for (const term of missing) this.termFrequency.set(term, found.get(term) ?? 0);
+    }
+    return [...unique]
+      .sort((a, b) => (this.termFrequency.get(a) ?? 0) - (this.termFrequency.get(b) ?? 0))
+      .slice(0, LEXICAL_TERM_LIMIT);
   }
 
   // Ranking happens inside a subquery over chunks_fts alone. Scoring the match
