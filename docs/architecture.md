@@ -94,20 +94,34 @@ silent empty index.
 `hybridSearch` evaluates up to four active-agent query expansions through three
 independent legs:
 
-1. exact id, path, URI, and substring matches;
-2. FTS5 BM25;
+1. exact chunk-id and external-id lookups, plus a URI and substring scan for
+   queries short enough to plausibly be a literal;
+2. FTS5 BM25 over the twelve most selective terms of the query, chosen by
+   document frequency;
 3. dense sqlite-vec KNN.
+
+None of the three joins the `documents` table. Deleting a document physically
+removes its chunks, FTS rows and vectors, so there is no deleted row left to
+filter out.
 
 Weighted reciprocal-rank fusion combines incomparable ranks. Evidence trust,
 fact confidence, and observed usefulness provide bounded priors. Valid-time and
 standing filters run before output. One adjacency hop over shared entities adds
-related temporal facts; lexical overlap and per-source caps remove redundant
-candidates. The final list is serialized under a caller-supplied hard byte
-budget and reports omissions and unavailable legs.
+related temporal facts, subject to the same score threshold as everything else.
+Lexical overlap removes redundant candidates, and a per-source cap applies only
+when the candidates actually span more than one source — enforcing it in a
+single-source scope just truncates the answer. The final list is serialized
+under a caller-supplied hard byte budget.
+
+`omitted` counts everything the limit, the diversity filter, or the byte budget
+left out. `status` is narrower: `partial` means a retrieval leg failed or the
+byte budget cut the answer short. Matching more than the limit is ordinary and
+does not make an answer partial.
 
 `before_agent_start` runs lexical-only retrieval over the raw prompt and adds at
-most four candidates above the documented automatic-injection threshold
-(`scoreThreshold: 0.055`) to that turn's system prompt. It does not append a
+most four candidates above the automatic-injection threshold to that turn's
+system prompt. The threshold defaults to `DEFAULT_RECALL_THRESHOLD` (0.055) and
+is overridable per install through `installMemoryHooks({ recallThreshold })`. It does not append a
 persistent session message or block startup on a model download. The agent calls
 `memory_context` when semantic expansion is warranted.
 
@@ -171,16 +185,26 @@ The suite is a regression gate, not proof of broad retrieval quality. 42 queries
 over 113 documents is small; it must grow with observed production failures.
 
 The benchmark drives the real ingest path (`MemoryEngine.index` and
-`indexAll`) over ~1.1 KB documents, with a deterministic stand-in encoder that
-gives every chunk a distinct vector. It reports single-document and batched
-ingest separately, KNN latency, whole-query latency, and bytes per chunk.
-Encoder inference is deliberately near-free so the throughput figure is the cost
-of the storage path; a real local encoder is orders of magnitude slower and
-would dominate, so model time is measured separately and never folded in.
+`indexAll`) over ~1.05 KB documents whose word frequencies follow a Zipf-like
+curve over ~5,000 terms, with a deterministic stand-in encoder that gives every
+chunk a distinct vector. It reports single-document and batched ingest
+separately, KNN latency, whole-query latency, and bytes per chunk. Encoder
+inference is deliberately near-free so the throughput figure is the cost of the
+storage path; a real local encoder is orders of magnitude slower and would
+dominate, so model time is measured separately and never folded in.
 
-An earlier benchmark bypassed the engine, wrote through projection methods that
-nothing else used, and stored the identical one-hot vector for all 100,000
-chunks against 22-byte documents. Its numbers described none of the above.
+Vocabulary shape is part of the measurement, not incidental to it. Lexical
+search costs what it costs because a term that appears in most chunks forces
+bm25 to score most of the index, so a corpus drawn uniformly from a small
+vocabulary reports a worst case that no real corpus produces: the same 100,000
+documents built from 60 words put whole-query latency at 568 ms against 103 ms
+for the Zipf-like corpus.
+
+Two earlier versions of this benchmark measured something other than the system.
+The first bypassed the engine, wrote through projection methods nothing else
+used, and stored the identical one-hot vector for all 100,000 chunks against
+22-byte documents. The second drove the real path but kept the 60-word
+vocabulary described above.
 
 ## Boundaries
 

@@ -104,16 +104,17 @@ expansions; see [Architecture](docs/architecture.md) for why.
 
 ### Measured on an M-series laptop
 
-At 5,000 documents (10,000 chunks) of ~1.1 KB prose, with a deterministic
-stand-in encoder:
+Documents of ~1.05 KB drawn from a Zipf-like vocabulary of ~5,000 terms, one
+chunk each, with a deterministic stand-in encoder:
 
-| | |
-|---|---|
-| ingest, `index()` one at a time | ~185 documents/s |
-| ingest, `indexAll()` in batches | ~2,300 documents/s |
-| KNN p95 | ~1.3 ms |
-| whole hybrid query p50 | ~33 ms |
-| resting size | ~5.3 KB per chunk |
+| | 5,000 docs | 100,000 docs |
+|---|---|---|
+| ingest, `index()` one at a time | 187 docs/s | 188 docs/s |
+| ingest, `indexAll()` in batches | 4,244 docs/s | 2,822 docs/s |
+| KNN p95 | 0.64 ms | 14.3 ms |
+| whole hybrid query p50 | 13.6 ms | 103.4 ms |
+| whole hybrid query p95 | 15.2 ms | 128.6 ms |
+| resting size | 7.19 KB/chunk | 6.82 KB/chunk |
 
 Single-document ingest is bounded by one `fsync` per journal entry (~3.8 ms),
 which is the durability guarantee, not overhead to be optimized away.
@@ -121,3 +122,11 @@ which is the durability guarantee, not overhead to be optimized away.
 run, which is then re-ingested. Use `index()` when a single write has to survive
 on its own. Real encoder inference is not included in these figures and will
 dominate them.
+
+Whole-query latency is dominated by FTS5 bm25 scoring and grows with corpus
+size. Two things keep that in hand: `lexicalSearch` scores only the 12 most
+selective terms of a query, chosen by document frequency, and no search leg
+joins `documents`. Corpus vocabulary matters as much as corpus size — the same
+100,000 documents drawn from a 60-word vocabulary instead put the query at
+568 ms, because every term then matches nearly every chunk and there is nothing
+selective to choose.
