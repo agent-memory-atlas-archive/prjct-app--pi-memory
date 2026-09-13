@@ -23,6 +23,18 @@ const MAX_PAGE_SIZE = 10_000;
 const RELATION_LIMIT = 256;
 // Most selective query terms kept by lexicalSearch.
 const LEXICAL_TERM_LIMIT = 12;
+// Terms in more than this share of the corpus are dropped outright. A term that
+// appears in most chunks carries almost no bm25 signal — its IDF is near zero —
+// but forces the engine to score every chunk it appears in, so it costs
+// everything and contributes nothing.
+const LEXICAL_DF_CEILING = 0.05;
+// Below this the whole index is cheap to scan and the ceiling is skipped: a
+// share is meaningless on a small corpus, where a genuinely selective term can
+// easily sit above 5% of it.
+const LEXICAL_CEILING_MIN_CHUNKS = 5_000;
+// The lexical leg never goes silent: if every query term is common, the most
+// selective few are used anyway.
+const LEXICAL_MIN_TERMS = 3;
 // Age past which an orphaned rebuild temporary is assumed abandoned.
 const STALE_TEMP_MS = 10 * 60_000;
 // Cached term frequencies before the cache is dropped wholesale.
@@ -55,6 +67,7 @@ export class Projection {
   private depth = 0;
   private readonly statements = new Map<string, StatementSync>();
   private readonly termFrequency = new Map<string, number>();
+  private chunks_: number | undefined;
 
   constructor(path: string) {
     this.path = path;
@@ -85,6 +98,7 @@ export class Projection {
   close(): void {
     this.statements.clear();
     this.termFrequency.clear();
+    this.chunks_ = undefined;
     this.db.close();
   }
 
@@ -166,6 +180,7 @@ export class Projection {
   }
 
   replaceChunksBatch(chunks: readonly DocumentChunk[], titles?: ReadonlyMap<string, string>): void {
+    this.chunks_ = undefined;
     this.transaction(() => {
       const keys = [...new Set(chunks.map(chunk => chunk.documentKey))];
       for (const key of keys) this.deleteChunksForDocument(key);
@@ -180,6 +195,7 @@ export class Projection {
   }
 
   private deleteChunksForDocument(key: string): void {
+    this.chunks_ = undefined;
     const ids = this.stmt('SELECT id FROM chunks WHERE document_key = ? LIMIT ?').all(key, MAX_PAGE_SIZE).map(row => String((row as Row).id));
     for (const id of ids) this.deleteVectorForChunk(id);
     const removeFts = this.stmt('DELETE FROM chunks_fts WHERE chunk_id = ?');
@@ -326,14 +342,18 @@ export class Projection {
   // every token of a prose prompt makes FTS5 bm25-score most of the corpus
   // before the limit applies, so cost grew with corpus size while the extra
   // terms — the ones in almost every document — carried almost no signal.
-  selectiveTerms(tokens: readonly string[]): string[] {
-    const unique = [...new Set(tokens)];
-    if (unique.length <= LEXICAL_TERM_LIMIT) return unique;
+  /** Chunk count, cached because it gates every lexical query. */
+  private chunkTotal(): number {
+    if (this.chunks_ === undefined) this.chunks_ = Number((this.stmt('SELECT count(*) AS n FROM chunks').get() as Row).n);
+    return this.chunks_;
+  }
+
+  private documentFrequencies(terms: readonly string[]): Map<string, number> {
     // fts5vocab has no index of its own, so asking it about a term is not a
     // seek. Frequencies are cached per connection: they only decide which terms
     // to keep, so drifting slightly behind new writes costs nothing but a
     // marginally worse choice, and vocabulary repeats heavily across prompts.
-    const missing = unique.filter(term => !this.termFrequency.has(term));
+    const missing = terms.filter(term => !this.termFrequency.has(term));
     if (missing.length) {
       const rows = this.stmt(`SELECT term, doc FROM chunks_fts_vocab WHERE term IN (${missing.map(() => '?').join(',')})`)
         .all(...missing) as Row[];
@@ -343,9 +363,23 @@ export class Projection {
       // selective, so it records as 0 and sorts first.
       for (const term of missing) this.termFrequency.set(term, found.get(term) ?? 0);
     }
-    return [...unique]
-      .sort((a, b) => (this.termFrequency.get(a) ?? 0) - (this.termFrequency.get(b) ?? 0))
-      .slice(0, LEXICAL_TERM_LIMIT);
+    return new Map(terms.map(term => [term, this.termFrequency.get(term) ?? 0]));
+  }
+
+  selectiveTerms(tokens: readonly string[]): string[] {
+    const unique = [...new Set(tokens)];
+    if (unique.length <= LEXICAL_MIN_TERMS) return unique;
+    const counts = this.documentFrequencies(unique);
+    const ranked = [...unique].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0));
+    const total = this.chunkTotal();
+    // Taking "the twelve most selective" is not enough on its own: when a query
+    // has only a handful of rare words the rest of the twelve are filler that
+    // each match most of the corpus, and one such term is enough to make bm25
+    // score everything.
+    const ceiling = total >= LEXICAL_CEILING_MIN_CHUNKS ? total * LEXICAL_DF_CEILING : Number.POSITIVE_INFINITY;
+    const informative = ranked.filter(term => (counts.get(term) ?? 0) <= ceiling);
+    const chosen = informative.length >= LEXICAL_MIN_TERMS ? informative : ranked.slice(0, LEXICAL_MIN_TERMS);
+    return chosen.slice(0, LEXICAL_TERM_LIMIT);
   }
 
   // Ranking happens inside a subquery over chunks_fts alone. Scoring the match

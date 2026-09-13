@@ -166,11 +166,11 @@ chunk each, with a deterministic stand-in encoder:
 
 | | 5,000 docs | 100,000 docs |
 |---|---|---|
-| ingest, `index()` one at a time | 187 docs/s | 188 docs/s |
-| ingest, `indexAll()` in batches | 4,244 docs/s | 2,822 docs/s |
-| KNN p95 | 0.64 ms | 14.3 ms |
-| whole hybrid query p50 | 13.6 ms | 103.4 ms |
-| whole hybrid query p95 | 15.2 ms | 128.6 ms |
+| ingest, `index()` one at a time | 187 docs/s | 199 docs/s |
+| ingest, `indexAll()` in batches | 4,244 docs/s | 2,847 docs/s |
+| KNN p95 | 0.64 ms | 12.6 ms |
+| whole hybrid query p50 | 13.6 ms | 74.4 ms |
+| whole hybrid query p95 | 15.2 ms | 105.7 ms |
 | resting size | 7.19 KB/chunk | 6.82 KB/chunk |
 
 Single-document ingest is bounded by one `fsync` per journal entry (~3.8 ms),
@@ -181,9 +181,20 @@ on its own. Real encoder inference is not included in these figures and will
 dominate them.
 
 Whole-query latency is dominated by FTS5 bm25 scoring and grows with corpus
-size. Two things keep that in hand: `lexicalSearch` scores only the 12 most
-selective terms of a query, chosen by document frequency, and no search leg
-joins `documents`. Corpus vocabulary matters as much as corpus size — the same
-100,000 documents drawn from a 60-word vocabulary instead put the query at
-568 ms, because every term then matches nearly every chunk and there is nothing
-selective to choose.
+size. Three things keep that in hand: no search leg joins `documents`;
+`lexicalSearch` keeps at most the twelve most selective terms of a query; and
+above 5,000 chunks it drops terms appearing in more than 5% of the corpus
+outright, because their bm25 contribution is near zero while the cost of
+scoring every chunk they appear in is not.
+
+That last one matters most for the queries the automatic hook actually sends —
+a whole user prompt, mostly ordinary words around a few real ones. Measured with
+eight known documents buried in 100,000 of filler and queried in prompt form,
+recall@10, MRR and nDCG@10 are identical with the ceiling and without it, while
+p50 goes from 88.6 ms to 2.9 ms. The benchmark's own queries are slices of
+corpus text and so carry far more mid-frequency terms than a real prompt, which
+is why its end-to-end figure improves by less.
+
+Corpus vocabulary matters as much as corpus size: the same 100,000 documents
+drawn from a 60-word vocabulary put the query at 568 ms, because every term then
+matches nearly every chunk and there is nothing selective to choose.
