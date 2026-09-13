@@ -20,7 +20,10 @@ continue to work and report that dense indexing is pending.
 
 - `memory_context` searches with up to four agent-authored query expansions,
   inspects ids, proposes consolidation candidates, and records
-  useful/wrong/stale feedback.
+  useful/wrong/stale feedback. Lookup covers **every scope the session can
+  read** — this project, each team on the machine, and the shared scope —
+  because a decision a teammate recorded answers the question as well as one
+  recorded here. Pass `scopes: ['project']` to narrow it.
 - `memory_record` stores a selective temporal fact, appends a resolution instead
   of rewriting history, or indexes a generic source document.
 
@@ -60,7 +63,13 @@ prjct publishes and the `settings.json` marker each scope carries.
 Each adapter declares the scope it belongs to, and sync indexes it into that
 scope's own projection — team knowledge into the team, project observations into
 the project. Routing an adapter at the wrong scope is refused rather than
-silently writing rows retrieval can never return.
+silently writing rows retrieval can never return. Retrieval then reads across
+all of them, so indexing into a team scope is not the same as hiding it.
+
+Scopes are searched concurrently, so the cost is the slowest one rather than the
+sum: six scopes holding 90,000 chunks answer an auto-recall query in 14.7 ms p50
+against 3.5 ms for the project alone. `memory_record` still writes to the
+project — reading is federated, writing is not.
 
 Two selections are deliberate. prjct records an observation per tool call, so
 only failures, verifications and explicit user statements are kept; on a real

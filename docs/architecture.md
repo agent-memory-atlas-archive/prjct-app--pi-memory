@@ -118,6 +118,24 @@ left out. `status` is narrower: `partial` means a retrieval leg failed or the
 byte budget cut the answer short. Matching more than the limit is ordinary and
 does not make an answer partial.
 
+Retrieval is federated. A session opens one engine per readable scope — the
+project, every team registered on this machine, and the shared scope — and
+searches them concurrently, so wall-clock is the slowest scope rather than the
+sum. Scores come from reciprocal rank computed inside each scope, which makes
+the best hit in a two-document team look like the best hit in a
+hundred-thousand-document project, so a mild scope prior (project 1, team 0.9,
+shared 0.85) breaks the tie in favour of where the work is happening. That is a
+prior, not a measurement. A scope that fails to open or to answer is reported as
+a gap and the rest of the answer still arrives.
+
+Every scope's engine builds an embedding provider, and one encoder is loaded per
+model and shared between them: six scopes would otherwise mean six copies of the
+model and six inference sessions. The load is reference counted and released
+when the last holder lets go.
+
+Writing is not federated. `memory_record` writes to the project scope; team and
+shared content arrives through sync from the systems that own it.
+
 `before_agent_start` runs lexical-only retrieval over the raw prompt and adds at
 most four candidates above the automatic-injection threshold to that turn's
 system prompt. The threshold defaults to `DEFAULT_RECALL_THRESHOLD` (0.055) and

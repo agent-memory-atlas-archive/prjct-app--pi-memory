@@ -1,10 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { EvidenceRef } from '../contracts/evidence.ts';
 import { hostEvidence, MemoryEngine } from '../engine.ts';
+import { federatedSearch } from '../retrieval/federated.ts';
 import { redactSecrets } from '../security/redact.ts';
+import { discoverTeams } from '../sources/discovery.ts';
+import { prjctHomeFor } from '../workspace/project-identity.ts';
 
 export type MemorySession = Readonly<{
   engine?: Promise<MemoryEngine>;
+  readable?: Promise<readonly MemoryEngine[]>;
   ctx?: ExtensionContext;
   prompt: string;
   evidence: ReadonlyMap<string, EvidenceRef>;
@@ -18,12 +22,14 @@ const textContent = (content: readonly unknown[]): string => content.flatMap(par
 
 const clip = (text: string, max = 2048): string => text.length <= max ? text : `${text.slice(0, max)}…`;
 
+export type MemorySearch = (request: Parameters<typeof federatedSearch>[1]) => ReturnType<typeof federatedSearch>;
+
 // Score a candidate must reach before it is injected into the system prompt
 // unasked. Low enough to let a solid lexical-only match through, high enough to
 // keep a single weak signal out.
 export const DEFAULT_RECALL_THRESHOLD = 0.055;
 
-export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; recallThreshold?: number } = {}) => {
+export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; recallThreshold?: number; federate?: boolean } = {}) => {
   const recallThreshold = options.recallThreshold ?? DEFAULT_RECALL_THRESHOLD;
   const slot: { current: MemorySession } = { current: { prompt: '', evidence: new Map() } };
   const get = (): MemorySession => slot.current;
@@ -38,13 +44,45 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; r
     return pending;
   };
 
+  /**
+   * Every scope this session may read: the project it is working in, each team
+   * registered on this machine, and the shared scope. Retrieval filters on
+   * scopeId, so without this the agent could only ever see the project — team
+   * knowledge would be indexed and never returned.
+   *
+   * Opened once per session and reused. A scope that will not open is left out
+   * rather than failing the search.
+   */
+  const readable = async (): Promise<readonly MemoryEngine[]> => {
+    const current = get();
+    if (current.readable) return current.readable;
+    const project = await engine();
+    if (options.federate === false) return [project];
+    const sessionId = current.ctx!.sessionManager.getSessionId();
+    const home = prjctHomeFor(options.home);
+    const scoped = options.home === undefined ? {} : { home: options.home };
+    const pending = (async (): Promise<readonly MemoryEngine[]> => {
+      const teams = await discoverTeams(home).catch(() => []);
+      const others = await Promise.all([
+        MemoryEngine.forShared(sessionId, scoped).catch(() => undefined),
+        ...teams.map(team => MemoryEngine.forScope('team', team.id, sessionId, scoped).catch(() => undefined)),
+      ]);
+      return [project, ...others.flatMap(found => found ?? [])];
+    })();
+    set({ readable: pending });
+    return pending;
+  };
+
+  const search: MemorySearch = async request => federatedSearch(await readable(), request);
+
   pi.on('session_start', async (_event, ctx) => {
     set({ ctx, prompt: '', evidence: new Map() });
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
     set({ ctx, prompt: event.prompt });
-    const recalled = await engine().then(memory => memory.search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: recallThreshold })).catch(() => undefined);
+    const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: recallThreshold })
+      .catch(() => undefined);
     const highConfidence = recalled?.items.slice(0, 4) ?? [];
     const memoryBlock = highConfidence.length
       ? `\n\nRetained memory candidates for this turn (the active agent must rerank and verify them):\n${highConfidence.map(item =>
@@ -64,10 +102,13 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; r
   });
 
   pi.on('session_shutdown', async () => {
-    const pending = get().engine;
-    set({ engine: undefined, ctx: undefined, evidence: new Map(), prompt: '' });
-    if (pending) await (await pending).dispose().catch(() => undefined);
+    const { engine: pending, readable: opened } = get();
+    set({ engine: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '' });
+    // The project engine is one of the readable ones; dispose the set, not both.
+    const engines = await opened?.catch(() => []) ?? (pending ? [await pending] : []);
+    for (const memory of engines) await memory.dispose().catch(() => undefined);
+    if (!engines.length && pending) await (await pending).dispose().catch(() => undefined);
   });
 
-  return { engine, stagedEvidence: () => get().evidence, currentPrompt: () => get().prompt };
+  return { engine, readable, search, stagedEvidence: () => get().evidence, currentPrompt: () => get().prompt };
 };

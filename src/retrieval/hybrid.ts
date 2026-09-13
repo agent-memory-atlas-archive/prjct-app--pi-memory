@@ -57,7 +57,7 @@ const addRanking = (scores: Map<string, number>, reasons: Map<string, string[]>,
   });
 };
 
-const clipItems = (items: readonly MemoryHit[], maxBytes: number): { items: MemoryHit[]; omitted: number } => {
+export const clipItems = (items: readonly MemoryHit[], maxBytes: number): { items: MemoryHit[]; omitted: number } => {
   const fit = items.reduce<{ items: MemoryHit[]; bytes: number; stopped: boolean }>((state, item) => {
     if (state.stopped) return state;
     const bytes = Buffer.byteLength(JSON.stringify(item), 'utf8') + 1;

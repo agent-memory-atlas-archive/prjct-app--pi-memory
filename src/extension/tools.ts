@@ -5,12 +5,19 @@ import { Type } from 'typebox';
 import type { EvidenceRef } from '../contracts/evidence.ts';
 import type { MemoryKind, MemoryStanding } from '../contracts/memory.ts';
 import type { MemoryEngine } from '../engine.ts';
+import type { MemorySearch } from './hooks.ts';
 import { consolidationCandidates } from '../retention/consolidation.ts';
+import { federatedSearch } from '../retrieval/federated.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 import { renderMemoryCall, renderMemoryResult } from './renderers.ts';
 
 export type ExtensionMemoryRuntime = Readonly<{
+  /** The project scope: what memory_record writes to. */
   engine(): Promise<MemoryEngine>;
+  /** Every scope the session may read from. */
+  readable(): Promise<readonly MemoryEngine[]>;
+  /** Federated lookup across all readable scopes. */
+  search: MemorySearch;
   stagedEvidence(): ReadonlyMap<string, EvidenceRef>;
   currentPrompt(): string;
 }>;
@@ -29,6 +36,7 @@ const contextParameters = Type.Object({
   maxBytes: Type.Optional(Type.Integer({ minimum: 512, maximum: 32768 })),
   scoreThreshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   dense: Type.Optional(Type.Boolean()),
+  scopes: Type.Optional(Type.Array(StringEnum(['project', 'team', 'shared'] as const), { maxItems: 3 })),
 }, { additionalProperties: false });
 
 const recordParameters = Type.Object({
@@ -69,7 +77,7 @@ const required = (value: string | undefined, name: string): string => {
 export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRuntime): void => {
   pi.registerTool({
     name: 'memory_context', label: 'Memory context',
-    description: 'Search, inspect, find mechanical consolidation candidates, or give feedback on temporal memory. For lookup, supply up to four standalone query expansions; results are candidates that the active agent must rerank against the task and evidence.',
+    description: 'Search, inspect, find mechanical consolidation candidates, or give feedback on temporal memory. Lookup searches the project, every team on this machine, and the shared scope unless `scopes` narrows it; supply up to four standalone query expansions, and rerank the candidates against the task and evidence.',
     promptSnippet: 'Retrieve bounded temporal memory with hybrid lexical, vector and graph search',
     promptGuidelines: [
       'Use memory_context lookup with concise standalone query expansions when prior decisions, failures, preferences, or cross-session work could affect the answer.',
@@ -78,13 +86,20 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
     parameters: contextParameters,
     async execute(_toolCallId, params, signal) {
       const engine = await runtime.engine();
-      if (params.action === 'lookup') return result(await engine.search({ queries: params.queries ?? [],
-        ...(params.asOf ? { asOf: params.asOf } : {}), ...(params.namespaces ? { namespaces: params.namespaces } : {}),
-        ...(params.kinds ? { kinds: params.kinds } : {}), maxBytes: params.maxBytes ?? 4096,
-        ...(params.scoreThreshold !== undefined ? { scoreThreshold: params.scoreThreshold } : {}),
-        dense: params.dense ?? true, signal }));
+      if (params.action === 'lookup') {
+        // Every scope by default: a decision recorded by a teammate answers the
+        // question as well as one recorded here. `scopes` narrows it.
+        const open = await runtime.readable();
+        const chosen = params.scopes?.length ? open.filter(memory => params.scopes!.includes(memory.scopeKind)) : open;
+        return result(await federatedSearch(chosen, { queries: params.queries ?? [],
+          ...(params.asOf ? { asOf: params.asOf } : {}), ...(params.namespaces ? { namespaces: params.namespaces } : {}),
+          ...(params.kinds ? { kinds: params.kinds } : {}), maxBytes: params.maxBytes ?? 4096,
+          ...(params.scoreThreshold !== undefined ? { scoreThreshold: params.scoreThreshold } : {}),
+          dense: params.dense ?? true, signal }));
+      }
       if (params.action === 'inspect') {
-        const items = (params.ids ?? []).flatMap(id => engine.projection.getFact(id) ?? []);
+        const open = await runtime.readable();
+        const items = (params.ids ?? []).flatMap(id => open.flatMap(memory => memory.projection.getFact(id) ?? []));
         return result({ status: items.length ? 'ok' : 'abstained', items, gaps: items.length ? [] : ['No requested memory ids exist.'] });
       }
       if (params.action === 'consolidate') {
@@ -93,8 +108,20 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
           gaps: candidates.length ? [] : ['No mechanical consolidation candidates were found.'] });
       }
       if (!params.signal || !(params.ids?.length)) throw new Error('feedback requires ids and signal.');
-      for (const id of params.ids) await engine.feedback(id, params.signal, (params.queries ?? []).join('\n'));
-      return result({ status: 'ok', recorded: params.ids.length, signal: params.signal });
+      // Feedback belongs to the scope that owns the fact. Sending it all to the
+      // project engine would throw for anything recalled from a team.
+      const open = await runtime.readable();
+      const query = (params.queries ?? []).join('\n');
+      const applied = { count: 0 };
+      const missing: string[] = [];
+      for (const id of params.ids) {
+        const owner = open.find(memory => memory.projection.getFact(id));
+        if (!owner) { missing.push(id); continue; }
+        await owner.feedback(id, params.signal, query);
+        applied.count += 1;
+      }
+      return result({ status: applied.count ? 'ok' : 'abstained', recorded: applied.count, signal: params.signal,
+        gaps: missing.length ? [`No open scope holds ${missing.join(', ')}.`] : [] });
     },
     renderCall(args, theme) { return renderMemoryCall(theme.fg('accent', 'memory context'), args); },
     renderResult(output, options) { return renderMemoryResult('memory context', output.details, options.expanded); },
