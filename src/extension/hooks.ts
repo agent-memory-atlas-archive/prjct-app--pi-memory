@@ -12,6 +12,8 @@ export type MemorySession = Readonly<{
   ctx?: ExtensionContext;
   prompt: string;
   evidence: ReadonlyMap<string, EvidenceRef>;
+  /** Last context size seen, to turn a running total into a per-turn delta. */
+  contextTokens: number;
 }>;
 
 const textContent = (content: readonly unknown[]): string => content.flatMap(part => {
@@ -29,9 +31,14 @@ export type MemorySearch = (request: Parameters<typeof federatedSearch>[1]) => R
 // keep a single weak signal out.
 export const DEFAULT_RECALL_THRESHOLD = 0.055;
 
-export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; recallThreshold?: number; federate?: boolean } = {}) => {
+export const installMemoryHooks = (pi: ExtensionAPI, options: {
+  home?: string; recallThreshold?: number; federate?: boolean;
+  /** Called after each turn is counted, so the caller can sync when due. */
+  onActivity?: (project: MemoryEngine) => Promise<void> | void;
+} = {}) => {
   const recallThreshold = options.recallThreshold ?? DEFAULT_RECALL_THRESHOLD;
-  const slot: { current: MemorySession } = { current: { prompt: '', evidence: new Map() } };
+  const onActivity = options.onActivity;
+  const slot: { current: MemorySession } = { current: { prompt: '', evidence: new Map(), contextTokens: 0 } };
   const get = (): MemorySession => slot.current;
   const set = (update: Partial<MemorySession>): MemorySession => (slot.current = { ...slot.current, ...update });
   const engine = async (): Promise<MemoryEngine> => {
@@ -75,12 +82,28 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; r
 
   const search: MemorySearch = async request => federatedSearch(await readable(), request);
 
+  /**
+   * Records what this turn cost. The host reports the size of the whole
+   * context, not the growth, so the delta is taken here; a context that shrank
+   * has been compacted, and its new size is the growth since.
+   */
+  const countTurn = async (ctx: ExtensionContext): Promise<void> => {
+    const project = await engine();
+    const seen = ctx.getContextUsage?.()?.tokens ?? null;
+    const previous = get().contextTokens;
+    const grown = seen === null ? 0 : seen > previous ? seen - previous : seen;
+    if (seen !== null) set({ contextTokens: seen });
+    project.projection.recordActivity({ turns: 1, tokens: grown });
+    await onActivity?.(project);
+  };
+
   pi.on('session_start', async (_event, ctx) => {
-    set({ ctx, prompt: '', evidence: new Map() });
+    set({ ctx, prompt: '', evidence: new Map(), contextTokens: 0 });
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
     set({ ctx, prompt: event.prompt });
+    await countTurn(ctx).catch(() => undefined);
     const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: recallThreshold })
       .catch(() => undefined);
     const highConfidence = recalled?.items.slice(0, 4) ?? [];
@@ -103,7 +126,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: { home?: string; r
 
   pi.on('session_shutdown', async () => {
     const { engine: pending, readable: opened } = get();
-    set({ engine: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '' });
+    set({ engine: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '', contextTokens: 0 });
     // The project engine is one of the readable ones; dispose the set, not both.
     const engines = await opened?.catch(() => []) ?? (pending ? [await pending] : []);
     for (const memory of engines) await memory.dispose().catch(() => undefined);

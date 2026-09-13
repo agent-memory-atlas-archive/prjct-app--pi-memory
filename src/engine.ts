@@ -121,6 +121,8 @@ export class MemoryEngine {
     const fact = assertTemporalFact({ ...sanitized, id: input.id ?? `mem_${randomUUID()}`, scopeId: this.scopeId,
       recordedAt, standing: input.standing ?? evidenceStanding(sanitizedEvidence) });
     await this.commit({ type: 'fact.recorded', fact });
+    // Written memories are one of the signals that a source is worth re-reading.
+    this.projection.recordActivity({ inserts: 1 });
     const document = this.projection.documentByKey({ namespace: 'memory', externalId: fact.id })!;
     const indexed = await this.indexProjectionDocument(document, signal);
     return { fact, dense: indexed };

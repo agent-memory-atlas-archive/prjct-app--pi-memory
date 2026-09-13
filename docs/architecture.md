@@ -175,6 +175,26 @@ filters on `scopeId`, so an adapter routed at the wrong engine would otherwise
 write rows that can never be returned; both the routing and the documents are
 checked, and a mismatch fails loudly.
 
+Re-reading a source is driven by work done, not by a clock. A clock re-scans an
+idle session for nothing and leaves a busy one stale; the signal that a sibling
+may have published something is that this session has been doing things. Two
+tables in the project's projection carry it: `sync_activity` counts turns,
+context tokens and memories written, monotonically and across restarts, and
+`sync_state` records for each adapter when it last ran, what it found, and the
+activity watermark at that moment. An adapter is due when any counter has moved
+past its threshold since that watermark, subject to a minimum interval that
+stops a burst from re-scanning every few seconds.
+
+Both tables live in the projection rather than the journal because they are
+operational, not knowledge: a rebuild discards them, and the cost of that is one
+extra sync. The host reports total context size rather than growth, so the
+per-turn delta is computed by the hook; a context that shrank has been compacted
+and its new size is counted as the growth since.
+
+The run is fired without being awaited. A source scan must never sit between the
+user's prompt and the agent starting, and a second run cannot begin while one is
+in flight.
+
 Two selections are deliberate rather than incidental. prjct records an
 observation per tool call, most of them routine reads, so only failures,
 verifications and explicit user statements are kept. pi-team's journal carries

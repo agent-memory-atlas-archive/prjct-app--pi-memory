@@ -172,6 +172,33 @@ export const migrate = (db: DatabaseSync): void => {
       model_key TEXT NOT NULL REFERENCES vector_collections(model_key) ON DELETE CASCADE,
       UNIQUE(chunk_id, model_key)
     );
+
+    -- What this scope has done since it started, counted monotonically. Sync is
+    -- driven by work performed, not by a clock: a session that sits idle has
+    -- nothing new to pull, and one that has been busy for an hour does.
+    CREATE TABLE IF NOT EXISTS sync_activity (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      turns INTEGER NOT NULL DEFAULT 0,
+      tokens INTEGER NOT NULL DEFAULT 0,
+      inserts INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO sync_activity(id) VALUES (1) ON CONFLICT(id) DO NOTHING;
+
+    -- One row per source adapter: when it last ran, what it found, and the
+    -- activity watermark at that moment. The deltas against sync_activity are
+    -- what make an adapter due.
+    CREATE TABLE IF NOT EXISTS sync_state (
+      adapter TEXT PRIMARY KEY,
+      last_at INTEGER NOT NULL,
+      at_turns INTEGER NOT NULL,
+      at_tokens INTEGER NOT NULL,
+      at_inserts INTEGER NOT NULL,
+      discovered INTEGER NOT NULL DEFAULT 0,
+      indexed INTEGER NOT NULL DEFAULT 0,
+      ok INTEGER NOT NULL DEFAULT 1,
+      detail TEXT
+    );
   `);
   db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(SCHEMA_VERSION));
 };

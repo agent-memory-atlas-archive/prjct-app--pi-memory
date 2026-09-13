@@ -13,6 +13,11 @@ import { sha256 } from '../workspace/project-identity.ts';
 export type LexicalHit = Readonly<{ chunkId: string; documentKey: string; score: number }>;
 export type VectorHit = Readonly<{ chunkId: string; documentKey: string; distance: number }>;
 export type StoredFact = TemporalFact & Readonly<{ usefulness: number }>;
+export type SyncActivity = Readonly<{ turns: number; tokens: number; inserts: number; updatedAt: number }>;
+export type SyncRun = Readonly<{
+  adapter: string; lastAt: string; at: SyncActivity;
+  discovered: number; indexed: number; ok: boolean; detail?: string;
+}>;
 
 // Longest query still treated as a possible literal by exactSearch. Above this
 // a query is prose, and prose is the lexical and dense legs' job.
@@ -51,6 +56,13 @@ const millis = (value?: string): number | null => value ? Date.parse(value) : nu
 const iso = (value: unknown): string | undefined => typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined;
 const vectorBlob = (vector: readonly number[]): Uint8Array => new Uint8Array(Float32Array.from(vector).buffer);
 const tableNameFor = (model: string, dims: number): string => `vec_${sha256(`${model}\u0000${dims}`).slice(0, 16)}`;
+
+const syncRunFromRow = (row: Row): SyncRun => ({
+  adapter: String(row.adapter), lastAt: new Date(Number(row.last_at)).toISOString(),
+  at: { turns: Number(row.at_turns), tokens: Number(row.at_tokens), inserts: Number(row.at_inserts), updatedAt: Number(row.last_at) },
+  discovered: Number(row.discovered), indexed: Number(row.indexed), ok: Number(row.ok) === 1,
+  ...(row.detail ? { detail: String(row.detail) } : {}),
+});
 
 const documentFromRow = (row: Row, text: string): SourceDocument => ({
   namespace: String(row.namespace), externalId: String(row.external_id), scopeId: String(row.scope_id),
@@ -557,6 +569,51 @@ export class Projection {
     const row = this.stmt(`SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE document_key=? AND deleted_at IS NULL LIMIT 1`)
       .get(documentKey(document)) as Row | undefined;
     return row ? documentFromRow(row, String(row.text)) : undefined;
+  }
+
+  // Sync bookkeeping. It lives in the projection rather than the journal
+  // because it is operational, not knowledge: losing it to a rebuild costs one
+  // extra sync and nothing else.
+  activity(): SyncActivity {
+    const row = this.stmt('SELECT turns, tokens, inserts, updated_at FROM sync_activity WHERE id = 1').get() as Row | undefined;
+    return { turns: Number(row?.turns ?? 0), tokens: Number(row?.tokens ?? 0), inserts: Number(row?.inserts ?? 0),
+      updatedAt: Number(row?.updated_at ?? 0) };
+  }
+
+  recordActivity(delta: Readonly<{ turns?: number; tokens?: number; inserts?: number }>, at = Date.now()): SyncActivity {
+    const turns = Math.max(0, Math.trunc(delta.turns ?? 0));
+    const tokens = Math.max(0, Math.trunc(delta.tokens ?? 0));
+    const inserts = Math.max(0, Math.trunc(delta.inserts ?? 0));
+    if (turns || tokens || inserts) {
+      this.stmt(`INSERT INTO sync_activity(id, turns, tokens, inserts, updated_at) VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET turns = turns + excluded.turns, tokens = tokens + excluded.tokens,
+        inserts = inserts + excluded.inserts, updated_at = excluded.updated_at`).run(turns, tokens, inserts, at);
+    }
+    return this.activity();
+  }
+
+  syncState(adapter: string): SyncRun | undefined {
+    const row = this.stmt(`SELECT adapter, last_at, at_turns, at_tokens, at_inserts, discovered, indexed, ok, detail
+      FROM sync_state WHERE adapter = ? LIMIT 1`).get(adapter) as Row | undefined;
+    return row ? syncRunFromRow(row) : undefined;
+  }
+
+  syncStates(limit = PAGE_SIZE): SyncRun[] {
+    const rows = this.stmt(`SELECT adapter, last_at, at_turns, at_tokens, at_inserts, discovered, indexed, ok, detail
+      FROM sync_state ORDER BY adapter LIMIT ?`).all(Math.max(1, Math.min(MAX_PAGE_SIZE, limit))) as Row[];
+    return rows.map(syncRunFromRow);
+  }
+
+  recordSync(adapter: string, run: Readonly<{ at?: number; discovered: number; indexed: number; ok: boolean; detail?: string }>): SyncRun {
+    const mark = this.activity();
+    this.stmt(`INSERT INTO sync_state(adapter, last_at, at_turns, at_tokens, at_inserts, discovered, indexed, ok, detail)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(adapter) DO UPDATE SET last_at=excluded.last_at, at_turns=excluded.at_turns,
+      at_tokens=excluded.at_tokens, at_inserts=excluded.at_inserts, discovered=excluded.discovered,
+      indexed=excluded.indexed, ok=excluded.ok, detail=excluded.detail`)
+      .run(adapter, run.at ?? Date.now(), mark.turns, mark.tokens, mark.inserts,
+        run.discovered, run.indexed, run.ok ? 1 : 0, run.detail ?? null);
+    return this.syncState(adapter)!;
   }
 
   stats(): { documents: number; chunks: number; vectors: number; facts: number; events: number; bytes: number } {

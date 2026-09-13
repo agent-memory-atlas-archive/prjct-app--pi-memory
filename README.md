@@ -42,8 +42,8 @@ progress narration, secrets, or generic summaries.
 
 ```text
 /memory status
-/memory sources
-/memory sync [adapter]
+/memory sources          # counters, last run per adapter, and what is due
+/memory sync [adapter]   # run now, whatever the counters say
 /memory replay
 /memory rebuild
 /memory gc
@@ -70,6 +70,31 @@ Scopes are searched concurrently, so the cost is the slowest one rather than the
 sum: six scopes holding 90,000 chunks answer an auto-recall query in 14.7 ms p50
 against 3.5 ms for the project alone. `memory_record` still writes to the
 project — reading is federated, writing is not.
+
+### When sources are re-read
+
+Sync is not on a schedule and does not run at start-up. Each turn adds to a
+watermark table in the project's projection — turns taken, context tokens
+consumed, memories written — and a source is re-read only once the work done
+since its last run crosses a threshold:
+
+| | default |
+|---|---|
+| turns since last run | 20 |
+| context tokens since last run | 40,000 |
+| memories written since last run | 10 |
+| minimum time between runs | 5 minutes |
+
+Any one threshold is enough; the minimum interval overrides all of them, so a
+burst of activity cannot re-scan the sibling stores every few seconds. The run
+happens in the background, so a turn never waits on it, and never twice at once.
+
+`/memory sources` shows the counters, each adapter's last run, and why it is or
+is not due. `/memory sync` ignores all of it and runs anyway. Adjust or disable
+with `installMemory(pi, { sync: { everyTurns: 50, enabled: false } })`.
+
+A failed run is recorded like a successful one, so a source that throws every
+time is visible as failing rather than looking like one that has never run.
 
 Two selections are deliberate. prjct records an observation per tool call, so
 only failures, verifications and explicit user statements are kept; on a real
