@@ -14,9 +14,9 @@ import { renderMemoryCall, renderMemoryResult } from './renderers.ts';
 export type ExtensionMemoryRuntime = Readonly<{
   /** The project scope: what memory_record writes to. */
   engine(): Promise<MemoryEngine>;
-  /** Every scope the session may read from. */
+  /** Engines belonging to the active project; production currently returns one. */
   readable(): Promise<readonly MemoryEngine[]>;
-  /** Federated lookup across all readable scopes. */
+  /** Project-local lookup across eligible ranking legs. */
   search: MemorySearch;
   stagedEvidence(): ReadonlyMap<string, EvidenceRef>;
   currentPrompt(): string;
@@ -36,7 +36,7 @@ const contextParameters = Type.Object({
   maxBytes: Type.Optional(Type.Integer({ minimum: 512, maximum: 32768 })),
   scoreThreshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   dense: Type.Optional(Type.Boolean()),
-  scopes: Type.Optional(Type.Array(StringEnum(['project', 'team', 'shared'] as const), { maxItems: 3 })),
+  scopes: Type.Optional(Type.Array(StringEnum(['project'] as const), { maxItems: 1 })),
 }, { additionalProperties: false });
 
 const recordParameters = Type.Object({

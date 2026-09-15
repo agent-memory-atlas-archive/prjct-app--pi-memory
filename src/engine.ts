@@ -1,5 +1,7 @@
 import { mkdir, readFile, open, rename, rm, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { existsSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ScopeKind, SourceDocument } from './contracts/documents.ts';
@@ -10,13 +12,17 @@ import { assertTemporalFact, type Episode, type MemoryStanding, type TemporalFac
 import { collectLegs, hybridSearch, type HybridSearchResult, type MemoryQuery, type SearchLegs } from './retrieval/hybrid.ts';
 import { redactSecrets } from './security/redact.ts';
 import { CurationBlockError } from './curation/types.ts';
-import { assertPublicationHold, CurationStore, jobIdFor } from './curation/store.ts';
+import { assertPublicationHold, jobIdFor, type CurationStore } from './curation/store.ts';
 import { MemoryJournal } from './storage/journal.ts';
-import { IndexedAuthority, type AuthorityPort, type JournalPort } from './storage/ports.ts';
+import { CompactJournal } from './storage/compact-journal.ts';
+import { CompactCapacityError } from './storage/compact-authority.ts';
+import { CompactStore } from './storage/compact-store.ts';
+import { promoteCompactAuthority } from './storage/promotion.ts';
+import { IndexedAuthority, type AuthorityPort, type CurationPort, type JournalPort, type ProjectionPort } from './storage/ports.ts';
 import { Projection } from './storage/projection.ts';
 import { createEmbeddingProvider, type EmbeddingConfig, type EmbeddingProvider } from './vector/providers.ts';
 import { createVectorIndex, EmbeddingUnavailableError, type VectorIndex } from './vector/vector-index.ts';
-import { MEMORY_DATABASE, assertExclusiveMemoryPath, assertProjectId, componentPath, prjctHomeFor, resolveProject, sha256 } from './workspace/project-identity.ts';
+import { MEMORY_DATABASE, assertExclusiveMemoryPath, assertProjectId, assertProjectLocalPath, componentPath, prjctHomeFor, resolveProject, sha256 } from './workspace/project-identity.ts';
 
 export type MemoryEngineOptions = Readonly<{
   root: string;
@@ -25,6 +31,8 @@ export type MemoryEngineOptions = Readonly<{
   scopeKind?: ScopeKind;
   provider?: EmbeddingProvider;
   embedding?: EmbeddingConfig;
+  /** Auto keeps existing indexed stores unchanged and starts new stores compact. */
+  storage?: 'auto' | 'compact' | 'indexed';
 }>;
 
 export type RecordFactInput = Omit<TemporalFact, 'id' | 'scopeId' | 'recordedAt' | 'standing'> & Readonly<{
@@ -44,11 +52,28 @@ export class MemoryEngine {
   readonly root: string;
   readonly scopeId: string;
   readonly scopeKind: ScopeKind;
-  readonly journal: JournalPort;
-  readonly authority: AuthorityPort;
-  readonly projection: Projection;
-  readonly vector: VectorIndex;
-  readonly curation: CurationStore;
+  private journalValue!: JournalPort;
+  private authorityValue!: AuthorityPort;
+  private projectionValue!: ProjectionPort & Pick<Projection, 'db'>;
+  private vectorValue!: VectorIndex;
+  private curationValue!: CurationPort & Pick<CurationStore, 'db'>;
+  private storageModeValue!: 'compact' | 'indexed';
+  private compact: CompactStore | undefined;
+  private readonly provider: EmbeddingProvider;
+  private refreshing = false;
+
+  get journal(): JournalPort { this.refreshStorageMode(); return this.journalValue; }
+  private set journal(value: JournalPort) { this.journalValue = value; }
+  get authority(): AuthorityPort { this.refreshStorageMode(); return this.authorityValue; }
+  private set authority(value: AuthorityPort) { this.authorityValue = value; }
+  get projection(): ProjectionPort & Pick<Projection, 'db'> { this.refreshStorageMode(); return this.projectionValue; }
+  private set projection(value: ProjectionPort & Pick<Projection, 'db'>) { this.projectionValue = value; }
+  get vector(): VectorIndex { this.refreshStorageMode(); return this.vectorValue; }
+  private set vector(value: VectorIndex) { this.vectorValue = value; }
+  get curation(): CurationPort & Pick<CurationStore, 'db'> { this.refreshStorageMode(); return this.curationValue; }
+  private set curation(value: CurationPort & Pick<CurationStore, 'db'>) { this.curationValue = value; }
+  get storageMode(): 'compact' | 'indexed' { this.refreshStorageMode(); return this.storageModeValue; }
+  private set storageMode(value: 'compact' | 'indexed') { this.storageModeValue = value; }
 
   constructor(options: MemoryEngineOptions) {
     if ((options.scopeKind ?? 'project') !== 'project' || !options.scopeId.startsWith('p_')) {
@@ -57,15 +82,95 @@ export class MemoryEngine {
     this.root = options.root;
     this.scopeId = assertProjectId(options.scopeId);
     this.scopeKind = 'project';
-    this.journal = new MemoryJournal(options.root, options.scopeId, options.sessionId);
+    const embedding = options.provider ? undefined : options.embedding
+      ? { ...options.embedding, cacheDir: assertProjectLocalPath(options.root, options.embedding.cacheDir ?? join(options.root, 'models')) }
+      : { cacheDir: assertProjectLocalPath(options.root, join(options.root, 'models')) };
     const database = join(options.root, MEMORY_DATABASE);
-    const projection = new Projection(database);
-    this.projection = projection;
-    this.curation = projection.attachCuration(database);
+    this.storageMode = resolveStorageMode(database, options.storage ?? 'auto');
+    if (this.storageMode === 'compact') {
+      const compact = new CompactStore(database, this.scopeId);
+      this.compact = compact;
+      this.projection = compact.projection;
+      this.curation = compact.curation;
+      this.authority = compact;
+      this.journal = new CompactJournal(compact, this.scopeId, options.sessionId);
+    } else {
+      this.compact = undefined;
+      const projection = new Projection(database);
+      const curation = projection.attachCuration(database);
+      projection.claimOwner(this.scopeId);
+      this.projection = projection;
+      this.curation = curation;
+      this.authority = new IndexedAuthority(projection, curation);
+      this.journal = new MemoryJournal(options.root, options.scopeId, options.sessionId);
+    }
+    this.provider = options.provider ?? createEmbeddingProvider(embedding!);
+    this.vector = createVectorIndex(this.projection, this.provider);
+  }
+
+  private refreshStorageMode(): void {
+    if (this.refreshing || !this.compact || this.compact.mode() === 0) return;
+    this.refreshing = true;
+    try {
+      this.compact.close();
+      this.installIndexed(new Projection(join(this.root, MEMORY_DATABASE)));
+    } finally { this.refreshing = false; }
+  }
+
+  private installIndexed(projection: Projection): void {
+    const curation = projection.attachCuration(projection.path);
     projection.claimOwner(this.scopeId);
-    this.authority = new IndexedAuthority(projection, this.curation);
-    const provider = options.provider ?? createEmbeddingProvider(options.embedding ?? { cacheDir: join(options.root, 'models') });
-    this.vector = createVectorIndex(this.projection, provider);
+    this.compact = undefined;
+    this.storageMode = 'indexed';
+    this.projection = projection;
+    this.curation = curation;
+    this.authority = new IndexedAuthority(projection, curation);
+    this.journal = new MemoryJournal(this.root, this.scopeId, this.journal.sessionId);
+    this.vector = createVectorIndex(projection, this.provider);
+  }
+
+  /** Empty stores can choose the indexed layout before their first durable
+   * mutation. This is not a data migration: there is no event, job, vector or
+   * checkpoint to move, and the compact files are removed only after close. */
+  private promoteEmpty(): void {
+    const compact = this.compact;
+    if (!compact || !compact.isLogicallyEmpty()) {
+      throw new Error('Non-empty compact memory requires atomic indexed promotion.');
+    }
+    compact.close();
+    const database = join(this.root, MEMORY_DATABASE);
+    for (const path of [database, `${database}-wal`, `${database}-shm`]) rmSync(path, { force: true });
+    this.installIndexed(new Projection(database));
+  }
+
+  /** Stage additive indexed schema while mode 0 remains authoritative, then
+   * populate every logical record and flip mode last in one SQLite commit. */
+  private promoteCompact(): void {
+    const compact = this.compact;
+    if (!compact) return;
+    const path = join(this.root, MEMORY_DATABASE);
+    const projection = (() => {
+      try { return promoteCompactAuthority(this.root, path, this.scopeId, compact); }
+      catch (error) {
+        if (compact.mode() === 1) return new Projection(path);
+        throw error;
+      }
+    })();
+    compact.close();
+    this.installIndexed(projection);
+  }
+
+  private promoteForCapacity(): void {
+    if (!this.compact) return;
+    if (this.compact.isLogicallyEmpty()) this.promoteEmpty();
+    else this.promoteCompact();
+  }
+
+  /** Select the indexed layout before mutation when a discovered source is
+   * larger than the compact authority's bounded decode envelope. */
+  prepareCapacity(discoveredBytes: number): void {
+    if (!Number.isSafeInteger(discoveredBytes) || discoveredBytes < 0) throw new Error('Invalid discovered source size.');
+    if (this.compact && discoveredBytes > 512 * 1024) this.promoteForCapacity();
   }
 
   authorityTransaction<T>(action: () => T): T {
@@ -74,6 +179,10 @@ export class MemoryEngine {
 
   commitAuthority(payload: MemoryEventPayload): void {
     const recordedAt = new Date().toISOString();
+    if (this.journal.appendAuthority) {
+      this.journal.appendAuthority(payload, recordedAt);
+      return;
+    }
     const unsigned = {
       schemaVersion: 1 as const, id: `evt_${randomUUID()}`, scopeId: this.scopeId, writerId: this.journal.writerId,
       sessionId: this.journal.sessionId, sequence: Math.max(1, Date.now() % 1_000_000_000), recordedAt, payload,
@@ -82,8 +191,15 @@ export class MemoryEngine {
   }
 
   private async commit(payload: MemoryEventPayload): Promise<void> {
-    const event = await this.journal.append(payload);
-    this.projection.apply(event);
+    try {
+      const event = await this.journal.append(payload);
+      this.projection.apply(event);
+    } catch (error) {
+      if (!(error instanceof CompactCapacityError) || !this.compact) throw error;
+      this.promoteCompact();
+      const event = await this.journal.append(payload);
+      this.projection.apply(event);
+    }
   }
 
   async collectPublication<T>(fn: () => Promise<T>): Promise<{ result: T; bag: PublicationBag }> {
@@ -112,7 +228,14 @@ export class MemoryEngine {
 
   async projectPublication(facts: readonly TemporalFact[], documents: readonly SourceDocument[], signal?: AbortSignal): Promise<boolean> {
     const dense = { ok: true };
-    if (facts.length) this.projection.recordActivity({ inserts: facts.length });
+    if (facts.length) {
+      try { this.projection.recordActivity({ inserts: facts.length }); }
+      catch (error) {
+        if (!(error instanceof CompactCapacityError) || !this.compact) throw error;
+        this.promoteCompact();
+        this.projection.recordActivity({ inserts: facts.length });
+      }
+    }
     for (const fact of facts) {
       const document = this.projection.documentByKey({ namespace: 'memory', externalId: fact.id });
       if (document) dense.ok = await this.indexProjectionDocument(document, signal) && dense.ok;
@@ -128,6 +251,7 @@ export class MemoryEngine {
 
   async index(document: SourceDocument, signal?: AbortSignal): Promise<{ chunks: number; embedded: number; dense: boolean }> {
     const sanitized = this.sanitizeDocument(document);
+    if (this.compact && JSON.stringify(sanitized).length > 12_000) this.promoteForCapacity();
     const bag = publication.getStore();
     if (bag) {
       bag.documents = [...bag.documents, sanitized];
@@ -160,7 +284,13 @@ export class MemoryEngine {
   async indexAll(documents: readonly SourceDocument[], signal?: AbortSignal): Promise<{ documents: number; chunks: number; embedded: number; dense: boolean }> {
     if (!documents.length) return { documents: 0, chunks: 0, embedded: 0, dense: true };
     const sanitized = documents.map(document => this.sanitizeDocument(document));
-    const events = await this.journal.appendAll(sanitized.map(document => ({ type: 'document.upserted' as const, document })));
+    if (this.compact && (sanitized.length >= 24 || JSON.stringify(sanitized).length > 12_000)) this.promoteForCapacity();
+    const payloads = sanitized.map(document => ({ type: 'document.upserted' as const, document }));
+    const events = await this.journal.appendAll(payloads).catch(async error => {
+      if (!(error instanceof CompactCapacityError) || !this.compact) throw error;
+      this.promoteCompact();
+      return this.journal.appendAll(payloads);
+    });
     this.projection.transaction(() => {
       for (const event of events) this.projection.apply(event);
     });
@@ -197,7 +327,12 @@ export class MemoryEngine {
     }
     await this.commit({ type: 'fact.recorded', fact });
     // Written memories are one of the signals that a source is worth re-reading.
-    this.projection.recordActivity({ inserts: 1 });
+    try { this.projection.recordActivity({ inserts: 1 }); }
+    catch (error) {
+      if (!(error instanceof CompactCapacityError) || !this.compact) throw error;
+      this.promoteCompact();
+      this.projection.recordActivity({ inserts: 1 });
+    }
     const document = this.projection.documentByKey({ namespace: 'memory', externalId: fact.id })!;
     const indexed = await this.indexProjectionDocument(document, signal);
     return { fact, dense: indexed };
@@ -290,22 +425,27 @@ export class MemoryEngine {
 
   async dispose(): Promise<void> {
     await this.vector.dispose();
-    this.curation.close();
-    this.projection.close();
+    if (this.compact) this.compact.close();
+    else {
+      this.curation.close();
+      this.projection.close();
+    }
   }
 
   static async forScope(kind: ScopeKind, scopeId: string, sessionId: string,
-    options: { home?: string; provider?: EmbeddingProvider } = {}): Promise<MemoryEngine> {
+    options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<MemoryEngine> {
     if (kind !== 'project') throw new Error('Memory opens only a project-owned database.');
     const home = prjctHomeFor(options.home);
     const root = componentPath(home, kind, assertProjectId(scopeId));
     await mkdir(root, { recursive: true, mode: 0o700 });
     assertExclusiveMemoryPath(home, scopeId, join(root, MEMORY_DATABASE));
     const config = await readConfig(root);
-    return new MemoryEngine({ root, scopeId, scopeKind: 'project', sessionId, ...(options.provider ? { provider: options.provider } : {}), embedding: config });
+    return new MemoryEngine({ root, scopeId, scopeKind: 'project', sessionId, ...(options.provider ? { provider: options.provider } : {}),
+      ...(options.storage ? { storage: options.storage } : {}), embedding: config });
   }
 
-  static async forProject(cwd: string, sessionId: string, options: { home?: string; provider?: EmbeddingProvider } = {}): Promise<MemoryEngine> {
+  static async forProject(cwd: string, sessionId: string,
+    options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<MemoryEngine> {
     const project = await resolveProject(cwd);
     return MemoryEngine.forScope('project', project.projectId, sessionId, options);
   }
@@ -319,6 +459,33 @@ export class MemoryEngine {
   }
 }
 
+const resolveStorageMode = (path: string, requested: 'auto' | 'compact' | 'indexed'): 'compact' | 'indexed' => {
+  if (!existsSync(path)) return requested === 'indexed' ? 'indexed' : 'compact';
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const names = new Set((db.prepare("SELECT name FROM sqlite_schema WHERE type IN ('table','view')").all() as { name: string }[])
+      .map(row => row.name));
+    const compact = names.has('compact_authority');
+    const indexed = names.has('meta') || names.has('documents') || names.has('memory_owner');
+    if (compact) {
+      const marker = db.prepare('SELECT mode FROM compact_authority WHERE id=1').get() as { mode?: number } | undefined;
+      if (marker?.mode === 1) {
+        if (!indexed) throw new Error('Indexed authority marker has no indexed schema.');
+        if (requested === 'compact') throw new Error('Existing indexed memory cannot be opened as compact.');
+        return 'indexed';
+      }
+      if (marker?.mode !== 0) throw new Error('Unsupported memory authority mode.');
+      if (requested === 'indexed') throw new Error('Existing compact memory cannot be opened as indexed without explicit promotion.');
+      return 'compact';
+    }
+    if (indexed || names.size > 0) {
+      if (requested === 'compact') throw new Error('Existing indexed memory cannot be opened as compact.');
+      return 'indexed';
+    }
+    return requested === 'indexed' ? 'indexed' : 'compact';
+  } finally { db.close(); }
+};
+
 const readConfig = async (root: string): Promise<EmbeddingConfig> => {
   const raw = await readFile(join(root, 'config.json'), 'utf8').catch(() => undefined);
   const parsed = raw ? JSON.parse(raw) as EmbeddingConfig : {};
@@ -329,7 +496,7 @@ const readConfig = async (root: string): Promise<EmbeddingConfig> => {
     // Deliberately NOT `?? parsed.apiKey`: a credential is read from the
     // environment only, so config.json can never become a place secrets live.
     apiKey: process.env.PI_MEMORY_EMBEDDINGS_API_KEY,
-    cacheDir: parsed.cacheDir ?? join(root, 'models') };
+    cacheDir: assertProjectLocalPath(root, parsed.cacheDir ? resolve(root, parsed.cacheDir) : join(root, 'models')) };
 };
 
 const STALE_LOCK_MS = 10 * 60_000;

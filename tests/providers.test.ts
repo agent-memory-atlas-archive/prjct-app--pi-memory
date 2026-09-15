@@ -3,9 +3,9 @@ import { test } from 'node:test';
 import { encoderLoads, residentModels, TransformerEmbeddingProvider } from '../src/vector/providers.ts';
 
 /**
- * A session reading its project, the shared scope and several teams holds one
- * engine per scope, and each builds its own provider. They must not each load
- * the encoder: the model is ~120 MB and carries its own inference session.
+ * Concurrent project-local components may build providers for the same model.
+ * They must not each load an encoder: the model is ~120 MB and carries its own
+ * inference session. Persistent cache paths remain project-specific.
  */
 test('providers on the same model share one loaded encoder and release it once', async () => {
   const before = residentModels();

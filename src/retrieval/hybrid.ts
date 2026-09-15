@@ -1,6 +1,7 @@
 import type { ScopeKind, SourceDocument } from '../contracts/documents.ts';
 import { factIsValidAt } from '../contracts/memory.ts';
-import type { LexicalHit, Projection, StoredFact, VectorHit } from '../storage/projection.ts';
+import type { LexicalHit, StoredFact, VectorHit } from '../storage/projection.ts';
+import type { ProjectionPort } from '../storage/ports.ts';
 import type { VectorIndex } from '../vector/vector-index.ts';
 import { relevantKeys, relevanceTerms } from './relevance.ts';
 
@@ -106,7 +107,7 @@ export const clipItems = (items: readonly MemoryHit[], maxBytes: number): { item
  * function does not fuse.
  */
 export const collectLegs = async (
-  projection: Projection,
+  projection: ProjectionPort,
   vector: VectorIndex,
   request: MemoryQuery,
 ): Promise<SearchLegs> => {
@@ -144,7 +145,7 @@ export const collectLegs = async (
 };
 
 export const candidatesFromScores = (
-  projection: Projection,
+  projection: ProjectionPort,
   request: MemoryQuery,
   scores: ReadonlyMap<string, number>,
   reasons: ReadonlyMap<string, readonly string[]>,
@@ -258,7 +259,7 @@ export const presentCandidates = (
     items: clipped.items, gaps: clipped.items.length ? gaps : [...gaps, 'No active memory matched the requested scope and time.'], omitted };
 };
 
-export const hybridSearch = async (projection: Projection, vector: VectorIndex, request: MemoryQuery): Promise<HybridSearchResult> => {
+export const hybridSearch = async (projection: ProjectionPort, vector: VectorIndex, request: MemoryQuery): Promise<HybridSearchResult> => {
   const queries = [...new Set(request.queries.map(query => query.trim()).filter(Boolean))].slice(0, 4);
   if (!queries.length) return { status: 'abstained', items: [], gaps: ['No retrieval query was provided.'], omitted: 0 };
   const limit = Math.max(1, Math.min(50, request.limit ?? 12));

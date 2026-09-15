@@ -14,13 +14,16 @@ import { TestEmbeddingProvider } from './helpers.ts';
 
 const TEXT = 'Decision: use SQLite for durable local storage. A hosted PostgreSQL database remains an unapproved proposal; no migration has been authorized.';
 
+const INDEXED_FAULT_FIXTURES = new Set(['publication-failure', 'due-reviews', 'finish-recovery', 'no-dup-commit', 'stale-discard', 'seal-not-success']);
+
 const fixture = async (t: { after(fn: () => unknown): void }, name: string) => {
   const root = await mkdtemp(join(tmpdir(), `pi-memory-${name}-`));
   const source = join(root, 'source');
   await mkdir(source);
   const path = join(source, 'policy.json');
   await writeFile(path, JSON.stringify({ id: 'policy', text: TEXT, observedAt: '2026-01-01T00:00:00Z' }));
-  const engine = new MemoryEngine({ root: join(root, 'index'), scopeId: 'p_review', sessionId: name, provider: new TestEmbeddingProvider() });
+  const engine = new MemoryEngine({ root: join(root, 'index'), scopeId: 'p_review', sessionId: name,
+    provider: new TestEmbeddingProvider(), ...(INDEXED_FAULT_FIXTURES.has(name) ? { storage: 'indexed' as const } : {}) });
   t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
   const adapter = new JsonRecordAdapter({ id: 'policies', scope: { kind: 'project', id: 'p_review' }, root: source, mapping: { namespace: 'policies' } });
   const registry = new SourceRegistry();
@@ -433,7 +436,8 @@ test('three windows persist first/middle/tail findings and synthesize before wat
   const text = `${block('Decision: use north-alpha-store. ')}${block('Procedure: verify the WAL nightly. ')}${block('Correction: north-alpha-store is not for replica traffic. ')}`;
   const path = join(source, 'policy.json');
   await writeFile(path, JSON.stringify({ id: 'policy', text, observedAt: '2026-01-01T00:00:00Z' }));
-  const engine = new MemoryEngine({ root: join(root, 'index'), scopeId: 'p_review', sessionId: 'windows', provider: new TestEmbeddingProvider() });
+  const engine = new MemoryEngine({ root: join(root, 'index'), scopeId: 'p_review', sessionId: 'windows',
+    provider: new TestEmbeddingProvider(), storage: 'indexed' });
   t.after(() => rm(root, { recursive: true, force: true }));
   const adapter = new JsonRecordAdapter({ id: 'policies', scope: { kind: 'project', id: 'p_review' }, root: source, mapping: { namespace: 'policies' } });
   const registry = new SourceRegistry();

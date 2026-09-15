@@ -8,7 +8,9 @@ import { tmpdir } from 'node:os';
 import { MemoryEngine } from '../src/engine.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
 
-const open = (root: string) => new MemoryEngine({ root, scopeId: 'p_wal', sessionId: 'test', provider: new TestEmbeddingProvider() });
+// These tests exercise the indexed WAL policy specifically. Compact WAL
+// pressure has its own pinned-reader and byte-envelope suite.
+const open = (root: string) => new MemoryEngine({ root, scopeId: 'p_wal', sessionId: 'test', provider: new TestEmbeddingProvider(), storage: 'indexed' });
 const child = async (root: string, mode: string) => {
   const process = spawn(globalThis.process.execPath, ['--import', 'tsx', new URL('./wal-child.mts', import.meta.url).pathname, root, mode], { stdio: ['ignore', 'pipe', 'pipe'] });
   await new Promise<void>((resolve, reject) => {

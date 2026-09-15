@@ -51,7 +51,7 @@ export const claimMemoryOwner = (db: DatabaseSync, projectId: string): void => {
   if (owner.project_id !== projectId) throw new Error('Memory database is owned by another project.');
 };
 
-export const migrate = (db: DatabaseSync): void => {
+export const migrate = (db: DatabaseSync, options: { preserveCompactPragmas?: boolean } = {}): void => {
   prepareConnection(db);
   if (schemaIsCurrent(db)) {
     db.exec('PRAGMA foreign_keys=ON');
@@ -67,7 +67,7 @@ export const migrate = (db: DatabaseSync): void => {
     );
     PRAGMA foreign_keys=ON;
     PRAGMA busy_timeout=5000;
-    PRAGMA auto_vacuum=INCREMENTAL;
+    ${options.preserveCompactPragmas ? '' : 'PRAGMA auto_vacuum=INCREMENTAL;'}
 
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS applied_events (

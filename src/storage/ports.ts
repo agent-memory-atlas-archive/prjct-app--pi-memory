@@ -1,4 +1,12 @@
 import type { MemoryEvent, MemoryEventPayload } from '../contracts/events.ts';
+import type { CurationStore } from '../curation/store.ts';
+import type { Projection } from './projection.ts';
+
+/** Public domain surfaces shared by indexed and compact storage. Driver and
+ * transaction-implementation details deliberately stay outside the ports. */
+export type ProjectionPort = Omit<Projection,
+  'db' | 'attachCuration' | 'claimOwner' | 'adoptOuter' | 'releaseOuter' | 'beginImmediate' | 'commit' | 'rollback' | 'ensureVectorCollection'>;
+export type CurationPort = Omit<CurationStore, 'db' | 'path' | 'adoptOuter' | 'releaseOuter'>;
 
 /**
  * Typed boundary between orchestration and a storage implementation. The
@@ -17,6 +25,8 @@ export type JournalPort = {
   readonly sessionId: string;
   append(payload: MemoryEventPayload, recordedAt?: string): Promise<MemoryEvent>;
   appendAll(payloads: readonly MemoryEventPayload[], recordedAt?: string): Promise<MemoryEvent[]>;
+  /** Synchronous append used only while an authority transaction is already open. */
+  appendAuthority?(payload: MemoryEventPayload, recordedAt?: string): MemoryEvent;
   readAll(): Promise<MemoryEvent[]>;
 };
 

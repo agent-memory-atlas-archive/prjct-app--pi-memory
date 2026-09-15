@@ -187,7 +187,7 @@ test('sync routes each adapter to the scope that owns it and is idempotent', asy
 
   const project = await MemoryEngine.forScope('project', 'p_test', 's1', { home: root, provider: new TestEmbeddingProvider() });
   const registry = new SourceRegistry();
-  await registerKnownSources(registry, 'p_test', { home: root, mailboxRoot: mailbox });
+  await registerKnownSources(registry, 'p_test', { home: root });
   assert.deepEqual(registry.list(), ['prjct-observations']);
 
   const engines = scopedEngines('s1', project, { home: root });
@@ -208,7 +208,7 @@ test('an extra adapter can be registered without changing pi-memory', async t =>
   const custom = new JsonRecordAdapter({ id: 'my-source', scope: { kind: 'project', id: 'p_test' },
     root, mapping: { namespace: 'my.source' } });
   const registry = new SourceRegistry();
-  await registerKnownSources(registry, 'p_test', { home: root, teams: false, extra: [custom] });
+  await registerKnownSources(registry, 'p_test', { home: root, extra: [custom] });
   assert.deepEqual(registry.list(), ['my-source', 'prjct-observations']);
 });
 

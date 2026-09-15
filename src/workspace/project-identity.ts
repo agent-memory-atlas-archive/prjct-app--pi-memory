@@ -18,6 +18,18 @@ export const assertProjectId = (projectId: string): string => {
 };
 export const memoryDatabasePath = (home: string, projectId: string): string =>
   join(componentPath(home, 'project', assertProjectId(projectId)), MEMORY_DATABASE);
+export const assertProjectLocalPath = (root: string, candidate: string): string => {
+  const expectedRoot = resolve(root);
+  const target = resolve(candidate);
+  const prefix = `${expectedRoot.replaceAll('\\', '/')}/`;
+  if (target !== expectedRoot && !target.replaceAll('\\', '/').startsWith(prefix)) throw new Error('Memory path escaped the project authority.');
+  const nearest = (path: string): string => existsSync(path) ? path : path === dirname(path) ? path : nearest(dirname(path));
+  const realRoot = realpathSync(expectedRoot).replaceAll('\\', '/');
+  const realNearest = realpathSync(nearest(target)).replaceAll('\\', '/');
+  if (realNearest !== realRoot && !realNearest.startsWith(`${realRoot}/`)) throw new Error('Memory path resolves outside the project authority.');
+  return target;
+};
+
 export const assertExclusiveMemoryPath = (home: string, projectId: string, candidate: string): string => {
   const expected = resolve(memoryDatabasePath(home, projectId));
   if (resolve(candidate) !== expected) throw new Error('Memory path is not the exclusive database for this project.');

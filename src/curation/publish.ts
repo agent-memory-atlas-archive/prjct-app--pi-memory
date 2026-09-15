@@ -5,7 +5,8 @@ import { assertSourceDocument } from '../contracts/documents.ts';
 import type { MemoryEngine } from '../engine.ts';
 import { redactSecrets } from '../security/redact.ts';
 import { sha256 } from '../workspace/project-identity.ts';
-import { publicationHold, stillHeld, type CurationStore } from './store.ts';
+import { publicationHold, stillHeld } from './store.ts';
+import type { CurationPort } from '../storage/ports.ts';
 import type { AnalysisProposal, AnalysisResult, CurationJob, EvidenceBundle, ProposedFact, SourceIdentity } from './types.ts';
 import { admitCapture } from '../retention/capture-gate.ts';
 import { assertPublishable } from './validate.ts';
@@ -54,7 +55,7 @@ export type PublishOutcome = Readonly<{
   embeddings: number;
 }>;
 
-export const liveFence = (store: CurationStore, job: CurationJob, identity: SourceIdentity, owner: string): boolean => {
+export const liveFence = (store: CurationPort, job: CurationJob, identity: SourceIdentity, owner: string): boolean => {
   const held = store.getJob(job.id);
   if (!stillHeld(held, owner, Date.now())) return false;
   const live = store.fingerprint(identity.documentKey);
@@ -69,7 +70,7 @@ const asPrepared = (value: unknown): PreparedBatch | undefined => {
     resolves: Array.isArray(row.resolves) ? row.resolves as string[] : [] };
 };
 
-export const replayAccepted = async (engine: MemoryEngine, store: CurationStore, job: CurationJob,
+export const replayAccepted = async (engine: MemoryEngine, store: CurationPort, job: CurationJob,
   identity: SourceIdentity, owner: string, signal?: AbortSignal): Promise<PublishOutcome | undefined> => {
   const recovered = store.acceptedBatch(job.id);
   if (!recovered || recovered.sourceRevision !== job.inputRevision) return undefined;
@@ -87,7 +88,7 @@ export const replayAccepted = async (engine: MemoryEngine, store: CurationStore,
   return applyCommitted(engine, store, job, identity, owner, topicId, recovered.topicExpected, prepared, recovered.id, signal, reuseJournal, !store.coverage(job.documentKey));
 };
 
-export const publishProposal = async (engine: MemoryEngine, store: CurationStore, job: CurationJob,
+export const publishProposal = async (engine: MemoryEngine, store: CurationPort, job: CurationJob,
   identity: SourceIdentity, result: AnalysisResult, expectedTopicRevision: number, owner: string,
   sourceText = '', signal?: AbortSignal, truncated = false): Promise<PublishOutcome> => {
   const replayed = await replayAccepted(engine, store, job, identity, owner, signal);
@@ -214,12 +215,12 @@ const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
   return { facts, documents, factIds: linked, resolves };
 };
 
-const sourceMoved = (store: CurationStore, job: CurationJob, identity: SourceIdentity): boolean => {
+const sourceMoved = (store: CurationPort, job: CurationJob, identity: SourceIdentity): boolean => {
   const live = store.fingerprint(identity.documentKey);
   return !live || live.revision !== job.inputRevision || live.contentHash !== job.contentHash;
 };
 
-const applyCommitted = async (engine: MemoryEngine, store: CurationStore, job: CurationJob, identity: SourceIdentity,
+const applyCommitted = async (engine: MemoryEngine, store: CurationPort, job: CurationJob, identity: SourceIdentity,
   owner: string, topicId: string, expectedTopicRevision: number, prepared: PreparedBatch,
   batchId: string, signal?: AbortSignal, reuseJournal = false, fullSource = true): Promise<PublishOutcome> => {
   const resolves = prepared.resolves.map(factId => ({ factId, standing: 'superseded' as const, rationale: 'Discarded by curated analysis' }));
@@ -312,7 +313,7 @@ export const materializeSealedBatches = async (engine: MemoryEngine, signal?: Ab
   }
 };
 
-export const invalidateDependents = async (engine: MemoryEngine, store: CurationStore, documentKeyValue: string,
+export const invalidateDependents = async (engine: MemoryEngine, store: CurationPort, documentKeyValue: string,
   standing: 'needs_review' | 'contradicted', rationale: string, revision?: string): Promise<number> => {
   const ids = store.dependents(documentKeyValue, revision);
   const count = { n: 0 };

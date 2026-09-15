@@ -72,7 +72,7 @@ test('automatic recall preserves evidence already bounded by retrieval instead o
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-auto-'));
   const handlers = new Map<string, Handler>();
   const pi = { on(name: string, handler: Handler) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
-  const runtime = installMemoryHooks(pi, { home: join(root, 'home'), federate: false });
+  const runtime = installMemoryHooks(pi, { home: join(root, 'home') });
   const ctx = { cwd: root, sessionManager: { getSessionId: () => 'automatic-test' } };
   await handlers.get('session_start')!({}, ctx);
   t.after(async () => { await handlers.get('session_shutdown')!({}, ctx); await rm(root, { recursive: true, force: true }); });

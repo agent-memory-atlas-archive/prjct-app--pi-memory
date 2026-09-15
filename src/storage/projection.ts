@@ -89,7 +89,9 @@ export class Projection {
   private lexicalRevision = '';
   private lexicalTokens: number | undefined;
 
-  constructor(pathOrDb: string | DatabaseSync, attachedPath?: string) {
+  constructor(pathOrDb: string | DatabaseSync, attachedPath?: string,
+    options: { allowCompactPromotion?: boolean; transactionActive?: boolean } = {}) {
+    this.depth = options.transactionActive ? 1 : 0;
     if (typeof pathOrDb === 'string') {
       this.path = pathOrDb;
       this.ownsConnection = true;
@@ -102,8 +104,13 @@ export class Projection {
     }
     try {
       this.db.exec('PRAGMA busy_timeout=5000');
+      const hasCompact = this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='compact_authority'").get();
+      const compact = hasCompact ? this.db.prepare('SELECT mode FROM compact_authority WHERE id=1').get() as { mode?: number } | undefined : undefined;
+      if (compact?.mode === 0 && !options.allowCompactPromotion) {
+        throw new Error('Compact memory must be opened through the compact authority.');
+      }
       sqliteVec.load(this.db);
-      migrate(this.db);
+      migrate(this.db, compact?.mode === 0 ? { preserveCompactPragmas: true } : {});
     } catch (error) {
       // Opening leaves an fd and a file lock held; migrate() rejects a schema
       // from a newer build, and that rejection must not leak the handle.

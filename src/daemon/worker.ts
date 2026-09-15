@@ -25,7 +25,6 @@ export type CycleOptions = Readonly<{
   analyzer?: Analyzer;
   block?: CurationBlockError;
   engines?: readonly MemoryEngine[];
-  mailboxRoot?: string;
   extraAdapters?: readonly SourceAdapter[];
   signal?: AbortSignal;
 }>;
@@ -35,10 +34,10 @@ export const discoverProjectIds = async (home: string): Promise<string[]> => {
   return entries.filter(entry => entry.isDirectory() && /^p_[A-Za-z0-9_-]+$/.test(entry.name)).map(entry => entry.name);
 };
 
-export const registryFor = async (engine: MemoryEngine, home: string, mailboxRoot?: string): Promise<SourceRegistry> => {
+export const registryFor = async (engine: MemoryEngine, home: string): Promise<SourceRegistry> => {
   const registry = new SourceRegistry();
   if (engine.scopeKind !== 'project') return registry;
-  await registerKnownSources(registry, engine.scopeId, { home, teams: false, ...(mailboxRoot ? { mailboxRoot } : {}) });
+  await registerKnownSources(registry, engine.scopeId, { home });
   return registry;
 };
 
@@ -67,14 +66,17 @@ const processProject = async (engine: MemoryEngine, options: CycleOptions, total
 }): Promise<void> => {
   if (engine.scopeKind !== 'project') throw new Error('Memory opens only a project-owned database.');
   options.signal?.throwIfAborted();
-  const registry = await registryFor(engine, options.config.home, options.mailboxRoot);
+  const registry = await registryFor(engine, options.config.home);
   for (const extra of options.extraAdapters ?? []) {
     if (!registry.get(extra.id)) registry.register(extra);
   }
   const adapters = new Map<string, SourceAdapter>();
   for (const id of registry.list()) {
     const adapter = registry.get(id);
-    if (!adapter || adapter.scope.kind !== 'project' || adapter.scope.id !== engine.scopeId) continue;
+    if (!adapter) continue;
+    if (adapter.scope.kind !== 'project' || adapter.scope.id !== engine.scopeId) {
+      throw new Error(`Daemon adapter ${id} is outside the active project authority.`);
+    }
     adapters.set(id, adapter);
     const result = await registry.sync(async () => engine, id, options.signal, engine.projection);
     totals.queued += result.queued + enqueueDueReviews(engine, id, Date.now(), options.config.maxReviewAgeMs);

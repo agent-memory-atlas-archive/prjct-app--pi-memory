@@ -37,12 +37,12 @@ const proposalFor = (bundle: EvidenceBundle): AnalysisProposal => ({
   conflicts: ['Hosted database remains unresolved against the SQLite decision.'],
 });
 
-const open = async (t: { after(fn: () => unknown): void }) => {
+const open = async (t: { after(fn: () => unknown): void }, storage: 'auto' | 'indexed' = 'auto') => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-curate-'));
   const source = join(root, 'source');
   await mkdir(source);
   await writeFile(join(source, 'policy.json'), JSON.stringify({ id: 'storage-policy', text: sourceText, observedAt: '2026-01-01T00:00:00.000Z' }));
-  const engine = new MemoryEngine({ root: join(root, 'index'), scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  const engine = new MemoryEngine({ root: join(root, 'index'), scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider(), storage });
   t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
   const registry = new SourceRegistry();
   const adapter = new JsonRecordAdapter({ id: 'policies', scope: { kind: 'project', id: 'p_test' }, root: source, mapping: { namespace: 'policies' } });
@@ -132,7 +132,7 @@ test('changed sources invalidate dependents and competing claims cannot publish 
 });
 
 test('missing analyzer, exhausted budget and failed analysis do not advance watermarks', async t => {
-  const { engine, registry } = await open(t);
+  const { engine, registry } = await open(t, 'indexed');
   await registry.sync(async () => engine, 'policies');
   const adapters = new Map([['policies', registry.get('policies')!]]);
   const blocked = await processAvailable(engine, adapters, 'worker-a', {

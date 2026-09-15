@@ -1,4 +1,5 @@
-import type { Projection, SyncActivity, SyncRun } from '../storage/projection.ts';
+import type { SyncActivity, SyncRun } from '../storage/projection.ts';
+import type { ProjectionPort } from '../storage/ports.ts';
 
 /**
  * When a source is worth re-reading.
@@ -70,7 +71,7 @@ export const syncDecision = (adapter: string, last: SyncRun | undefined, now: Sy
  * Which adapters are worth running now. Reads the watermark table only — no
  * source is touched until something is actually due.
  */
-export const dueAdapters = (projection: Projection, adapters: readonly string[],
+export const dueAdapters = (projection: ProjectionPort, adapters: readonly string[],
   policy: SyncPolicy = {}, at = Date.now()): readonly SyncDecision[] => {
   const resolved = { ...DEFAULT_SYNC_POLICY, ...policy };
   const now = projection.activity();

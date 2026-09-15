@@ -1,7 +1,6 @@
 import type { MemoryEngine } from '../engine.ts';
 import { prjctHomeFor } from '../workspace/project-identity.ts';
-import { discoverTeams, teamMailboxRoot } from './discovery.ts';
-import { prjctObservationSource, teamArtifactSource, teamJournalSource } from './presets.ts';
+import { prjctObservationSource } from './presets.ts';
 import type { RecordMapping } from './records.ts';
 import type { AdapterScope, EngineResolver, SourceAdapter, SourceRegistry } from './registry.ts';
 import type { SelectionRules } from './shape.ts';
@@ -15,11 +14,8 @@ import type { SelectionRules } from './shape.ts';
  */
 export type SourceInstallOptions = Readonly<{
   home?: string;
-  mailboxRoot?: string;
   observations?: SelectionRules;
-  teamJournal?: SelectionRules;
-  mappings?: Readonly<{ observations?: Partial<RecordMapping>; teamJournal?: Partial<RecordMapping>; teamArtifacts?: Partial<RecordMapping> }>;
-  teams?: boolean;
+  mappings?: Readonly<{ observations?: Partial<RecordMapping> }>;
   /** Extra adapters registered alongside the discovered ones. */
   extra?: readonly SourceAdapter[];
 }>;
@@ -31,21 +27,6 @@ export const registerKnownSources = async (registry: SourceRegistry, projectId: 
   registry.register(prjctObservationSource({ home, scope,
     ...(options.observations ? { select: options.observations } : {}),
     ...(options.mappings?.observations ? { mapping: options.mappings.observations } : {}) }));
-  if (options.teams === true) {
-    const mailboxRoot = teamMailboxRoot(options.mailboxRoot);
-    for (const team of await discoverTeams(home)) {
-      const teamScope: AdapterScope = { kind: 'team', id: team.id };
-      // A team with no name has no mailbox to read, but its artifact store is
-      // still worth indexing.
-      if (team.name) {
-        registry.register(teamJournalSource({ mailboxRoot, teamName: team.name, scope: teamScope,
-          ...(options.teamJournal ? { select: options.teamJournal } : {}),
-          ...(options.mappings?.teamJournal ? { mapping: options.mappings.teamJournal } : {}) }));
-      }
-      registry.register(teamArtifactSource({ home, scope: teamScope,
-        ...(options.mappings?.teamArtifacts ? { mapping: options.mappings.teamArtifacts } : {}) }));
-    }
-  }
   for (const adapter of options.extra ?? []) registry.register(adapter);
   return registry.list();
 };

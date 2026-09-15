@@ -33,39 +33,44 @@ text to numbers; it cannot promote a claim or decide what is true.
 `src/workspace/project-identity.ts` deliberately copies prjct's pure identity
 rule. The `.prjct/prjct.config.json` locator wins when a checkout moved;
 otherwise the id is `p_` plus the first twelve hexadecimal characters of
-SHA-256 over its canonical path. No extension needs another installed to agree
-on these roots:
-
-- project: `$PRJCT_HOME/<projectId>/memory`
-- team: `$PRJCT_HOME/teams/<teamId>/memory`
-- shared: `$PRJCT_HOME/shared/memory`
+SHA-256 over its canonical path. No extension needs another installed to agree on the project root:
+`$PRJCT_HOME/<projectId>/memory`. MemoryEngine accepts only project scopes. Team
+and shared publishers may be discovered as sources, but cannot open an authority
+or route documents outside the engine's project owner.
 
 The old sibling `vector/` component is not used. `src/vector/` is a public module
 inside the pi-memory npm package.
 
-## Authoritative log and projection
+## Compact and indexed authority
 
-Every durable mutation first appends one bounded `MemoryEvent` to
-`events/<UTC-day>/<writerId>.jsonl`. Writers are unique to a session runtime, so
-independent Pi processes never append to the same file. Each stream is monotonic
-and hash-chained. Files are opened with append, create, write, and no-follow
-flags and synced before the event is projected.
+Every project has one canonical `memory.sqlite`. New bounded stores start in
+compact mode. One owner-bound, checksummed, Brotli-compressed row contains typed
+domain maps, hash-chained events, deterministic chunks, packed int8 vectors,
+curation state and operational checkpoints. Append and domain reduction share
+one revision CAS and one FULL-synchronous SQLite commit. Compact mode creates no
+JSONL, second database or checkpoint sidecar; lexical/dense retrieval scans only
+its capacity-bounded state.
 
-A crash after append but before projection leaves recoverable work. `replay()`
-finds unapplied event ids; `rebuild()` discards SQLite and applies the complete
-log. A malformed or torn event fails closed rather than being skipped.
+Capacity is admitted before the authority row is mutated. Busy checkpoints and
+stale revisions are explicit failures, never dropped writes. A pinned reader may
+hold one bounded WAL generation; later writes back off rather than accumulating
+unbounded frames. Current-schema opens perform only connection-local setup and
+reads.
 
-`index.sqlite` uses WAL, foreign keys, a busy timeout, and incremental vacuum. It
-contains:
+Existing indexed stores stay indexed. Indexed mode appends bounded,
+hash-chained `MemoryEvent` streams under `events/<UTC-day>/<writerId>.jsonl`,
+then applies them idempotently to `memory.sqlite`, which holds source documents,
+deterministic chunks, FTS5, sqlite-vec, temporal graph state and curation state.
+A crash in the indexed append/apply window is repaired by `replay()`.
 
-- source documents and deterministic chunks;
-- FTS5 rows for lexical retrieval;
-- sqlite-vec collections keyed by `(model, dimensions)`;
-- episodes, evidence, entities, temporal facts, links, and usefulness signals;
-- applied event ids for idempotent replay.
-
-There is no mutable JSON snapshot and no revision directory. Historical truth is
-represented by events, not copies of the whole state.
+Large sources select indexed mode before the first durable mutation. A non-empty
+compact store that exhausts capacity first materializes its verified history,
+stages additive indexed schema while compact mode remains authoritative, then
+copies facts, documents, vectors, curation, sync and checkpoint state in one
+SQLite transaction. The mode marker switches last. Readers therefore observe a
+complete compact authority or a complete indexed authority, never partially
+populated indexed tables. Existing indexed data is never implicitly rewritten
+as compact.
 
 ## Provenance and time
 
@@ -127,8 +132,9 @@ is not a transactional snapshot of a publisher's entire store.
 The default provider lazily loads the
 `Xenova/paraphrase-multilingual-MiniLM-L12-v2` feature-extraction pipeline with
 q8 model weights and mean-pooled normalized embeddings. Model files are cached
-under the shared memory scope. A configured OpenAI-compatible endpoint implements
-the same `EmbeddingProvider` contract.
+inside the active project's memory root; no model-cache path is shared across
+projects. A configured OpenAI-compatible endpoint implements the same
+`EmbeddingProvider` contract.
 
 Vectors are scalar-quantized into sqlite-vec `int8` collections, reducing vector
 storage fourfold relative to Float32. Model name and dimensions select a
@@ -166,15 +172,16 @@ left out. `status` is narrower: `partial` means a retrieval leg failed or the
 byte budget cut the answer short. Matching more than the limit is ordinary and
 does not make an answer partial.
 
-Retrieval is federated. The public lookup searches the session's project, teams,
-and shared scope. It collects unfused candidates concurrently and applies
-namespace, kind, scope and temporal eligibility before ranking. Filtered legs
-replenish their candidate budget up to 1,000 hits; exhausting that bound reports
-a gap rather than claiming complete recall.
+Public retrieval is project-local. The ranking coordinator accepts one or more
+legs only when every engine has the same project owner; mixed-project, team and
+shared inputs are rejected before any search. It applies namespace, kind and
+temporal eligibility before ranking. Filtered legs replenish their candidate
+budget up to 1,000 hits; exhausting that bound reports a gap rather than claiming
+complete recall.
 
-Federated lexical scoring uses BM25 with one set of full-corpus document
-frequencies and average length summed across scopes. It does not compare local
-FTS5 magnitudes or derive IDF from the query's candidate pool. Titles contribute
+Lexical scoring uses BM25 with one set of full-project document frequencies and
+average length across the eligible legs. It does not compare local FTS5
+magnitudes or derive IDF from the query's candidate pool. Titles contribute
 alongside body text, common function words are removed, and named identifiers
 found in titles/URIs constrain their query's candidates. The lexical quality is
 normalized against the query's theoretical saturated BM25 score, not its best
@@ -182,7 +189,7 @@ observed hit. A weak corpus winner must not become a perfect match by definition
 
 The vector collection's `distance` is **L2 over quantized int8 values**, not
 cosine. KNN still uses that existing collection; candidates additionally expose
-cosine similarity computed on the stored vectors. Federated fusion uses this
+cosine similarity computed on the stored vectors. Rank fusion uses this
 similarity and refuses to compare different model/dimension spaces, returning
 lexical results with a gap instead. No re-embedding is needed for this change.
 
@@ -205,13 +212,13 @@ item limit and byte budget are applied once. A shortened excerpt is marked with
 turn useful retrieval into an empty answer. The single-scope `hybridSearch` API
 retains its local RRF scoring as a regression reference.
 
-Every scope's engine builds an embedding provider, and one encoder is loaded per
-model and shared between them: six scopes would otherwise mean six copies of the
-model and six inference sessions. The load is reference counted and released
-when the last holder lets go.
+The project engine builds an embedding provider. Concurrent components in the
+same process reuse one read-only encoder instance per model; the load is
+reference counted and released when the last holder lets go. Persistent model
+files and every data-bearing cache remain under the project root.
 
-Writing is not federated. `memory_record` writes to the project scope; team and
-shared content arrives through sync from the systems that own it.
+`memory_record`, retrieval, source sync, checkpoints and maintenance all target
+the same active project authority.
 
 `before_agent_start` runs lexical-only retrieval over the raw prompt and adds at
 most four candidates above the automatic-injection threshold to that turn's
@@ -238,19 +245,16 @@ the record's own values, and `keep`/`drop` rules decide what is worth storing.
 Undeclared fields fall back to the conventional names, so an ordinary publisher
 needs no mapping and an unusual one needs configuration rather than code.
 
-Neither prjct nor pi-team is imported. The shared surface is the directory rule
-prjct publishes — `$PRJCT_HOME/teams/<id>/<component>`, which pi-team follows
-independently — and the `settings.json` marker each scope carries. Teams are
-discovered by reading those markers, which is also what binds a team's id to its
-name: the mailbox is keyed by name under the Pi agent directory while the
-artifact store is keyed by id under prjct's home, and taking them as separate
-arguments let a caller index one team's artifacts into another's scope.
+No publisher package is imported. The built-in production adapter reads the
+active project's prjct observations through an explicit path mapping. Standalone
+discovery helpers can describe other publisher formats for diagnostics, but the
+production registry never invokes them and routing cannot open their authorities
+or ingest them into the project.
 
-Every adapter declares the scope it belongs to and sync resolves an engine for
-that scope, so team knowledge is written to the team's projection. Retrieval
-filters on `scopeId`, so an adapter routed at the wrong engine would otherwise
-write rows that can never be returned; both the routing and the documents are
-checked, and a mismatch fails loudly.
+Every adapter declares the owner it belongs to. The project-only engine rejects
+a team/shared adapter rather than writing it into a project database. Project
+adapters are checked again against every returned document; a mismatch fails
+loudly before any ingest.
 
 Re-reading a source is driven by work done, not by a clock. A clock re-scans an
 idle session for nothing and leaves a busy one stale; the signal that a sibling
@@ -262,11 +266,12 @@ activity watermark at that moment. An adapter is due when any counter has moved
 past its threshold since that watermark, subject to a minimum interval that
 stops a burst from re-scanning every few seconds.
 
-Both tables live in the projection rather than the journal because they are
-operational, not knowledge: a rebuild discards them, and the cost of that is one
-extra sync. The host reports total context size rather than growth, so the
-per-turn delta is computed by the hook; a context that shrank has been compacted
-and its new size is counted as the growth since.
+Both records are operational, not retrieval candidates. Indexed mode keeps them
+in ordinary SQLite tables; compact mode keeps them in separate typed maps inside
+the same authority snapshot. Rebuild and promotion preserve them. The host
+reports total context size rather than growth, so the per-turn delta is computed
+by the hook; a context that shrank has been compacted and its new size is counted
+as the growth since.
 
 The run is fired without being awaited. A source scan must never sit between the
 user's prompt and the agent starting, and a second run cannot begin while one is
@@ -274,19 +279,20 @@ in flight.
 
 Source selection distinguishes a request from an answer. prjct's default mapping
 keeps failures, verifications and explicitly declared statements, not arbitrary
-`user_input` prompts. pi-team's mapping keeps published result bodies, delivered
-threads and reported check-in state; empty requests and interrupted placeholders
-are excluded. A check-in can contain a substantive final delivery: its title alone
-is not a reason to discard it. Ordinary recall also suppresses legacy raw prompts
-and unanswered threads already indexed by older presets; an explicit namespace
-lookup can still inspect them. Their owner journals are never erased.
+`user_input` prompts. Optional mapping definitions can classify other record
+formats, but an adapter is eligible only when it is explicitly bound to the same
+project owner. Ordinary recall also suppresses legacy raw prompts and unanswered
+threads already indexed by older presets; an explicit namespace lookup can still
+inspect project-local legacy material. Existing owner journals are never erased.
 
-Team artifacts retain their full bounded content (up to 512,000 bytes) rather than
-an 8,000-character preview that could omit the answer. Source-document journal
-events have a 2 MiB serialized bound, consistent with the document contract;
-non-document events keep their 64 KiB bound. Record bodies remain bounded too.
-After updating a preset, sync re-ingests changed bodies idempotently. Previously
-excluded answers become available without changing their imported provenance.
+Discovered artifacts retain their full bounded content (up to 512,000 bytes)
+rather than an 8,000-character preview that could omit the answer. Indexed
+source-document journal events have a 2 MiB serialized bound, consistent with
+the document contract; non-document events keep their 64 KiB bound. Compact
+mode enforces its smaller whole-authority capacity before mutation and promotes
+when necessary. Record bodies remain bounded too. After updating a preset, sync
+re-ingests changed bodies idempotently. Previously excluded answers become
+available without changing their imported provenance.
 
 ## Consolidation and garbage collection
 
@@ -297,16 +303,15 @@ resolution.
 Retention value combines evidence, judgment type, actual positive/negative use,
 age, and standing. Novelty alone is not value. Supported user/native decisions,
 corrections, constraints, and preferences are protected. GC marks active document
-roots, removes only unreferenced or low-value hot projections and stale vector
-collections, records the removed keys in a `gc.compacted` event, and incrementally
-vacuums SQLite. Facts and evidence remain replayable from the append-only log.
+roots, removes only unreferenced or low-value hot projections and stale vectors,
+and records removed keys in a `gc.compacted` event. Facts and evidence remain in
+compact history or the indexed append-only log.
 
-`/memory rebuild` is an operator action for a quiet scope. It uses an advisory
-lock against another rebuild, builds the replacement SQLite file beside the live
-projection, and swaps it only after the full journal has applied. It cannot
-fence another already-open Pi process that keeps writing during the swap; any
-such writes remain in the append-only journal and are recovered by a later
-replay or rebuild.
+`/memory rebuild` is an operator action protected by an advisory per-project
+lock. Compact mode replays its in-database history and regenerates derived
+structures without another authority file. Indexed mode applies the verified
+JSONL history idempotently and reindexes active documents. Neither path starts a
+daemon or reads another project's state.
 
 ## Quality gates
 
@@ -330,16 +335,16 @@ document nearly verbatim, and the system scored 0.8216 without them against a
 are worth about +0.007 — which is roughly what an honest expansion is worth on a
 corpus this size.
 
-The eval also partitions the same corpus deterministically across project, team
-and shared scopes. `federatedNoExpansion` must beat the ordinary baseline gate and
-must not regress Recall@10, MRR or nDCG@10 against the former per-scope RRF merge
-on that partition. This measures the actual public retrieval path, not only the
-single-scope reference.
+Historical evaluation fixtures may partition a corpus to compare fusion math,
+but the production public path accepts only engines with the same project owner.
+Mixed-project, team and shared engine sets are rejected before retrieval; no
+quality score can authorize cross-project reads.
 
 `npm run eval:real -- --cases /private/cases.json` builds a private snapshot of
-prjct sources, team mailboxes and the cached local encoder. It never opens original
-scope indexes or uses a remote embedding provider. Cases specify project id, query,
-expected document ids and optional required excerpt text, or require abstention.
+explicitly authorized project-local sources and its cached local encoder. It
+never opens an original authority or uses a remote embedding provider. Cases
+specify project id, query, expected document ids and optional required excerpt
+text, or require abstention.
 The script checks lexical, hybrid and automatic-injection budgets, full embedding
 coverage, and a second idempotent sync. Reports and source data stay outside the
 repository. See [real-data evaluation](real-data-evaluation.md) for reuse and cleanup.

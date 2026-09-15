@@ -2,7 +2,7 @@ import { assertSourceDocument, documentKey } from '../contracts/documents.ts';
 import type { ScopeKind, SourceDocument } from '../contracts/documents.ts';
 import { enqueueSnapshot } from '../curation/pipeline.ts';
 import type { MemoryEngine } from '../engine.ts';
-import type { Projection } from '../storage/projection.ts';
+import type { ProjectionPort } from '../storage/ports.ts';
 import { withSourceIdentity } from './identity.ts';
 import { dueAdapters, type SyncDecision, type SyncPolicy } from './schedule.ts';
 
@@ -62,7 +62,7 @@ export class SourceRegistry {
    * scope the documents landed in. A failure is recorded too: an adapter that
    * throws every time should not look like one that has never run.
    */
-  async sync(resolve: EngineResolver, id: string, signal?: AbortSignal, book?: Projection): Promise<SourceSyncResult> {
+  async sync(resolve: EngineResolver, id: string, signal?: AbortSignal, book?: ProjectionPort): Promise<SourceSyncResult> {
     try {
       const result = await this.run(resolve, id, signal);
       book?.recordSync(id, { discovered: result.discovered, indexed: result.indexed, ok: !result.gaps.length, ...(result.gaps.length ? { detail: result.gaps.join('; ') } : {}) });
@@ -95,6 +95,7 @@ export class SourceRegistry {
       throw new Error(`Adapter ${id} produced a ${foreign.scopeKind}/${foreign.scopeId} document outside its own scope.`);
     }
     documents.forEach(assertSourceDocument);
+    engine.prepareCapacity(documents.reduce((sum, document) => sum + Buffer.byteLength(JSON.stringify(document), 'utf8'), 0));
     const legacy = new Map([...engine.projection.eachDocumentHash()].map(row => [row.documentKey, row]));
     const collision = documents.find(document => {
       const key = documentKey(document);
@@ -110,7 +111,7 @@ export class SourceRegistry {
       unchanged: queued.unchanged, dense: 0, removed: queued.withdrawn, queued: queued.queued, gaps: snapshot.gaps };
   }
 
-  async syncAll(resolve: EngineResolver, signal?: AbortSignal, book?: Projection): Promise<SourceSyncResult[]> {
+  async syncAll(resolve: EngineResolver, signal?: AbortSignal, book?: ProjectionPort): Promise<SourceSyncResult[]> {
     const results = [] as SourceSyncResult[];
     for (const id of this.list()) results.push(await this.sync(resolve, id, signal, book));
     return results;
@@ -121,7 +122,7 @@ export class SourceRegistry {
    * ones it skipped with the reason. One adapter failing does not stop the
    * others: its failure is recorded and the run continues.
    */
-  async syncDue(resolve: EngineResolver, book: Projection, policy: SyncPolicy = {}, signal?: AbortSignal): Promise<{
+  async syncDue(resolve: EngineResolver, book: ProjectionPort, policy: SyncPolicy = {}, signal?: AbortSignal): Promise<{
     ran: SourceSyncResult[]; failed: readonly { adapter: string; error: string }[]; skipped: readonly SyncDecision[];
   }> {
     const decisions = dueAdapters(book, this.list(), policy);

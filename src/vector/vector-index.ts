@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { SourceDocument } from '../contracts/documents.ts';
 import { assertSourceDocument, documentKey } from '../contracts/documents.ts';
 import { Projection, type VectorHit } from '../storage/projection.ts';
+import type { ProjectionPort } from '../storage/ports.ts';
 import { chunkDocument, type ChunkOptions } from './chunker.ts';
 import type { EmbeddingProvider } from './providers.ts';
 
@@ -34,10 +35,10 @@ export interface VectorIndex {
 
 export class SqliteVectorIndex implements VectorIndex {
   readonly provider: EmbeddingProvider;
-  private readonly projection: Projection;
+  private readonly projection: ProjectionPort;
   private readonly chunkOptions: ChunkOptions;
 
-  constructor(projection: Projection, provider: EmbeddingProvider, chunkOptions: ChunkOptions = {}) {
+  constructor(projection: ProjectionPort, provider: EmbeddingProvider, chunkOptions: ChunkOptions = {}) {
     this.projection = projection;
     this.provider = provider;
     this.chunkOptions = chunkOptions;
@@ -124,7 +125,7 @@ export class SqliteVectorIndex implements VectorIndex {
   }
 }
 
-export const createVectorIndex = (projection: Projection, provider: EmbeddingProvider, options?: ChunkOptions): VectorIndex =>
+export const createVectorIndex = (projection: ProjectionPort, provider: EmbeddingProvider, options?: ChunkOptions): VectorIndex =>
   new SqliteVectorIndex(projection, provider, options);
 
 class OwnedSqliteVectorIndex extends SqliteVectorIndex {

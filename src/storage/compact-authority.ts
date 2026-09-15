@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, statSync } from 'node:fs';
+import { copyFileSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { brotliCompressSync, brotliDecompressSync, constants } from 'node:zlib';
@@ -49,7 +49,7 @@ export class CompactAuthority {
   constructor(readonly path: string, projectId: string) {
     this.owner = assertProjectId(projectId);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path);
+    this.db = new DatabaseSync(path, { allowExtension: true });
     try {
       // Connection-local settings only. Opening a populated compact authority
       // does not create schema, checkpoint or rewrite persistent PRAGMAs.
@@ -98,12 +98,19 @@ export class CompactAuthority {
 
   private row(): { revision: number; bytes: Uint8Array } {
     const row = this.db.prepare('SELECT owner,format,mode,revision,digest,state FROM compact_authority WHERE id=1').get();
-    if (row?.owner !== this.owner) throw new CompactFormatError('Compact authority owner mismatch.');
+    if (row?.owner !== this.owner) throw new CompactFormatError('Memory owner mismatch: database is owned by another project owner.');
     if (row.format !== FORMAT || row.mode !== 0) throw new CompactFormatError('Unsupported compact format/mode; reroute to the indexed authority.');
     if (!Number.isSafeInteger(row.revision) || Number(row.revision) < 0 || !(row.state instanceof Uint8Array)
       || row.state.length > MAX_ENCODED_BYTES || !(row.digest instanceof Uint8Array)
       || !hash(this.owner, row.state).equals(row.digest)) throw new CompactFormatError('Corrupt compact authority state.');
     return { revision: Number(row.revision), bytes: row.state };
+  }
+
+  mode(): 0 | 1 {
+    const row = this.db.prepare('SELECT owner,mode FROM compact_authority WHERE id=1').get();
+    if (row?.owner !== this.owner) throw new CompactFormatError('Memory owner mismatch: database is owned by another project owner.');
+    if (row.mode !== 0 && row.mode !== 1) throw new CompactFormatError('Unsupported compact authority mode.');
+    return row.mode as 0 | 1;
   }
 
   read(): CompactSnapshot {
@@ -125,6 +132,13 @@ export class CompactAuthority {
     } catch (error) { if (busy(error)) return 'busy'; throw error; }
   }
 
+  publicationPaused(): boolean { return this.walBytes() > 0 && this.checkpoint() === 'busy'; }
+
+  exportSnapshot(destination: string): void {
+    if (this.checkpoint() !== 'checkpointed') throw new Error('Compact authority is busy; snapshot was not created.');
+    copyFileSync(this.path, destination);
+  }
+
   compareAndSwap(expectedRevision: number, state: CompactState): CompactWrite {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= Number.MAX_SAFE_INTEGER) {
       throw new CompactFormatError('Invalid compact expected revision.');
@@ -140,7 +154,8 @@ export class CompactAuthority {
       const current = this.row();
       if (current.revision !== expectedRevision) return { status: 'stale', revision: current.revision };
       const pages = Number(this.db.prepare('PRAGMA page_count').get()!.page_count);
-      if (pages > MAX_PAGES) throw new CompactCapacityError('Existing compact pages require indexed promotion.');
+      const promotionStaged = Boolean(this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='applied_events'").get());
+      if (pages > MAX_PAGES && !promotionStaged) throw new CompactCapacityError('Existing compact pages require indexed promotion.');
       const revision = expectedRevision + 1;
       this.db.prepare('UPDATE compact_authority SET revision=?,digest=?,state=? WHERE id=1 AND revision=?')
         .run(revision, hash(this.owner, encoded), encoded, expectedRevision);
@@ -148,6 +163,22 @@ export class CompactAuthority {
       return { status: 'committed', revision };
     } catch (error) { if (busy(error)) return { status: 'busy' }; throw error; }
     finally { if (lock.held) this.db.exec('ROLLBACK'); }
+  }
+
+  /** Hold the compact write fence while a fresh snapshot is promoted. */
+  withPromotionLock<T>(action: (snapshot: CompactSnapshot, db: DatabaseSync) => T): T {
+    const lock = { held: false };
+    this.db.exec('PRAGMA busy_timeout=5000');
+    try {
+      this.db.exec('BEGIN IMMEDIATE'); lock.held = true;
+      const result = action(this.read(), this.db);
+      if (this.mode() !== 1) throw new CompactFormatError('Promotion did not switch authority mode.');
+      this.db.exec('COMMIT'); lock.held = false; this.cache = undefined;
+      return result;
+    } finally {
+      if (lock.held) this.db.exec('ROLLBACK');
+      this.db.exec('PRAGMA busy_timeout=0');
+    }
   }
 
   close(): void { this.db.close(); }

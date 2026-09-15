@@ -104,8 +104,10 @@ test('no checkpoint and oversized current turn fails closed', () => {
 test('checkpoints are private project/session rows excluded from recall and semantic stats', async t => {
   const root = await mkdtemp(join(tmpdir(), 'handoff-cp-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const a = new MemoryEngine({ root: join(root, 'a'), scopeId: 'p_aaa', sessionId: 's1', provider: new TestEmbeddingProvider() });
-  const b = new MemoryEngine({ root: join(root, 'b'), scopeId: 'p_bbb', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  // This assertion inspects indexed rows directly; compact checkpoint behavior
+  // is covered through the public API in the compact runtime suite.
+  const a = new MemoryEngine({ root: join(root, 'a'), scopeId: 'p_aaa', sessionId: 's1', provider: new TestEmbeddingProvider(), storage: 'indexed' });
+  const b = new MemoryEngine({ root: join(root, 'b'), scopeId: 'p_bbb', sessionId: 's1', provider: new TestEmbeddingProvider(), storage: 'indexed' });
   t.after(async () => { await a.dispose(); await b.dispose(); });
   const before = a.projection.stats();
   const checkpoint = {

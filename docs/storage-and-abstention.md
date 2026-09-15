@@ -3,8 +3,16 @@
 ## WAL policy
 
 SQLite remains the only project authority, in WAL mode with `synchronous=FULL`.
-Current-schema opening is unchanged: no checkpoint, persistent schema writes, or
-new PRAGMA work runs on that path. Ordinary extension turns do not checkpoint.
+New bounded projects use the compact single-snapshot layout; existing and large
+projects use the indexed layout. Current-schema opening performs no schema or
+persistent PRAGMA write. Ordinary extension turns do not checkpoint.
+
+Compact publication checkpoints any prior generation before taking its writer
+lock, rechecks WAL/mode/owner/revision under that lock, admits the compressed
+snapshot before `UPDATE`, and writes at most one bounded generation. A pinned
+reader causes explicit busy backpressure instead of WAL accumulation. History
+and its domain reduction are one SQLite commit, so compact mode has no JSONL
+append/apply gap. Indexed mode retains the maintenance policy below.
 
 The explicitly invoked daemon's `processAvailable` checks maintenance before
 materializing work and between completed jobs, outside publication transactions
@@ -143,6 +151,25 @@ unit/scale gates remain unchanged. The real-encoder `npm run eval` gold
 recall/MRR/nDCG gate remains BLOCKED pending explicit model authorization.
 
 Evidence: `/Users/jj/.pi/agent/teams/pime/r17-dev-validation-20260915/{baseline-r16,candidate-r17-final}/report.json`.
-Independent reviewer, external rerun, and QA acceptance are still required on
-frozen bytes. r16 remains the prior mechanically accepted candidate; semantic
-quality authorization remains BLOCKED.
+
+### r18 compact result
+
+An isolated offline run of the same pinned `prjct-cli` workload measured all
+persistent bytes (SQLite, WAL, SHM, JSONL, checkpoints and other files):
+
+| Total bytes | 68,857-B tiny | 7,381,450-B larger |
+| --- | ---: | ---: |
+| Peak live | **59,000** | **3,328,910** |
+| Clean quiescent | **45,568** | **3,177,711** |
+| Closed | **12,800** | **3,144,943** |
+| Reopened | **45,568** | **3,177,711** |
+| Maximum sampled WAL | **13,432** | **1,886,992** |
+
+The tiny workload remains compact and is below its 68,857-B source size in all
+four required phases. The larger source is admitted to indexed mode before its
+first durable mutation and remains a storage win. The same run passed 25/25
+mechanical rows, used zero network/model downloads, returned zero false positives
+for 20 unanswerable routes, and explicitly abstained on O8 in 4/4 routes. Those
+scripted lexical/dense checks are diagnostic only. Semantic answer quality remains
+BLOCKED until a provider, model, private-data permission and budget are explicitly
+authorized.

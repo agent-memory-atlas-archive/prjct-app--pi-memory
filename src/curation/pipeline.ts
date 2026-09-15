@@ -4,7 +4,8 @@ import type { MemoryEngine } from '../engine.ts';
 import { sourceRevisionOf, withSourceIdentity } from '../sources/identity.ts';
 import type { SourceAdapter, SourceSnapshot } from '../sources/registry.ts';
 import { sha256 } from '../workspace/project-identity.ts';
-import { identityFromDocument, jobIdFor, publicationHold, stillHeld, type CurationStore } from './store.ts';
+import { identityFromDocument, jobIdFor, publicationHold, stillHeld } from './store.ts';
+import type { CurationPort } from '../storage/ports.ts';
 import { invalidateDependents, liveFence, materializeSealedBatches, publishProposal, replayAccepted, topicIdFor, topicSemanticKey } from './publish.ts';
 import { CurationBlockError, isCuratedNamespace, type Analyzer, type CurationJob, type EvidenceBundle, type SourceIdentity } from './types.ts';
 
@@ -146,7 +147,7 @@ export const readBundle = async (adapter: SourceAdapter | undefined, identity: S
   };
 };
 
-const recoverBlocked = (store: CurationStore, options: ProcessOptions, now: number): void => {
+const recoverBlocked = (store: CurationPort, options: ProcessOptions, now: number): void => {
   if (options.analyzer) {
     store.unblock('missing_model', now);
     store.unblock('missing_auth', now);

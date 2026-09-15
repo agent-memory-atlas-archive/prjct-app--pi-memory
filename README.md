@@ -19,17 +19,15 @@ pi install npm:@prjct.app/pi-memory
 ```
 
 The first dense operation downloads the default local multilingual encoder into
-`~/.prjct/shared/memory/models`. Until it is available, writes and lexical search
-continue to work and report that dense indexing is pending.
+the active project's `memory/models` directory. Until it is available, writes
+and lexical search continue to work and report that dense indexing is pending.
 
 ## Agent tools
 
-- `memory_context` searches with up to four agent-authored query expansions,
-  inspects ids, proposes consolidation candidates, and records
-  useful/wrong/stale feedback. Lookup covers **every scope the session can
-  read** — this project, each team on the machine, and the shared scope —
-  because a decision a teammate recorded answers the question as well as one
-  recorded here. Pass `scopes: ['project']` to narrow it.
+- `memory_context` searches the active project with up to four agent-authored
+  query expansions, inspects ids, proposes consolidation candidates, and records
+  useful/wrong/stale feedback. It never opens a team, shared or other-project
+  authority. `scopes: ['project']` is the only accepted scope selector.
 - `memory_record` stores a selective temporal fact, appends a resolution instead
   of rewriting history, or indexes a generic source document.
 
@@ -67,31 +65,23 @@ npm run daemon -- stop
 
 ## Sources
 
-`/memory sync` scans the siblings that publish into this machine's prjct home
-and enqueues changed identities for the daemon. It does not copy their bodies
-into the memory journal. Nothing is imported from those apps: the shared surface
-is the directory rule prjct publishes and the `settings.json` marker each scope
-carries.
+`/memory sync` scans configured publishers for the active project and enqueues
+changed identities for explicitly configured maintenance. Source bodies remain
+transient; only validated selected knowledge, fingerprints and citations enter
+the project authority. The built-in eligible source is the project's own prjct
+observation stream.
 
-- **prjct observations** — the project's own observation stream.
-- **pi-team** — for every team discovered under `$PRJCT_HOME/teams/*/settings.json`,
-  the settled journal (from the mailbox under `$PI_CODING_AGENT_DIR/teams`) and
-  the content-addressed artifact store.
+Each adapter declares its owner. The production registry installs only the
+active project's adapter and rejects a team/shared adapter or a document whose
+project id differs from the open engine. Standalone discovery helpers are not
+part of runtime sync. There is no federated cross-project fallback.
 
-Each adapter declares the scope it belongs to, and sync indexes it into that
-scope's own projection — team knowledge into the team, project observations into
-the project. Routing an adapter at the wrong scope is refused rather than
-silently writing rows retrieval can never return. Retrieval then reads across
-all of them, so indexing into a team scope is not the same as hiding it.
-
-Scopes contribute candidates concurrently; one global ranking uses shared
-lexical statistics and measured cosine similarity. Unrelated source winners do
-not get a scope bonus or a reserved slot. When no sufficient signal exists,
-retrieval abstains. Evidence windows preserve the continuation of matching
-headings, and byte-limited excerpts are explicitly marked as shortened.
-`memory_record` still writes to the project — reading is federated, writing is not.
-See [real-data evaluation](docs/real-data-evaluation.md) for reproducible,
-private-snapshot checks with the real encoder.
+Within the project, candidate legs use one ranking with corpus-wide lexical
+statistics and measured cosine similarity. Unrelated sources receive no bonus or
+reserved slot. When no sufficient signal exists, retrieval abstains. Evidence
+windows preserve the continuation of matching headings, and byte-limited
+excerpts are explicitly marked as shortened. See [real-data evaluation](docs/real-data-evaluation.md)
+for reproducible private-snapshot checks with the real encoder.
 
 ### When sources are re-read
 
@@ -108,7 +98,7 @@ since its last run crosses a threshold:
 | minimum time between runs | 5 minutes |
 
 Any one threshold is enough; the minimum interval overrides all of them, so a
-burst of activity cannot re-scan the sibling stores every few seconds. The run
+burst of activity cannot re-scan project-local source trees every few seconds. The run
 happens in the background, so a turn never waits on it, and never twice at once.
 
 `/memory sources` shows the counters, each adapter's last run, and why it is or
@@ -118,11 +108,10 @@ with `installMemory(pi, { sync: { everyTurns: 50, enabled: false } })`.
 A failed run is recorded like a successful one, so a source that throws every
 time is visible as failing rather than looking like one that has never run.
 
-Source selection distinguishes questions from answers. prjct keeps failures,
-verifications and explicitly declared statements, not raw user prompts. pi-team
-keeps published result bodies, delivered threads and check-in replies, not empty
-requests or interrupted-turn placeholders. Artifacts retain their full bounded
-content instead of an 8,000-character preview that might omit the answer.
+Source selection distinguishes questions from answers. The built-in prjct
+mapping keeps failures, verifications and explicitly declared statements, not
+raw user prompts. Eligible artifacts retain their full bounded content instead
+of an 8,000-character preview that might omit the answer.
 
 ### Connecting anything else
 
@@ -153,9 +142,8 @@ const adapter = new JsonRecordAdapter({
 Paths support nesting and `*` fan-out (`replies.*.state`). Timestamps are
 accepted as ISO strings, epoch seconds or epoch milliseconds. Selection is a
 rule set — `keep` is a disjunction, `drop` vetoes — so what a source contributes
-is configuration, not a code change. Pass extra adapters through
-`installMemory(pi, { extra: [...] })`, and override any built-in selection with
-`{ observations, teamJournal, mappings }`.
+is configuration, not a code change. Custom registries may add adapters, but
+every production adapter and returned document must identify the active project.
 
 ## One product, reusable vector layer
 
@@ -173,9 +161,10 @@ const vectors = openVectorIndex({
 ```
 
 The default provider is a quantized local multilingual sentence encoder. An
-OpenAI-compatible embedding endpoint can be selected in the scope's
+OpenAI-compatible embedding endpoint can be selected in the project's
 `memory/config.json`; credentials are read from the host environment and are
-never persisted by pi-memory.
+never persisted by pi-memory. A configured local `cacheDir` must remain inside
+that project memory root; escaping and symlinked cache paths are rejected.
 
 Known supply-chain caveat: `@huggingface/transformers` currently brings
 `onnxruntime-node` and image-processing dependencies whose audit advisories may
@@ -184,11 +173,21 @@ review `npm audit --omit=dev` before publishing or deploying.
 
 ## Storage
 
-Project data lives at `~/.prjct/<projectId>/memory` (or `$PRJCT_HOME`). Team and
-shared scopes use `~/.prjct/teams/<teamId>/memory` and
-`~/.prjct/shared/memory`. Immutable, hash-chained events are appended under
-`events/<YYYYMMDD>/<writer>.jsonl`; `index.sqlite` is a disposable FTS5,
-temporal-graph, and sqlite-vec projection rebuilt from those events.
+Each project owns exactly one database at
+`$PRJCT_HOME/<projectId>/memory/memory.sqlite` (default `~/.prjct`). The engine
+refuses team/shared authorities and foreign owners; there is no shared database
+or cross-project fallback.
+
+New small projects use a compact authority: hash-chained history, domain state,
+chunks and packed vectors commit together in one bounded SQLite snapshot, with
+no journal or checkpoint sidecar. Retrieval scans that bounded state directly.
+Existing indexed stores remain indexed and open without implicit migration. A
+large discovered source selects the indexed layout before its first mutation;
+if an active compact store reaches capacity, indexed tables are staged while the
+compact marker remains authoritative, all logical state is copied in one
+transaction, and the authority mode switches last. Indexed mode retains the
+hash-chained `events/<YYYYMMDD>/<writer>.jsonl` recovery log plus FTS5,
+temporal-graph and sqlite-vec tables in the same project directory.
 
 See [Architecture](docs/architecture.md) for retrieval, concurrency, retention,
 and provenance details.
@@ -229,12 +228,11 @@ chunk each, with a deterministic stand-in encoder:
 | whole hybrid query p95 | 15.2 ms | 105.7 ms |
 | resting size | 7.19 KB/chunk | 6.82 KB/chunk |
 
-Single-document ingest is bounded by one `fsync` per journal entry (~3.8 ms),
-which is the durability guarantee, not overhead to be optimized away.
-`indexAll()` trades it for one `fsync` per batch: a crash can lose the tail of a
-run, which is then re-ingested. Use `index()` when a single write has to survive
-on its own. Real encoder inference is not included in these figures and will
-dominate them.
+These scale figures exercise the indexed layout. Indexed single-document ingest
+is bounded by one `fsync` per journal entry (~3.8 ms); `indexAll()` uses one
+`fsync` per batch. Compact history and projection instead commit in the same
+FULL-synchronous SQLite transaction, eliminating the append/apply crash window.
+Real encoder inference is not included in these figures and will dominate them.
 
 Whole-query latency is dominated by FTS5 bm25 scoring and grows with corpus
 size. Three things keep that in hand: no search leg joins `documents`;
@@ -267,6 +265,8 @@ and [real-content lifecycle validation](docs/real-data-evaluation.md#real-conten
 ### Storage and abstention boundaries
 
 See [WAL maintenance, default abstention, and the corrected offline benchmark](docs/storage-and-abstention.md).
-The 68,857-byte tiny source corpus is **not a storage win**, even after checkpointing.
-Larger-corpus savings apply only to the measured selected-memory workload; semantic
-answer quality remains blocked pending authorized model evaluation.
+The r18 compact run stores the exact 68,857-byte tiny workload in 59,000 B at
+peak-live, 45,568 B quiescent/reopened, and 12,800 B closed. The 7,381,450-byte
+source workload selects indexed mode and remains a measured storage win. These
+are workload-specific mechanical results; semantic answer quality remains
+blocked pending authorized model evaluation.

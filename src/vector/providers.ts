@@ -20,21 +20,29 @@ export const DEFAULT_LOCAL_MODEL = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2
 
 /**
  * One loaded model per (model, cacheDir), shared by every provider that asks
- * for it and released when the last one lets go. A session that reads its
- * project, the shared scope and four teams holds six engines; without this each
- * would load its own copy of the encoder and its own inference session.
+ * for it and released when the last one lets go. Concurrent components for the
+ * active project must not each load their own copy and inference session. This
+ * in-process read-only reuse does not change the project-local disk cache path.
  */
 type SharedPipeline = { pipeline: Promise<FeaturePipeline>; refs: number };
 const loaded = new Map<string, SharedPipeline>();
 
 const loads = { count: 0 };
+const modelLoads: { tail: Promise<void> } = { tail: Promise.resolve() };
 
 const loadPipeline = async (model: string, cacheDir: string | undefined): Promise<FeaturePipeline> => {
   loads.count += 1;
-  const transformers = await import('@huggingface/transformers');
-  if (cacheDir) transformers.env.cacheDir = cacheDir;
-  transformers.env.allowRemoteModels = true;
-  return await transformers.pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as FeaturePipeline;
+  // transformers.env.cacheDir is process-global. Serialize the entire model
+  // load so concurrent projects cannot race that mutable setting and populate
+  // one another's persistent cache directories.
+  const load = modelLoads.tail.then(async () => {
+    const transformers = await import('@huggingface/transformers');
+    if (cacheDir) transformers.env.cacheDir = cacheDir;
+    transformers.env.allowRemoteModels = true;
+    return await transformers.pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as FeaturePipeline;
+  });
+  modelLoads.tail = load.then(() => undefined, () => undefined);
+  return await load;
 };
 
 /** How many encoders are resident. */

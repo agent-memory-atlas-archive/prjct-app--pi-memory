@@ -10,7 +10,7 @@ import { SourceRegistry, type SourceSyncResult } from './sources/registry.ts';
 import { dueAdapters, type SyncPolicy } from './sources/schedule.ts';
 
 export type MemoryExtensionOptions = Readonly<{
-  home?: string; mailboxRoot?: string; recallThreshold?: number;
+  home?: string; recallThreshold?: number;
   /** Explicit bound for messages retained after a real model switch. */
   handoff?: HandoffBudget;
   /** Thresholds that make a source due; `{ enabled: false }` turns it off. */
@@ -22,8 +22,8 @@ const USAGE = 'Usage: /memory status | sources | sync [adapter] | replay | rebui
 /**
  * Scans publisher sources, records fingerprints and enqueues analysis jobs.
  * It does not copy raw source bodies into the memory journal. The standalone
- * daemon publishes curated knowledge. Each adapter is routed to the scope it
- * declares.
+ * daemon publishes curated knowledge. Every adapter must declare this project's
+ * owner; team, shared and foreign-project routing is rejected.
  */
 const syncSources = async (registry: SourceRegistry, sessionId: string, project: MemoryEngine,
   target: string | undefined, options: MemoryExtensionOptions): Promise<SourceSyncResult[]> => {

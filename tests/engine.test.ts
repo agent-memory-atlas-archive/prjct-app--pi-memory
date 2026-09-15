@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { MemoryEngine, hostEvidence } from '../src/engine.ts';
 import type { EmbeddingProvider } from '../src/vector/providers.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
+import { sha256 } from '../src/workspace/project-identity.ts';
 
 class RecoveringEmbeddingProvider implements EmbeddingProvider {
   readonly model = 'recovering-v1';
@@ -86,11 +87,80 @@ test('rebuild is locked and still reconstructs the projection', async t => {
   assert.equal(rebuilt.documents, 1);
 });
 
-test('replay repairs an event committed before its projection and remains idempotent', async t => {
+test('indexed replay repairs an event committed before its projection and remains idempotent', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-engine-'));
-  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider(), storage: 'indexed' });
   t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
   await engine.journal.append({ type: 'document.deleted', namespace: 'docs', externalId: 'missing', reason: 'crash-window' });
   assert.equal((await engine.replay()).events, 1);
   assert.equal((await engine.replay()).events, 0);
+});
+
+test('compact journal append and projection application are one durable operation', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-compact-engine-'));
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
+  await engine.journal.append({ type: 'document.deleted', namespace: 'docs', externalId: 'missing', reason: 'atomic' });
+  assert.equal((await engine.replay()).events, 0);
+  assert.equal((await engine.journal.readAll()).length, 1);
+});
+
+test('capacity promotion atomically preserves history, jobs, checkpoints, vectors and retrieval', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-promotion-'));
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 'compact', provider: new TestEmbeddingProvider() });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  engine.projection.upsertOperationalCheckpoint('p_test', 'handoff', '{"goal":"preserve"}', 1);
+  const identity = { adapter: 'docs', documentKey: 'docs\u0000one', namespace: 'docs', externalId: 'one', revision: 'r1',
+    contentHash: sha256('r1'), kind: 'document', observedAt: '2026-01-01T00:00:00.000Z', trust: 'host' as const, metadata: {} };
+  engine.curation.upsertFingerprint(identity, 1);
+  engine.curation.writeTopic({ id: 'topic_preserve', scopeId: 'p_test', title: 'Preserve', summary: 'Promotion state', factIds: [] }, 0, 1);
+  engine.curation.setCoverage(identity.documentKey, 10, 20, 1);
+  engine.curation.saveWindowDraft(identity.documentKey, identity.revision, 0, [], ['keep qualification'], 'draft');
+  engine.curation.linkFact('mem_future', identity);
+  engine.curation.recordSpend({ calls: 2, inputTokens: 3, outputTokens: 4, embeddingCalls: 5 }, Date.parse('2026-01-01T00:00:00.000Z'));
+  engine.curation.enqueue({ id: 'job_batch', scopeId: 'p_test', adapter: 'docs', documentKey: identity.documentKey,
+    action: 'analyze', inputRevision: 'r1', contentHash: identity.contentHash });
+  const claimed = engine.curation.claim('owner', 60_000)!;
+  const accepted = engine.curation.acceptBatch(claimed, identity, 'topic_preserve', 1, { factIds: [] }, 'owner')!;
+  engine.curation.finish(claimed.id, 'owner', 'no_change', undefined, Date.now(), true);
+  engine.curation.enqueue({ id: 'job_preserve', scopeId: 'p_test', adapter: 'docs', documentKey: identity.documentKey,
+    action: 'review', inputRevision: 'r1', contentHash: identity.contentHash }, 3);
+  const observer = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 'observer', provider: new TestEmbeddingProvider() });
+  assert.equal(observer.storageMode, 'compact');
+  for (const index of Array.from({ length: 40 }, (_, value) => value)) {
+    const entropy = Array.from({ length: 40 }, (_, value) => sha256(`${index}:${value}`)).join(' ');
+    await engine.recordFact({ id: `mem_promote_${index}`, kind: 'fact', statement: `Promotion fact ${index}: ${entropy}`,
+      entities: [], evidence: [], episodeIds: [], confidence: 0.8, tags: {} });
+    if (engine.storageMode === 'indexed') break;
+  }
+  assert.equal(engine.storageMode, 'indexed');
+  assert.equal(engine.curation.getJob('job_preserve')?.status, 'pending');
+  assert.equal(engine.curation.fingerprint(identity.documentKey)?.revision, 'r1');
+  assert.equal(engine.curation.watermark('docs', identity.documentKey)?.outcome, 'no_change');
+  assert.equal(engine.curation.topic('topic_preserve')?.summary, 'Promotion state');
+  assert.deepEqual(engine.curation.coverage(identity.documentKey), { offset: 10, total: 20 });
+  assert.equal(engine.curation.windowDrafts(identity.documentKey, 'r1')[0]?.qualifications[0], 'keep qualification');
+  assert.deepEqual(engine.curation.dependents(identity.documentKey), ['mem_future']);
+  assert.equal(engine.curation.acceptedBatch('job_batch')?.id, accepted);
+  assert.equal(engine.curation.spend(Date.parse('2026-01-01T00:00:00.000Z')).embeddingCalls, 5);
+  assert.equal(engine.projection.operationalCheckpoint('p_test', 'handoff'), '{"goal":"preserve"}');
+  assert.ok(engine.projection.stats().facts > 0);
+  assert.ok(engine.projection.stats().vectors > 0);
+  assert.equal((await engine.search({ queries: ['Promotion fact 0'], dense: false })).items[0]?.id, 'mem_promote_0');
+  const history = await engine.journal.readAll();
+  assert.ok(history.some(event => event.payload.type === 'fact.recorded' && event.payload.fact.id === 'mem_promote_0'));
+  await observer.recordFact({ id: 'mem_observer', kind: 'fact', statement: 'An already-open client reroutes after promotion.',
+    entities: [], evidence: [], episodeIds: [], confidence: 0.8, tags: {} });
+  assert.equal(observer.storageMode, 'indexed');
+  assert.equal(engine.projection.getFact('mem_observer')?.statement, 'An already-open client reroutes after promotion.');
+  const reopened = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 'indexed', provider: new TestEmbeddingProvider() });
+  assert.equal(reopened.storageMode, 'indexed');
+  assert.equal(reopened.curation.getJob('job_preserve')?.status, 'pending');
+  assert.equal(reopened.curation.acceptedBatch('job_batch')?.id, accepted);
+  assert.equal(reopened.curation.watermark('docs', identity.documentKey)?.revision, 'r1');
+  assert.equal(reopened.curation.windowDrafts(identity.documentKey, 'r1')[0]?.summary, 'draft');
+  assert.equal(reopened.projection.operationalCheckpoint('p_test', 'handoff'), '{"goal":"preserve"}');
+  await reopened.dispose();
+  await observer.dispose();
+  await engine.dispose();
 });

@@ -7,7 +7,6 @@ import { loadDaemonConfig } from '../src/daemon/config.ts';
 import { runCycle } from '../src/daemon/worker.ts';
 import { MemoryEngine } from '../src/engine.ts';
 import { federatedSearch } from '../src/retrieval/federated.ts';
-import { teamMailboxRoot } from '../src/sources/discovery.ts';
 import { prjctHomeFor } from '../src/workspace/project-identity.ts';
 
 type Case = { name: string; projectId: string; query: string; contains?: string; citation?: string; abstain?: boolean };
@@ -34,18 +33,20 @@ const copy = async (source: string, destination: string): Promise<void> => {
   } });
 };
 const sourceHome = join(workspace, 'source');
-const mailbox = join(workspace, 'mailbox');
 const indexes = join(workspace, 'indexes');
 const models = join(workspace, 'models');
 if (!process.argv.includes('--reuse')) {
-  await copy(resolve(arg('--home') ?? prjctHomeFor()), sourceHome);
-  await copy(resolve(arg('--mailbox') ?? teamMailboxRoot()), mailbox);
+  const source = resolve(arg('--home') ?? prjctHomeFor());
+  await mkdir(sourceHome, { mode: 0o700 });
+  for (const projectId of [...new Set(cases.map(item => item.projectId))]) {
+    await copy(join(source, projectId), join(sourceHome, projectId));
+  }
   await mkdir(indexes, { mode: 0o700 });
   await mkdir(models, { mode: 0o700 });
-  await writeFile(join(workspace, 'snapshot.json'), JSON.stringify({ source: sourceHome, mailbox, indexes, models }, null, 2));
+  await writeFile(join(workspace, 'snapshot.json'), JSON.stringify({ source: sourceHome, indexes, models }, null, 2));
 }
 const canonical = await realpath(workspace);
-for (const path of [sourceHome, mailbox, indexes]) {
+for (const path of [sourceHome, indexes]) {
   if (!(await stat(path).catch(() => undefined))) throw new Error(`Missing workspace path ${path}`);
   const rel = relative(canonical, await realpath(path));
   if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('Curated eval paths must stay inside the workspace.');
@@ -87,7 +88,7 @@ for (const id of [...new Set(cases.map(item => item.projectId))]) {
   engines.push(await MemoryEngine.forScope('project', id, 'curated-eval', { home: indexes }));
 }
 const started = Date.now();
-const cycle = await runCycle({ config: { ...config, home: sourceHome }, owner: 'curated-eval', analyzer, engines, mailboxRoot: mailbox });
+const cycle = await runCycle({ config: { ...config, home: sourceHome }, owner: 'curated-eval', analyzer, engines });
 const rawBodies: string[] = [];
 for (const engine of engines) {
   for (const event of await engine.journal.readAll()) {

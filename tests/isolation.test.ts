@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -10,8 +10,8 @@ import { federatedSearch } from '../src/retrieval/federated.ts';
 import { MEMORY_DATABASE, memoryDatabasePath } from '../src/workspace/project-identity.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
 
-const open = (home: string, id: string): Promise<MemoryEngine> =>
-  MemoryEngine.forScope('project', id, 's1', { home, provider: new TestEmbeddingProvider() });
+const open = (home: string, id: string, storage: 'auto' | 'indexed' = 'auto'): Promise<MemoryEngine> =>
+  MemoryEngine.forScope('project', id, 's1', { home, provider: new TestEmbeddingProvider(), storage });
 
 test('each project owns a separate memory.sqlite and cannot open another project', async t => {
   const home = await mkdtemp(join(tmpdir(), 'pi-memory-iso-'));
@@ -67,7 +67,7 @@ test('contradictory knowledge in A is invisible to B including inspect and feedb
 test('a competing process can open a migrated database while a writer holds BEGIN IMMEDIATE', async t => {
   const home = await mkdtemp(join(tmpdir(), 'pi-memory-iso5b-'));
   t.after(() => rm(home, { recursive: true, force: true }));
-  const engine = await open(home, 'p_iso5b');
+  const engine = await open(home, 'p_iso5b', 'indexed');
   t.after(() => engine.dispose());
   engine.projection.db.exec('BEGIN IMMEDIATE');
   const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./open-engine-child.mts', import.meta.url)), home, 'p_iso5b'], {
@@ -80,6 +80,22 @@ test('a competing process can open a migrated database while a writer holds BEGI
   engine.projection.db.exec('ROLLBACK');
   assert.equal(code, 0, `competing opener crashed: ${output.err || output.out}`);
   assert.match(output.out, /opened-ok/);
+});
+
+test('embedding caches cannot escape or symlink outside the project authority', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-memory-cache-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const outside = join(home, 'outside');
+  await mkdir(outside);
+  const configured = join(home, 'p_configured', 'memory');
+  await mkdir(configured, { recursive: true });
+  await writeFile(join(configured, 'config.json'), JSON.stringify({ cacheDir: outside }));
+  await assert.rejects(MemoryEngine.forScope('project', 'p_configured', 's1', { home }), /escaped the project authority/);
+
+  const linked = join(home, 'p_linked', 'memory');
+  await mkdir(linked, { recursive: true });
+  await symlink(outside, join(linked, 'models'), 'dir');
+  await assert.rejects(MemoryEngine.forScope('project', 'p_linked', 's1', { home }), /outside the project authority/);
 });
 
 test('a symlink into another project is rejected', async t => {

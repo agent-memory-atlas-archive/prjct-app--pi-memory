@@ -32,7 +32,7 @@ export type MemorySearch = (request: Parameters<typeof federatedSearch>[1]) => R
 export const DEFAULT_RECALL_THRESHOLD = 0;
 
 export const installMemoryHooks = (pi: ExtensionAPI, options: {
-  home?: string; recallThreshold?: number; federate?: boolean;
+  home?: string; recallThreshold?: number;
   handoff?: HandoffBudget;
   /** Called after each turn is counted, so the caller can sync when due. */
   onActivity?: (project: MemoryEngine) => Promise<void> | void;

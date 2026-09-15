@@ -1,4 +1,7 @@
+import { statSync } from 'node:fs';
+import type { DatabaseSync } from 'node:sqlite';
 import { chunkDocument } from '../vector/chunker.ts';
+import { rankLexically, words } from '../retrieval/lexical.ts';
 import { documentKey } from '../contracts/documents.ts';
 import type { DocumentChunk, SourceDocument } from '../contracts/documents.ts';
 import type { EvidenceRef } from '../contracts/evidence.ts';
@@ -22,7 +25,7 @@ type Batch = { id: string; jobId: string; documentKey: string; sourceRevision: s
 type Fingerprint = SourceIdentity & { withdrawnAt?: number; updatedAt: number };
 type Topic = { id: string; scopeId: string; title: string; summary: string; revision: number; summaryHash: string; factIds: string[]; updatedAt: number };
 
-type State = {
+export type CompactDomainState = {
   version: 1;
   history: MemoryEvent[];
   applied: Record<string, string>;
@@ -58,6 +61,8 @@ const TERMINAL: readonly JobStatus[] = ['published', 'no_change', 'discarded'];
 const utcDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
 const defined = <T extends Record<string, unknown>>(value: T): T =>
   Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null)) as T;
+type State = CompactDomainState;
+
 const emptyState = (): State => ({
   version: 1, history: [], applied: {}, documents: {}, chunks: {}, vectors: {}, facts: {}, evidence: {}, entities: {},
   episodes: {}, factEvidence: {}, factEntities: {}, factEpisodes: {}, links: [], usefulness: {},
@@ -65,6 +70,11 @@ const emptyState = (): State => ({
   curation: { fingerprints: {}, jobs: {}, watermarks: {}, topics: {}, batches: {}, coverage: {}, drafts: {}, dependencies: {}, spend: {} },
 });
 const jobView = (job: CurationJob): CurationJob => defined({ ...job }) as CurationJob;
+const tokenSequencePresent = (text: string, token: string): boolean => {
+  const haystack = words(text);
+  const needle = words(token);
+  return needle.length > 0 && haystack.some((_, index) => needle.every((word, offset) => haystack[index + offset] === word));
+};
 
 /**
  * Compact domain adapters over one CompactAuthority snapshot. Pure state
@@ -83,7 +93,7 @@ export class CompactStore {
   readonly projection: CompactProjection;
   readonly curation: CompactCuration;
 
-  constructor(path: string, readonly projectId: string) {
+  constructor(readonly path: string, readonly projectId: string) {
     this.authority = new CompactAuthority(path, projectId);
     this.projection = new CompactProjection(this);
     this.curation = new CompactCuration(this);
@@ -101,8 +111,15 @@ export class CompactStore {
   }
 
   revision(): number { return this.authority.read().revision; }
+  mode(): 0 | 1 { return this.authority.mode(); }
   promotionRequired(): boolean { return this.capacity; }
-  checkpoint(): 'checkpointed' | 'busy' { return this.authority.checkpoint(); }
+  isLogicallyEmpty(): boolean { return JSON.stringify(this.state()) === JSON.stringify(emptyState()); }
+  checkpoint(): 'checkpointed' | 'busy' {
+    if (this.draft.state) throw new Error('Cannot checkpoint inside an authority transaction.');
+    return this.authority.checkpoint();
+  }
+  publicationPaused(): boolean { return this.authority.publicationPaused(); }
+  exportSnapshot(destination: string): void { this.authority.exportSnapshot(destination); }
   close(): void { this.authority.close(); }
 
   transaction<T>(action: () => T): T {
@@ -131,6 +148,12 @@ export class CompactStore {
   }
 
   history(): readonly MemoryEvent[] { return this.state().history; }
+  promotionState(): CompactDomainState { return structuredClone(this.state()); }
+  withPromotionLock<T>(action: (state: CompactDomainState, db: DatabaseSync) => T): T {
+    if (this.draft.state) throw new Error('Cannot promote inside an authority transaction.');
+    return this.authority.withPromotionLock((snapshot, db) => action(
+      structuredClone(snapshot.state.version === 1 ? snapshot.state as unknown as State : emptyState()), db));
+  }
 
   applyEvent(event: MemoryEvent): boolean {
     if (this.state().applied[event.id]) return false;
@@ -271,7 +294,13 @@ const applyToState = (state: State, event: MemoryEvent): void => {
 // ------------------------------------------------------------- projection
 
 export class CompactProjection {
-  constructor(private readonly store: CompactStore) {}
+  readonly path: string;
+  /** Compact mode intentionally exposes no SQL driver; retained only so the
+   * legacy Projection-shaped public field fails explicitly rather than leaking
+   * an unrelated connection. */
+  get db(): never { throw new Error('Compact memory has no public SQL projection driver.'); }
+  constructor(private readonly store: CompactStore) { this.path = store.path; }
+  exportSnapshot(destination: string): void { this.store.exportSnapshot(destination); }
   private get state(): State { return this.store.state(); }
 
   hasEvent(id: string): boolean { return Boolean(this.state.applied[id]); }
@@ -330,6 +359,28 @@ export class CompactProjection {
     return entry && entry.deletedAt === null ? entry.document : undefined;
   }
 
+  upsertDocument(document: SourceDocument): void {
+    this.store.transaction(() => upsertDocument(this.state, document));
+  }
+
+  deleteDocument(namespace: string, externalId: string, at: string): void {
+    this.store.transaction(() => deleteDocumentKey(this.state, documentKey({ namespace, externalId }), at));
+  }
+
+  replaceChunks(key: string, chunks: readonly DocumentChunk[], _title?: string): void {
+    this.replaceChunksBatch(chunks, new Map([[key, _title ?? '']]));
+  }
+
+  replaceChunksBatch(chunks: readonly DocumentChunk[], titles?: ReadonlyMap<string, string>): void {
+    this.store.transaction(() => {
+      const keys = new Set([...chunks.map(chunk => chunk.documentKey), ...(titles ? [...titles.keys()] : [])]);
+      for (const key of keys) {
+        for (const id of Object.keys(this.state.chunks)) if (this.state.chunks[id]!.documentKey === key) dropChunk(this.state, id);
+      }
+      for (const chunk of chunks) this.state.chunks[chunk.id] = chunk;
+    });
+  }
+
   chunkCount(document: Pick<SourceDocument, 'namespace' | 'externalId'>): number {
     const key = documentKey(document);
     return Object.values(this.state.chunks).filter(chunk => chunk.documentKey === key).length;
@@ -359,7 +410,11 @@ export class CompactProjection {
     if (rows.some(row => row.vector.some(value => !Number.isFinite(value)))) throw new Error('Embedding vectors must be finite.');
     if (!Number.isSafeInteger(dims) || dims < 8 || dims > 8192) throw new Error('Invalid embedding dimensions.');
     this.store.transaction(() => {
-      for (const row of rows) this.state.vectors[row.chunkId] = { model, dims, values: [...row.vector] };
+      for (const row of rows) {
+        const norm = Math.sqrt(row.vector.reduce((sum, value) => sum + value * value, 0));
+        const values = row.vector.map(value => Math.max(-127, Math.min(127, Math.round(norm ? value * 127 / norm : 0))));
+        this.state.vectors[row.chunkId] = { model, dims, values };
+      }
     });
   }
 
@@ -367,11 +422,85 @@ export class CompactProjection {
 
   storedVector(chunkId: string): { model: string; dims: number; values: number[] } | undefined { return this.state.vectors[chunkId]; }
 
+  vectorSearch(model: string, dims: number, vector: readonly number[], limit: number): Array<{
+    chunkId: string; documentKey: string; distance: number; dimensions: number; similarity: number;
+  }> {
+    if (vector.some(value => !Number.isFinite(value))) throw new Error('Embedding query must be finite.');
+    if (!Number.isSafeInteger(dims) || dims < 8 || dims > 8192 || vector.length !== dims) throw new Error('Invalid embedding dimensions.');
+    const queryNorm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+    return Object.entries(this.state.vectors).flatMap(([chunkId, stored]) => {
+      const chunk = this.state.chunks[chunkId];
+      if (!chunk || stored.model !== model || stored.dims !== dims) return [];
+      const storedNorm = Math.sqrt(stored.values.reduce((sum, value) => sum + value * value, 0));
+      const dot = stored.values.reduce((sum, value, index) => sum + value * vector[index]!, 0);
+      const similarity = storedNorm && queryNorm ? Math.max(-1, Math.min(1, dot / (storedNorm * queryNorm))) : 0;
+      return [{ chunkId, documentKey: chunk.documentKey, distance: Math.sqrt(Math.max(0, 2 - 2 * similarity)), dimensions: dims, similarity }];
+    }).sort((a, b) => a.distance - b.distance || a.chunkId.localeCompare(b.chunkId)).slice(0, Math.max(1, Math.min(1_000, limit)));
+  }
+
   unembeddedChunks(model: string): Array<DocumentChunk & { document: SourceDocument }> {
     const state = this.state;
     return this.chunks(Object.keys(state.chunks).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
       .filter(id => state.vectors[id]?.model !== model)
       .filter(id => state.documents[state.chunks[id]!.documentKey]?.deletedAt === null));
+  }
+
+  lexicalStatistics(terms: readonly string[]): { documents: number; tokens: number; frequencies: ReadonlyMap<string, number> } {
+    const chunks = Object.values(this.state.chunks);
+    const searchable = (chunk: DocumentChunk): string => `${this.state.documents[chunk.documentKey]?.document.title ?? ''}\n${chunk.text}\n${Object.values(chunk.metadata).join(' ')}`;
+    const wanted = new Set(terms.flatMap(words));
+    const frequencies = new Map<string, number>();
+    for (const term of wanted) frequencies.set(term, chunks.filter(chunk => new Set(words(searchable(chunk))).has(term)).length);
+    return { documents: chunks.length, tokens: chunks.reduce((sum, chunk) => sum + words(searchable(chunk)).length, 0), frequencies };
+  }
+
+  selectiveTerms(tokens: readonly string[]): string[] {
+    const unique = [...new Set(tokens.map(token => token.toLocaleLowerCase()))];
+    if (unique.length <= 3) return unique;
+    const chunks = Object.values(this.state.chunks);
+    const counts = new Map(unique.map(token => [token, chunks.filter(chunk => tokenSequencePresent(chunk.text, token)).length]));
+    const ranked = [...unique].sort((a, b) => (counts.get(a) ?? 0) - (counts.get(b) ?? 0));
+    const ceiling = chunks.length >= 5_000 ? chunks.length * 0.05 : Number.POSITIVE_INFINITY;
+    const informative = ranked.filter(term => (counts.get(term) ?? 0) <= ceiling);
+    return (informative.length >= 3 ? informative : ranked.slice(0, 3)).slice(0, 12);
+  }
+
+  lexicalSearch(query: string, limit: number): Array<{ chunkId: string; documentKey: string; score: number }> {
+    const tokens = query.toLocaleLowerCase().match(/[\p{L}\p{N}_./:-]{2,}/gu) ?? [];
+    const terms = this.selectiveTerms(tokens.slice(0, 64));
+    if (!terms.length) return [];
+    const state = this.state;
+    const candidates = Object.values(state.chunks).filter(chunk => terms.some(term => tokenSequencePresent(
+      `${state.documents[chunk.documentKey]?.document.title ?? ''}\n${chunk.text}\n${Object.values(chunk.metadata).join(' ')}`, term)))
+      .map(chunk => ({ key: chunk.id, title: state.documents[chunk.documentKey]?.document.title, statement: chunk.text }));
+    const scores = rankLexically(candidates, [terms.join(' ')], [this.lexicalStatistics(terms)])[0]!;
+    return candidates.flatMap(candidate => {
+      const score = scores.get(candidate.key);
+      const chunk = state.chunks[candidate.key];
+      return score && chunk ? [{ chunkId: chunk.id, documentKey: chunk.documentKey, score }] : [];
+    }).sort((a, b) => b.score - a.score || a.chunkId.localeCompare(b.chunkId)).slice(0, Math.max(1, Math.min(1_000, limit)));
+  }
+
+  exactSearch(query: string, limit: number): Array<{ chunkId: string; documentKey: string; score: number }> {
+    const capped = Math.max(1, Math.min(1_000, limit));
+    const state = this.state;
+    return Object.values(state.chunks).filter(chunk => chunk.id === query
+      || state.documents[chunk.documentKey]?.document.externalId === query
+      || (query.length <= 160 && (chunk.text.toLocaleLowerCase().includes(query.toLocaleLowerCase())
+        || state.documents[chunk.documentKey]?.document.uri?.toLocaleLowerCase().includes(query.toLocaleLowerCase()))))
+      .sort((a, b) => a.id.localeCompare(b.id)).slice(0, capped)
+      .map(chunk => ({ chunkId: chunk.id, documentKey: chunk.documentKey, score: 1 }));
+  }
+
+  chunkWindow(chunkId: string, maxChars = 2_400): { text: string; chunkIds: string[] } | undefined {
+    const first = this.state.chunks[chunkId];
+    if (!first) return undefined;
+    return Object.values(this.state.chunks).filter(chunk => chunk.documentKey === first.documentKey && chunk.ordinal >= first.ordinal)
+      .sort((a, b) => a.ordinal - b.ordinal).slice(0, 3).reduce<{ text: string; chunkIds: string[] }>((window, chunk) => {
+        if (window.text.length >= maxChars) return window;
+        const next = `${window.text ? '\n\n' : ''}${chunk.text}`;
+        return { text: `${window.text}${next}`.slice(0, maxChars), chunkIds: [...window.chunkIds, chunk.id] };
+      }, { text: '', chunkIds: [] });
   }
 
   graphNeighbors(factIds: readonly string[], limit: number): StoredFact[] {
@@ -418,10 +547,21 @@ export class CompactProjection {
 
   stats(): { documents: number; chunks: number; vectors: number; facts: number; events: number; bytes: number } {
     const state = this.state;
+    const bytes = [this.path, `${this.path}-wal`, `${this.path}-shm`]
+      .reduce((sum, path) => sum + (statSync(path, { throwIfNoEntry: false })?.size ?? 0), 0);
     return { documents: Object.keys(state.documents).length, chunks: Object.keys(state.chunks).length,
       vectors: Object.keys(state.vectors).length,
-      facts: Object.keys(state.facts).length, events: Object.keys(state.applied).length, bytes: 0 };
+      facts: Object.keys(state.facts).length, events: Object.keys(state.applied).length, bytes };
   }
+
+  checkpointWal(): { status: 'checkpointed' | 'busy'; logFrames: number; checkpointedFrames: number } {
+    const status = this.store.checkpoint();
+    return { status, logFrames: 0, checkpointedFrames: 0 };
+  }
+
+  walPublicationPaused(): boolean { return this.store.publicationPaused(); }
+
+  close(): void { /* CompactStore owns the one connection. */ }
 
   activity(): SyncActivity { return this.state.activity; }
 
@@ -489,9 +629,11 @@ export class CompactProjection {
 // --------------------------------------------------------------- curation
 
 export class CompactCuration {
+  get db(): never { throw new Error('Compact memory has no public SQL curation driver.'); }
   constructor(private readonly store: CompactStore) {}
   private get state(): State['curation'] { return this.store.state().curation; }
   transaction<T>(action: () => T): T { return this.store.transaction(action); }
+  close(): void { /* CompactStore owns the one connection. */ }
 
   fingerprint(documentKeyValue: string): SourceIdentity | undefined {
     const record = this.state.fingerprints[documentKeyValue];

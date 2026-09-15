@@ -5,14 +5,13 @@ import { documentKey } from '../src/contracts/documents.ts';
 import { MemoryEngine } from '../src/engine.ts';
 import { federatedSearch } from '../src/retrieval/federated.ts';
 import { DEFAULT_RECALL_THRESHOLD } from '../src/extension/hooks.ts';
-import { discoverTeams, teamMailboxRoot } from '../src/sources/discovery.ts';
 import { registerKnownSources } from '../src/sources/install.ts';
-import { SourceRegistry, type AdapterScope } from '../src/sources/registry.ts';
+import { SourceRegistry } from '../src/sources/registry.ts';
 import { DEFAULT_LOCAL_MODEL, TransformerEmbeddingProvider } from '../src/vector/providers.ts';
 import { prjctHomeFor } from '../src/workspace/project-identity.ts';
 
 type Case = { name: string; projectId: string; query: string; relevantIds?: string[]; contains?: string; maxRank?: number; abstain?: boolean };
-type Snapshot = { version: 1; source: string; mailbox: string; models: string; indexes: string; createdAt: string };
+type Snapshot = { version: 2; source: string; models: string; indexes: string; createdAt: string };
 const arg = (name: string): string | undefined => {
   const index = process.argv.indexOf(name);
   return index < 0 ? undefined : process.argv[index + 1];
@@ -39,35 +38,39 @@ const snapshot: Snapshot = process.argv.includes('--reuse')
   ? JSON.parse(await readFile(marker, 'utf8')) : await (async (): Promise<Snapshot> => {
     // A new snapshot must never overwrite an existing workspace.
     if (arg('--workspace')) await mkdir(workspace, { mode: 0o700 });
-    const paths: Snapshot = { version: 1, source: join(workspace, 'source'), mailbox: join(workspace, 'mailbox'),
+    const paths: Snapshot = { version: 2, source: join(workspace, 'source'),
       models: join(workspace, 'models'), indexes: join(workspace, 'indexes'), createdAt: new Date().toISOString() };
     const source = resolve(arg('--home') ?? prjctHomeFor());
-    const mailbox = resolve(arg('--mailbox') ?? teamMailboxRoot());
-    const modelCache = resolve(arg('--model-cache') ?? join(source, 'shared', 'memory', 'models'));
-    await copy(source, paths.source, true);
-    await copy(mailbox, paths.mailbox);
+    const modelCache = resolve(arg('--model-cache') ?? join(source, cases[0]!.projectId, 'memory', 'models'));
+    await mkdir(paths.source, { mode: 0o700 });
+    for (const projectId of [...new Set(cases.map(item => item.projectId))]) {
+      await copy(join(source, projectId), join(paths.source, projectId), true);
+    }
     await copy(modelCache, paths.models);
     await mkdir(paths.indexes, { mode: 0o700 });
     await writeFile(marker, JSON.stringify(paths, null, 2), { mode: 0o600 });
     return paths;
   })();
-if (snapshot.version !== 1) throw new Error('Unsupported snapshot.');
+if (snapshot.version !== 2) throw new Error('Unsupported snapshot.');
 const canonicalWorkspace = await realpath(workspace);
-for (const path of [snapshot.source, snapshot.mailbox, snapshot.models, snapshot.indexes]) {
+for (const path of [snapshot.source, snapshot.models, snapshot.indexes]) {
   const rel = relative(canonicalWorkspace, await realpath(path));
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error('Snapshot paths must stay inside the private workspace.');
 }
 // Force all provider/cache and engine writes into the snapshot. Never open an
 // original memory SQLite file or honor an original remote-provider config.
 process.env.PRJCT_HOME = snapshot.indexes;
-const teams = await discoverTeams(snapshot.source);
 const engines = new Map<string, MemoryEngine>();
-const engineFor = async (scope: AdapterScope): Promise<MemoryEngine> => {
-  const key = `${scope.kind}/${scope.id}`;
-  if (!engines.has(key)) engines.set(key, await MemoryEngine.forScope(scope.kind, scope.id, 'real-eval', {
-    home: snapshot.indexes, provider: new TransformerEmbeddingProvider(DEFAULT_LOCAL_MODEL, snapshot.models),
-  }));
-  return engines.get(key)!;
+const engineFor = async (projectId: string): Promise<MemoryEngine> => {
+  if (!engines.has(projectId)) {
+    const cache = join(snapshot.indexes, projectId, 'memory', 'models');
+    await mkdir(join(snapshot.indexes, projectId, 'memory'), { recursive: true, mode: 0o700 });
+    await copy(snapshot.models, cache);
+    engines.set(projectId, await MemoryEngine.forScope('project', projectId, 'real-eval', {
+      home: snapshot.indexes, provider: new TransformerEmbeddingProvider(DEFAULT_LOCAL_MODEL, cache),
+    }));
+  }
+  return engines.get(projectId)!;
 };
 const started = Date.now();
 try {
@@ -79,7 +82,8 @@ try {
     for (const adapterId of registry.list()) {
       const adapter = registry.get(adapterId)!;
       const scanned = await registry.inspect(adapterId);
-      const engine = await engineFor(adapter.scope);
+      if (adapter.scope.kind !== 'project') throw new Error('Real evaluation accepts project-local adapters only.');
+      const engine = await engineFor(adapter.scope.id);
       const current = new Map([...engine.projection.eachDocumentHash()].map(row => [row.documentKey, row.contentHash]));
       const changed = scanned.documents.filter(document => current.get(documentKey(document)) !== document.contentHash);
       if (changed.length) {
@@ -93,23 +97,21 @@ try {
   };
   for (const id of [...new Set(cases.map(item => item.projectId))]) {
     const registry = new SourceRegistry();
-    await registerKnownSources(registry, id, { home: snapshot.source, mailboxRoot: snapshot.mailbox });
+    await registerKnownSources(registry, id, { home: snapshot.source });
     const first = await indexKnown(registry);
     const second = await indexKnown(registry);
     if (second.some(row => row.indexed > 0)) throw new Error('Sync is not idempotent.');
     sync.push({ projectId: id, first, second });
   }
-  const otherScopes = await Promise.all([...teams.map(team => ({ kind: 'team' as const, id: team.id })),
-    { kind: 'shared' as const, id: 'shared' }].map(engineFor));
   for (const engine of engines.values()) {
     if (engine.projection.unembeddedChunks(DEFAULT_LOCAL_MODEL).length) throw new Error(`Incomplete embedding coverage in ${engine.scopeId}.`);
   }
   const results = [];
   for (const item of cases) {
-    const project = await engineFor({ kind: 'project', id: item.projectId });
+    const project = await engineFor(item.projectId);
     for (const mode of ['lexical', 'hybrid', 'automatic'] as const) {
       const automatic = mode === 'automatic';
-      const found = await federatedSearch([project, ...otherScopes], { queries: [item.query], dense: mode === 'hybrid',
+      const found = await federatedSearch([project], { queries: [item.query], dense: mode === 'hybrid',
         limit: automatic ? 4 : 6, maxBytes: automatic ? 2200 : 12000,
         ...(automatic ? { scoreThreshold: DEFAULT_RECALL_THRESHOLD } : {}) });
       const rank = found.items.findIndex(hit => item.relevantIds?.includes(hit.id)

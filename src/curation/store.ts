@@ -54,7 +54,7 @@ export const stillHeld = (job: CurationJob | undefined, owner: string, now: numb
   Boolean(job && job.status === 'claimed' && job.leaseOwner === owner && (job.leaseUntil ?? 0) > now);
 
 export type PublicationHold = Readonly<{
-  store: CurationStore; jobId: string; owner: string; mode: 'publish' | 'retract';
+  store: Pick<CurationStore, 'getJob'>; jobId: string; owner: string; mode: 'publish' | 'retract';
 }>;
 
 export const publicationHold = new AsyncLocalStorage<PublicationHold>();
