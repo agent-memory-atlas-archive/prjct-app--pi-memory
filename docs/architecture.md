@@ -1,13 +1,21 @@
 # Architecture
 
-## Pi is the engine
+## Interactive extension and autonomous memory maintenance
+
+The confirmed target separates interactive retrieval from an autonomous memory
+analysis daemon. The daemon must maintain curated knowledge while Pi is closed;
+a timer that runs only inside Pi does not meet that requirement. See
+[curated memory and refresh jobs](curated-memory-plan.md#confirmed-execution-model-autonomous-daemon)
+for the job contract and acceptance gates. The standalone daemon is
+`scripts/memory-daemon.ts` (`once|start|stop|status|run`). Operational jobs live
+in `curation.sqlite`. The following still describes the extension/storage substrate.
 
 pi-memory follows the pi-team extension pattern. It registers tools, commands,
-renderers, and documented lifecycle hooks in the Pi process. It starts no MCP
-server, daemon, graph database, or child reasoning process and never calls a
-second LLM behind the current agent.
+renderers, and documented lifecycle hooks in the Pi process. The extension starts
+no MCP server, graph database or implicit daemon/model loop. Default source sync
+fingerprints publishers and enqueues analysis; it does not copy raw bodies.
 
-The active agent performs the cognitive work:
+The active agent currently performs the cognitive work:
 
 1. turn a task into up to four standalone retrieval queries;
 2. rerank returned candidates against the actual task and inspect evidence;
@@ -72,7 +80,47 @@ Facts carry valid time (`validAt`, `invalidAt`) and transaction time
 (`recordedAt`, `expiredAt`). Superseding or contradicting a fact appends a
 resolution event, sets its terminal standing, and closes its valid interval
 without erasing it. Historical `asOf` retrieval may still return the earlier
-fact when the query time falls inside that interval.
+fact when the query time falls inside that interval. Without an explicit valid
+start, the observation/recording date is the lower bound, not negative infinity.
+All scopes in a search use the same query clock and half-open `[start, end)`
+intervals. Empty intervals represent cancelled plans; malformed or inverted
+source dates are rejected.
+
+A fact that supersedes another closes it at the replacement's `validAt` (falling
+back to its `recordedAt`); resolution transaction time comes from the journal.
+Thus a future-effective replacement does not retire the current answer early.
+Terminal intervals cannot be reopened in place: record a new fact so the gap in
+validity is not erased. Fact ids are immutable. GC's seven-day grace starts no
+earlier than both resolution time and the end of validity. Retrieval includes
+observation, declared validity and resolution dates; automatic recall explicitly
+warns that publication dates do not establish present applicability.
+
+### Source freshness and retirement
+
+JSON adapters map `validFrom` and `validTo` (custom field paths are supported).
+Sync fingerprints include version, observation/validity dates and metadata, not
+only body hashes. Metadata-only amendments therefore reach the projection and
+journal. Schema v2 adds journal-recoverable source ownership and revision columns;
+older projections migrate in place and re-sync to establish ownership.
+
+A JSON adapter offers an authoritative snapshot in addition to `scan()`. Only a
+complete snapshot may retire previously owned documents absent from it. A missing
+root, missing blob, malformed JSON, invalid timestamps or failed indexing cannot
+be interpreted as a withdrawal. Retained results report a source freshness gap;
+a rebuild also reports unverified source state until a successful scan. Legacy
+unowned rows are never guessed to belong to an adapter, and ordinary adapters
+that only implement `scan()` remain additive. An adapter cannot overwrite another
+adapter's tracked identity. Latest-per-id selection happens on raw revisions,
+before content selection, so an excluded newer revision cannot resurrect an old
+one. Ownership and tombstones survive rebuild.
+
+These checks establish freshness only as of the last successful scan. They do
+not infer semantic supersession between different document ids or filenames.
+External documents retain the latest indexed revision, not a queryable version
+archive: `asOf` applies its declared validity (or observation lower bound), and
+cannot reconstruct deleted/overwritten source bodies. Facts retain their own
+closed intervals until GC. Publisher writes should be atomic; a directory scan
+is not a transactional snapshot of a publisher's entire store.
 
 ## Vector indexing
 
@@ -118,15 +166,44 @@ left out. `status` is narrower: `partial` means a retrieval leg failed or the
 byte budget cut the answer short. Matching more than the limit is ordinary and
 does not make an answer partial.
 
-Retrieval is federated. A session opens one engine per readable scope — the
-project, every team registered on this machine, and the shared scope — and
-searches them concurrently, so wall-clock is the slowest scope rather than the
-sum. Scores come from reciprocal rank computed inside each scope, which makes
-the best hit in a two-document team look like the best hit in a
-hundred-thousand-document project, so a mild scope prior (project 1, team 0.9,
-shared 0.85) breaks the tie in favour of where the work is happening. That is a
-prior, not a measurement. A scope that fails to open or to answer is reported as
-a gap and the rest of the answer still arrives.
+Retrieval is federated. The public lookup searches the session's project, teams,
+and shared scope. It collects unfused candidates concurrently and applies
+namespace, kind, scope and temporal eligibility before ranking. Filtered legs
+replenish their candidate budget up to 1,000 hits; exhausting that bound reports
+a gap rather than claiming complete recall.
+
+Federated lexical scoring uses BM25 with one set of full-corpus document
+frequencies and average length summed across scopes. It does not compare local
+FTS5 magnitudes or derive IDF from the query's candidate pool. Titles contribute
+alongside body text, common function words are removed, and named identifiers
+found in titles/URIs constrain their query's candidates. The lexical quality is
+normalized against the query's theoretical saturated BM25 score, not its best
+observed hit. A weak corpus winner must not become a perfect match by definition.
+
+The vector collection's `distance` is **L2 over quantized int8 values**, not
+cosine. KNN still uses that existing collection; candidates additionally expose
+cosine similarity computed on the stored vectors. Federated fusion uses this
+similarity and refuses to compare different model/dimension spaces, returning
+lexical results with a gap instead. No re-embedding is needed for this change.
+
+One quality-weighted RRF combines the global lexical and cosine lists. Exact
+ids, URIs and short literals get an explicit signal; a prose substring does not
+get an exact-answer bonus just because an earlier prompt repeated the question.
+There is no scope prior or source quota. Confidence and provenance remain visible
+but cannot promote an unrelated observed failure over a relevant imported answer.
+A query with no sufficient lexical or semantic signal abstains. These relevance
+floors are heuristics checked against unrelated-query controls, not probabilities
+or a guarantee that every returned claim is true. Supported queries keep weaker
+candidates for the active agent's reranking rather than losing multi-answer recall.
+
+Document identity includes scope and namespace. The best chunk per document
+brings up to two following chunks (at most 2,400 characters), so a matching heading
+can carry its actual decision or procedure. The returned `contextChunkIds` identify
+that evidence window. Redundancy filtering, scoped graph expansion, the final
+item limit and byte budget are applied once. A shortened excerpt is marked with
+`excerptTruncated`, and the result is `partial`; an oversized hit cannot silently
+turn useful retrieval into an empty answer. The single-scope `hybridSearch` API
+retains its local RRF scoring as a regression reference.
 
 Every scope's engine builds an embedding provider, and one encoder is loaded per
 model and shared between them: six scopes would otherwise mean six copies of the
@@ -138,7 +215,7 @@ shared content arrives through sync from the systems that own it.
 
 `before_agent_start` runs lexical-only retrieval over the raw prompt and adds at
 most four candidates above the automatic-injection threshold to that turn's
-system prompt. The threshold defaults to `DEFAULT_RECALL_THRESHOLD` (0.055) and
+system prompt. The threshold defaults to `DEFAULT_RECALL_THRESHOLD` (0.006) and
 is overridable per install through `installMemoryHooks({ recallThreshold })`. It does not append a
 persistent session message or block startup on a model download. The agent calls
 `memory_context` when semantic expansion is warranted.
@@ -195,12 +272,21 @@ The run is fired without being awaited. A source scan must never sit between the
 user's prompt and the agent starting, and a second run cannot begin while one is
 in flight.
 
-Two selections are deliberate rather than incidental. prjct records an
-observation per tool call, most of them routine reads, so only failures,
-verifications and explicit user statements are kept. pi-team's journal carries
-`message`, `thread`, `checkin` and `control` entries; only the settled `thread`
-and `checkin` are durable knowledge, and the turn-by-turn message traffic is
-narration. Both are rule sets a caller can replace.
+Source selection distinguishes a request from an answer. prjct's default mapping
+keeps failures, verifications and explicitly declared statements, not arbitrary
+`user_input` prompts. pi-team's mapping keeps published result bodies, delivered
+threads and reported check-in state; empty requests and interrupted placeholders
+are excluded. A check-in can contain a substantive final delivery: its title alone
+is not a reason to discard it. Ordinary recall also suppresses legacy raw prompts
+and unanswered threads already indexed by older presets; an explicit namespace
+lookup can still inspect them. Their owner journals are never erased.
+
+Team artifacts retain their full bounded content (up to 512,000 bytes) rather than
+an 8,000-character preview that could omit the answer. Source-document journal
+events have a 2 MiB serialized bound, consistent with the document contract;
+non-document events keep their 64 KiB bound. Record bodies remain bounded too.
+After updating a preset, sync re-ingests changed bodies idempotently. Previously
+excluded answers become available without changing their imported provenance.
 
 ## Consolidation and garbage collection
 
@@ -243,6 +329,20 @@ document nearly verbatim, and the system scored 0.8216 without them against a
 0.8623 bar. The current expansions restate the *question*, never the answer, and
 are worth about +0.007 — which is roughly what an honest expansion is worth on a
 corpus this size.
+
+The eval also partitions the same corpus deterministically across project, team
+and shared scopes. `federatedNoExpansion` must beat the ordinary baseline gate and
+must not regress Recall@10, MRR or nDCG@10 against the former per-scope RRF merge
+on that partition. This measures the actual public retrieval path, not only the
+single-scope reference.
+
+`npm run eval:real -- --cases /private/cases.json` builds a private snapshot of
+prjct sources, team mailboxes and the cached local encoder. It never opens original
+scope indexes or uses a remote embedding provider. Cases specify project id, query,
+expected document ids and optional required excerpt text, or require abstention.
+The script checks lexical, hybrid and automatic-injection budgets, full embedding
+coverage, and a second idempotent sync. Reports and source data stay outside the
+repository. See [real-data evaluation](real-data-evaluation.md) for reuse and cleanup.
 
 The suite is a regression gate, not proof of broad retrieval quality. 42 queries
 over 113 documents is small; it must grow with observed production failures.

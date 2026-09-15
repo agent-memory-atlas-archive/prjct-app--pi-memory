@@ -103,3 +103,15 @@ test('journal refuses a torn final event instead of silently losing it', async t
   await appendFile(join(root, 'events', '20260101', 'writer_0123456789abcdef.jsonl'), '{');
   await assert.rejects(journal.readAll(), /Torn memory journal line/);
 });
+
+test('bounded source documents larger than a fact event remain replayable', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-large-document-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const journal = new MemoryJournal(root, 'p_test', 's1');
+  const text = 'Source evidence. '.repeat(6000);
+  await journal.append({ type: 'document.upserted', document: {
+    namespace: 'source', externalId: 'large', scopeId: 'p_test', scopeKind: 'project', source: 'fixture', kind: 'artifact', text,
+    version: '1', contentHash: createHash('sha256').update(text).digest('hex'), observedAt: '2026-01-01T00:00:00Z', trust: 'imported', metadata: {},
+  } });
+  assert.equal((await journal.readAll()).length, 1);
+});

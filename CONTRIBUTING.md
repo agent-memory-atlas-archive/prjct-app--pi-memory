@@ -6,8 +6,10 @@
 - Use English for code, documentation, tests, issues, and pull requests.
 - Use strict TypeScript and only APIs documented by Pi 0.85.1.
 - Use immutable values: `npm run check` fails on any `let` under `src/`.
-- Do not import host internals, start an MCP server, or invoke a second reasoning model.
-- Pi's active agent owns extraction, query expansion, reranking, and consolidation decisions.
+- Do not import host internals or start an MCP server. The Pi extension must not launch hidden background model calls or start a daemon implicitly.
+- An explicitly configured standalone memory daemon may perform autonomous extraction, synthesis, consolidation, and freshness review while Pi is closed. It must enforce durable job state, scoped access, revision checks, deadlines, and model/cost budgets.
+- Pi's active agent owns interactive query expansion, reranking, and final answers. Background analysis persists curated knowledge and provenance references, not raw source bodies or model transcripts.
+- Daemon implementation is not authorization to install or activate a persistent service; activation requires explicit user authorization.
 - Host observations may only receive native provenance from extension event handlers.
 - Keep runtime dependencies in `dependencies`; list Pi-provided packages in `peerDependencies`.
 - Run `npm run check`, `npm test`, `npm run test:integration`, and `npm pack --dry-run` before review.

@@ -1,6 +1,8 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { checkpointAndEnqueueLegacy } from './curation/migrate.ts';
 import type { MemoryEngine } from './engine.ts';
 import { installMemoryHooks } from './extension/hooks.ts';
+import type { HandoffBudget } from './handoff/select.ts';
 import { installMemoryTools } from './extension/tools.ts';
 import { runGc } from './retention/gc.ts';
 import { registerKnownSources, scopedEngines } from './sources/install.ts';
@@ -9,18 +11,19 @@ import { dueAdapters, type SyncPolicy } from './sources/schedule.ts';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; mailboxRoot?: string; recallThreshold?: number;
+  /** Explicit bound for messages retained after a real model switch. */
+  handoff?: HandoffBudget;
   /** Thresholds that make a source due; `{ enabled: false }` turns it off. */
   sync?: SyncPolicy;
 }>;
 
-const USAGE = 'Usage: /memory status | sources | sync [adapter] | replay | rebuild | gc';
+const USAGE = 'Usage: /memory status | sources | sync [adapter] | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
 
 /**
- * Pulls the siblings that publish into this machine's prjct home — the
- * project's own prjct observation stream and every team pi-team has registered
- * — into memory. Each adapter declares the scope it belongs to and is indexed
- * into that scope's engine, so team knowledge lands in the team's projection
- * rather than invisibly in the project's.
+ * Scans publisher sources, records fingerprints and enqueues analysis jobs.
+ * It does not copy raw source bodies into the memory journal. The standalone
+ * daemon publishes curated knowledge. Each adapter is routed to the scope it
+ * declares.
  */
 const syncSources = async (registry: SourceRegistry, sessionId: string, project: MemoryEngine,
   target: string | undefined, options: MemoryExtensionOptions): Promise<SourceSyncResult[]> => {
@@ -70,6 +73,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   const runtime = installMemoryHooks(pi, {
     ...(options.home === undefined ? {} : { home: options.home }),
     ...(options.recallThreshold === undefined ? {} : { recallThreshold: options.recallThreshold }),
+    ...(options.handoff === undefined ? {} : { handoff: options.handoff }),
     // Deliberately not awaited by the hook: a source scan must never sit
     // between the user's prompt and the agent starting.
     onActivity: project => { void syncIfDue(project).catch(() => undefined); },
@@ -77,8 +81,9 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   installMemoryTools(pi, runtime);
 
   pi.registerCommand('memory', {
-    description: 'Inspect or maintain pi-memory: /memory status | sources | sync [adapter] | replay | rebuild | gc',
+    description: 'Inspect or maintain pi-memory: /memory status | sources | sync [adapter] | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
     handler: async (args, ctx) => {
+      try {
       const engine = await runtime.engine();
       const [action = 'status', target] = args.trim().split(/\s+/).filter(Boolean);
       if (action === 'sources') {
@@ -86,6 +91,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
         ctx.ui.notify(JSON.stringify({
           scope: `${engine.scopeKind}/${engine.scopeId}`,
           activity: engine.projection.activity(),
+          curation: engine.curation.stats(),
           adapters: dueAdapters(engine.projection, ready.list(), options.sync ?? {}).map(decision => ({
             ...decision, last: engine.projection.syncState(decision.adapter) ?? null,
           })),
@@ -99,13 +105,30 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
         ctx.ui.notify(JSON.stringify(results, null, 2), 'info');
         return;
       }
-      const report = action === 'status' ? engine.projection.stats()
+      if (action === 'migrate-curated') {
+        ctx.ui.notify(JSON.stringify(await checkpointAndEnqueueLegacy(engine), null, 2), 'info');
+        return;
+      }
+      if (action === 'checkpoint') {
+        const raw = args.trim().slice('checkpoint'.length).trim();
+        if (!raw) throw new Error('Usage: /memory checkpoint {"goal":"...","constraints":[],"done":[],"inProgress":[],"blocked":[],"decisions":[],"evidenceRefs":[],"nextSteps":[]}');
+        const saved = await runtime.handoff.persist(engine, ctx.sessionManager.getSessionId(), JSON.parse(raw));
+        ctx.ui.notify(JSON.stringify(saved, null, 2), 'info');
+        return;
+      }
+      const report = action === 'status' ? { ...engine.projection.stats(), curation: engine.curation.stats() }
         : action === 'replay' ? await engine.replay(false)
         : action === 'rebuild' ? await engine.rebuild()
         : action === 'gc' ? await runGc(engine)
+        : action === 'checkpoint-wal' ? engine.projection.checkpointWal()
         : undefined;
       if (!report) throw new Error(USAGE);
       ctx.ui.notify(JSON.stringify(report, null, 2), 'info');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(message, 'error');
+        throw error;
+      }
     },
   });
 };

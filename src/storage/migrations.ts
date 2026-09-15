@@ -1,6 +1,24 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 4;
+
+export const prepareConnection = (db: DatabaseSync): void => {
+  db.exec('PRAGMA busy_timeout=5000');
+};
+
+export const schemaIsCurrent = (db: DatabaseSync): boolean => {
+  const row = (() => {
+    try {
+      return db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value?: unknown } | undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  if (!row) return false;
+  const version = Number(row.value ?? 0);
+  if (!Number.isSafeInteger(version) || version < 0 || version > SCHEMA_VERSION) throw new Error(`Unsupported memory projection schema: ${row.value}`);
+  return version === SCHEMA_VERSION;
+};
 
 const readVersion = (db: DatabaseSync): number => {
   db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -10,11 +28,43 @@ const readVersion = (db: DatabaseSync): number => {
   return version;
 };
 
+export const claimMemoryOwner = (db: DatabaseSync, projectId: string): void => {
+  if (!/^p_[A-Za-z0-9_-]+$/.test(projectId)) throw new Error('Memory opens only a project-owned database.');
+  const owner = (() => {
+    try {
+      return db.prepare('SELECT project_id FROM memory_owner LIMIT 1').get() as { project_id?: string } | undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  if (owner?.project_id === projectId) return;
+  if (owner?.project_id) throw new Error('Memory database is owned by another project.');
+  db.exec(`CREATE TABLE IF NOT EXISTS memory_owner (project_id TEXT NOT NULL UNIQUE, claimed_at INTEGER NOT NULL)`);
+  const populated = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='facts'").get()
+    ? db.prepare('SELECT 1 FROM facts LIMIT 1').get()
+    : undefined;
+  if (!owner && populated) throw new Error('Legacy memory has no verifiable project ownership.');
+  if (!owner) {
+    db.prepare('INSERT INTO memory_owner(project_id, claimed_at) VALUES (?, ?)').run(projectId, Date.now());
+    return;
+  }
+  if (owner.project_id !== projectId) throw new Error('Memory database is owned by another project.');
+};
+
 export const migrate = (db: DatabaseSync): void => {
+  prepareConnection(db);
+  if (schemaIsCurrent(db)) {
+    db.exec('PRAGMA foreign_keys=ON');
+    return;
+  }
   readVersion(db);
   db.exec(`
     PRAGMA journal_mode=WAL;
-    PRAGMA synchronous=NORMAL;
+    PRAGMA synchronous=FULL;
+    CREATE TABLE IF NOT EXISTS memory_owner (
+      project_id TEXT NOT NULL UNIQUE,
+      claimed_at INTEGER NOT NULL
+    );
     PRAGMA foreign_keys=ON;
     PRAGMA busy_timeout=5000;
     PRAGMA auto_vacuum=INCREMENTAL;
@@ -173,6 +223,16 @@ export const migrate = (db: DatabaseSync): void => {
       UNIQUE(chunk_id, model_key)
     );
 
+    -- Operational handoff state is deliberately outside documents/chunks/FTS,
+    -- the semantic journal, vector indexes, curation and ordinary memory stats.
+    CREATE TABLE IF NOT EXISTS operational_checkpoints (
+      project_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      body TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(project_id, session_id)
+    );
+
     -- What this scope has done since it started, counted monotonically. Sync is
     -- driven by work performed, not by a clock: a session that sits idle has
     -- nothing new to pull, and one that has been busy for an hour does.
@@ -200,5 +260,15 @@ export const migrate = (db: DatabaseSync): void => {
       detail TEXT
     );
   `);
-  db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(SCHEMA_VERSION));
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const documentColumns = db.prepare('PRAGMA table_info(documents)').all();
+    if (!documentColumns.some(column => column.name === 'source_adapter')) db.exec('ALTER TABLE documents ADD COLUMN source_adapter TEXT;');
+    if (!documentColumns.some(column => column.name === 'source_revision')) db.exec('ALTER TABLE documents ADD COLUMN source_revision TEXT;');
+    db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(SCHEMA_VERSION));
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 };

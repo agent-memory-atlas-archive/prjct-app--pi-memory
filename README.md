@@ -1,8 +1,14 @@
 # pi-memory
 
-Pi-native temporal memory and hybrid retrieval for agents. The active Pi agent is
-the only reasoning engine; this extension supplies durable evidence, indexing,
-retrieval, and bounded garbage collection.
+Pi-native temporal memory and hybrid retrieval for agents. The extension supplies
+durable evidence, indexing, retrieval, and bounded garbage collection.
+
+**Architecture:** the Pi extension retrieves and records; a standalone daemon
+(`npm run daemon -- once|start|stop|status`) analyzes changed sources while Pi is
+closed. Default `/memory sync` fingerprints publishers and enqueues work — it does
+not copy raw source bodies. Configure `PI_MEMORY_ANALYSIS_PROVIDER` and
+`PI_MEMORY_ANALYSIS_MODEL`. Do not install a persistent service unless explicitly
+authorized. See [the design](docs/curated-memory-plan.md).
 
 ## Install
 
@@ -42,18 +48,30 @@ progress narration, secrets, or generic summaries.
 
 ```text
 /memory status
-/memory sources          # counters, last run per adapter, and what is due
-/memory sync [adapter]   # run now, whatever the counters say
+/memory sources          # counters, last run per adapter, queued jobs, and what is due
+/memory sync [adapter]   # scan and enqueue now; does not copy raw source bodies
 /memory replay
 /memory rebuild
 /memory gc
+/memory migrate-curated  # checkpoint raw journal/projection and enqueue legacy documents
+```
+
+Daemon (separate process, never started by the extension):
+
+```sh
+npm run daemon -- status
+npm run daemon -- once --home "$PRJCT_HOME" --provider anthropic --model claude-sonnet-4-5
+npm run daemon -- start --home "$PRJCT_HOME" --provider anthropic --model claude-sonnet-4-5
+npm run daemon -- stop
 ```
 
 ## Sources
 
-`/memory sync` pulls in the siblings that publish into this machine's prjct
-home. Nothing is imported from them: the shared surface is the directory rule
-prjct publishes and the `settings.json` marker each scope carries.
+`/memory sync` scans the siblings that publish into this machine's prjct home
+and enqueues changed identities for the daemon. It does not copy their bodies
+into the memory journal. Nothing is imported from those apps: the shared surface
+is the directory rule prjct publishes and the `settings.json` marker each scope
+carries.
 
 - **prjct observations** — the project's own observation stream.
 - **pi-team** — for every team discovered under `$PRJCT_HOME/teams/*/settings.json`,
@@ -66,10 +84,14 @@ the project. Routing an adapter at the wrong scope is refused rather than
 silently writing rows retrieval can never return. Retrieval then reads across
 all of them, so indexing into a team scope is not the same as hiding it.
 
-Scopes are searched concurrently, so the cost is the slowest one rather than the
-sum: six scopes holding 90,000 chunks answer an auto-recall query in 14.7 ms p50
-against 3.5 ms for the project alone. `memory_record` still writes to the
-project — reading is federated, writing is not.
+Scopes contribute candidates concurrently; one global ranking uses shared
+lexical statistics and measured cosine similarity. Unrelated source winners do
+not get a scope bonus or a reserved slot. When no sufficient signal exists,
+retrieval abstains. Evidence windows preserve the continuation of matching
+headings, and byte-limited excerpts are explicitly marked as shortened.
+`memory_record` still writes to the project — reading is federated, writing is not.
+See [real-data evaluation](docs/real-data-evaluation.md) for reproducible,
+private-snapshot checks with the real encoder.
 
 ### When sources are re-read
 
@@ -96,11 +118,11 @@ with `installMemory(pi, { sync: { everyTurns: 50, enabled: false } })`.
 A failed run is recorded like a successful one, so a source that throws every
 time is visible as failing rather than looking like one that has never run.
 
-Two selections are deliberate. prjct records an observation per tool call, so
-only failures, verifications and explicit user statements are kept; on a real
-machine that is 4 of 50. pi-team's journal carries `message`, `thread`,
-`checkin` and `control` entries, and only the settled `thread` and `checkin`
-become memory — the turn-by-turn traffic is narration.
+Source selection distinguishes questions from answers. prjct keeps failures,
+verifications and explicitly declared statements, not raw user prompts. pi-team
+keeps published result bodies, delivered threads and check-in replies, not empty
+requests or interrupted-turn placeholders. Artifacts retain their full bounded
+content instead of an 8,000-character preview that might omit the answer.
 
 ### Connecting anything else
 
@@ -232,3 +254,19 @@ is why its end-to-end figure improves by less.
 Corpus vocabulary matters as much as corpus size: the same 100,000 documents
 drawn from a 60-word vocabulary put the query at 568 ms, because every term then
 matches nearly every chunk and there is nothing selective to choose.
+
+
+### Freshness validation
+
+Source sync detects validity/metadata-only changes and retires missing documents
+only after a complete, ownership-scoped scan. Failed source checks preserve the
+index with a freshness warning. Recall exposes dates; historical proposals are
+not automatically certified as current. See [temporal semantics](docs/architecture.md#source-freshness-and-retirement)
+and [real-content lifecycle validation](docs/real-data-evaluation.md#real-content-lifecycle-fault-injection).
+
+### Storage and abstention boundaries
+
+See [WAL maintenance, default abstention, and the corrected offline benchmark](docs/storage-and-abstention.md).
+The 68,857-byte tiny source corpus is **not a storage win**, even after checkpointing.
+Larger-corpus savings apply only to the measured selected-memory workload; semantic
+answer quality remains blocked pending authorized model evaluation.

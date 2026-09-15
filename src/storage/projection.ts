@@ -4,14 +4,18 @@ import { basename, dirname, join } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import type { DocumentChunk, SourceDocument } from '../contracts/documents.ts';
 import { documentKey } from '../contracts/documents.ts';
+import { chunkDocument } from '../vector/chunker.ts';
 import type { EvidenceRef } from '../contracts/evidence.ts';
 import type { MemoryEvent } from '../contracts/events.ts';
 import type { Entity, Episode, MemoryStanding, TemporalFact } from '../contracts/memory.ts';
-import { migrate } from './migrations.ts';
+import { claimMemoryOwner, migrate } from './migrations.ts';
+import { CurationStore } from '../curation/store.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 
+export const MAX_QUIESCENT_WAL_BYTES = 8 * 1024 * 1024;
 export type LexicalHit = Readonly<{ chunkId: string; documentKey: string; score: number }>;
-export type VectorHit = Readonly<{ chunkId: string; documentKey: string; distance: number }>;
+/** distance is int8 L2 (not cosine); similarity is cosine on the stored quantized vectors. */
+export type VectorHit = Readonly<{ chunkId: string; documentKey: string; distance: number; similarity: number; dimensions: number }>;
 export type StoredFact = TemporalFact & Readonly<{ usefulness: number }>;
 export type SyncActivity = Readonly<{ turns: number; tokens: number; inserts: number; updatedAt: number }>;
 export type SyncRun = Readonly<{
@@ -45,7 +49,7 @@ const STALE_TEMP_MS = 10 * 60_000;
 // Cached term frequencies before the cache is dropped wholesale.
 const TERM_CACHE_LIMIT = 20_000;
 const DOCUMENT_COLUMNS = 'document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,'
-  + ' version, content_hash, observed_at, valid_from, valid_to, trust, metadata';
+  + ' version, content_hash, observed_at, valid_from, valid_to, trust, metadata, source_adapter, source_revision';
 
 type Row = Record<string, SQLInputValue>;
 const json = (value: unknown): string => JSON.stringify(value);
@@ -70,6 +74,7 @@ const documentFromRow = (row: Row, text: string): SourceDocument => ({
   ...(row.title ? { title: String(row.title) } : {}), text, ...(row.uri ? { uri: String(row.uri) } : {}),
   version: String(row.version), contentHash: String(row.content_hash), observedAt: new Date(Number(row.observed_at)).toISOString(),
   ...(iso(row.valid_from) ? { validFrom: iso(row.valid_from)! } : {}), ...(iso(row.valid_to) ? { validTo: iso(row.valid_to)! } : {}),
+  ...(row.source_adapter ? { sync: { adapter: String(row.source_adapter), revision: String(row.source_revision) } } : {}),
   trust: String(row.trust) as SourceDocument['trust'], metadata: parse<Record<string, string>>(row.metadata, {}),
 });
 
@@ -77,24 +82,54 @@ export class Projection {
   readonly path: string;
   readonly db: DatabaseSync;
   private depth = 0;
+  private readonly ownsConnection: boolean;
   private readonly statements = new Map<string, StatementSync>();
   private readonly termFrequency = new Map<string, number>();
   private chunks_: number | undefined;
+  private lexicalRevision = '';
+  private lexicalTokens: number | undefined;
 
-  constructor(path: string) {
-    this.path = path;
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path, { allowExtension: true });
+  constructor(pathOrDb: string | DatabaseSync, attachedPath?: string) {
+    if (typeof pathOrDb === 'string') {
+      this.path = pathOrDb;
+      this.ownsConnection = true;
+      mkdirSync(dirname(pathOrDb), { recursive: true, mode: 0o700 });
+      this.db = new DatabaseSync(pathOrDb, { allowExtension: true });
+    } else {
+      this.path = attachedPath ?? '';
+      this.ownsConnection = false;
+      this.db = pathOrDb;
+    }
     try {
+      this.db.exec('PRAGMA busy_timeout=5000');
       sqliteVec.load(this.db);
       migrate(this.db);
     } catch (error) {
       // Opening leaves an fd and a file lock held; migrate() rejects a schema
       // from a newer build, and that rejection must not leak the handle.
-      this.db.close();
+      if (this.ownsConnection) this.db.close();
       throw error;
     }
   }
+
+  /** Curation shares this one canonical connection; ownership stays here. */
+  attachCuration(path: string): CurationStore { return new CurationStore(this.db, path); }
+  claimOwner(projectId: string): void { claimMemoryOwner(this.db, projectId); }
+
+  adoptOuter(): void { this.depth += 1; }
+  // Transaction control is exposed as named operations so orchestration can
+  // depend on the authority port instead of this connection.
+  beginImmediate(): void { this.db.exec('BEGIN IMMEDIATE'); }
+  commit(): void { this.db.exec('COMMIT'); }
+  rollback(): void { this.db.exec('ROLLBACK'); }
+
+  /** Consistent physical copy for an explicit, reversible legacy checkpoint. */
+  exportSnapshot(destination: string): void {
+    this.db.exec('PRAGMA wal_checkpoint(FULL)');
+    this.db.exec(`VACUUM INTO '${destination.replaceAll("'", "''")}'`);
+  }
+
+  releaseOuter(): void { this.depth = Math.max(0, this.depth - 1); }
 
   // Compiling a statement costs ~11 µs, which is several times the cost of
   // running a point lookup. Every query here has a fixed SQL shape, so they are
@@ -107,11 +142,42 @@ export class Projection {
     return prepared;
   }
 
+  /** Daemon backpressure, not an extension-turn hook. A pinned reader cannot be
+   * forced to release its snapshot safely, so stop taking jobs rather than grow
+   * the WAL indefinitely. One in-flight bounded job may exceed this soft limit.
+   */
+  walPublicationPaused(): boolean {
+    const result = this.checkpointWal();
+    return result.status === 'busy' && (statSync(`${this.path}-wal`, { throwIfNoEntry: false })?.size ?? 0) >= MAX_QUIESCENT_WAL_BYTES;
+  }
+
+  /** Explicit quiescent maintenance only. Never called from apply/transaction or hot open.
+   * TRUNCATE releases the allocated WAL (PASSIVE alone leaves its high-water size).
+   * A pinned reader/writer wins immediately; a later boundary retries without waiting.
+   */
+  checkpointWal(): { status: 'checkpointed' | 'busy'; logFrames: number; checkpointedFrames: number } {
+    if (this.depth > 0) throw new Error('WAL maintenance cannot run inside an authority transaction.');
+    const timeout = this.db.prepare('PRAGMA busy_timeout').get() as { timeout?: number; busy_timeout?: number };
+    const prior = Number(timeout.timeout ?? timeout.busy_timeout ?? 5000);
+    this.db.exec('PRAGMA busy_timeout=0');
+    try {
+      const row = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
+        busy: number; log: number; checkpointed: number;
+      };
+      return { status: row.busy ? 'busy' : 'checkpointed', logFrames: row.log, checkpointedFrames: row.checkpointed };
+    } catch (error) {
+      if (/locked|busy/iu.test(String(error))) return { status: 'busy', logFrames: -1, checkpointedFrames: -1 };
+      throw error;
+    } finally {
+      this.db.exec(`PRAGMA busy_timeout=${prior}`);
+    }
+  }
+
   close(): void {
     this.statements.clear();
     this.termFrequency.clear();
     this.chunks_ = undefined;
-    this.db.close();
+    if (this.ownsConnection) this.db.close();
   }
 
   // Re-entrant: a batch caller can wrap many apply() calls, each of which opens
@@ -148,11 +214,16 @@ export class Projection {
       if (payload.type === 'document.upserted') this.upsertDocument(payload.document);
       if (payload.type === 'document.deleted') this.deleteDocument(payload.namespace, payload.externalId, event.recordedAt);
       if (payload.type === 'episode.recorded') this.insertEpisode(payload.episode);
-      if (payload.type === 'fact.recorded') this.insertFact(payload.fact);
+      if (payload.type === 'fact.recorded') this.insertFact(payload.fact, event.recordedAt);
       if (payload.type === 'fact.resolved') this.resolveFact(payload.factId, payload.standing, payload.replacementId, event.recordedAt);
       if (payload.type === 'retrieval.feedback') this.feedback(payload.factId, payload.signal, event.recordedAt);
       if (payload.type === 'gc.compacted') {
         for (const key of payload.removed) this.deleteDocumentKey(key, event.recordedAt);
+      }
+      if (payload.type === 'curation.batch.commit') {
+        for (const fact of payload.facts) this.insertFact(fact, event.recordedAt);
+        for (const document of payload.documents) this.upsertDocument(document);
+        for (const item of payload.resolves ?? []) this.resolveFact(item.factId, item.standing, undefined, event.recordedAt);
       }
       this.stmt('INSERT INTO applied_events(id, event_hash, recorded_at) VALUES (?, ?, ?)')
         .run(event.id, event.eventHash, Date.parse(event.recordedAt));
@@ -164,18 +235,19 @@ export class Projection {
     const key = documentKey(document);
     this.stmt(`INSERT INTO documents(
       document_key, namespace, external_id, scope_id, scope_kind, source, kind, title, text, uri,
-      version, content_hash, observed_at, valid_from, valid_to, trust, metadata, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      version, content_hash, observed_at, valid_from, valid_to, trust, metadata, source_adapter, source_revision, deleted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(document_key) DO UPDATE SET
       scope_id=excluded.scope_id, scope_kind=excluded.scope_kind, source=excluded.source,
       kind=excluded.kind, title=excluded.title, text=excluded.text, uri=excluded.uri,
       version=excluded.version, content_hash=excluded.content_hash, observed_at=excluded.observed_at,
       valid_from=excluded.valid_from, valid_to=excluded.valid_to, trust=excluded.trust,
-      metadata=excluded.metadata, deleted_at=NULL`)
+      metadata=excluded.metadata, source_adapter=excluded.source_adapter, source_revision=excluded.source_revision, deleted_at=NULL`)
       .run(key, document.namespace, document.externalId, document.scopeId, document.scopeKind,
         document.source, document.kind, document.title ?? null, document.text, document.uri ?? null,
         document.version, document.contentHash, Date.parse(document.observedAt), millis(document.validFrom),
-        millis(document.validTo), document.trust, json(document.metadata));
+        millis(document.validTo), document.trust, json(document.metadata), document.sync?.adapter ?? null, document.sync?.revision ?? null);
+    if (document.text.trim()) this.replaceChunks(key, chunkDocument(document), document.title);
   }
 
   deleteDocument(namespace: string, externalId: string, at: string): void {
@@ -241,7 +313,10 @@ export class Projection {
       .run(entity.id, entity.scopeId, entity.name, entity.type, json(entity.aliases), entity.summary ?? null);
   }
 
-  private insertFact(fact: TemporalFact): void {
+  private insertFact(fact: TemporalFact, recordedAt: string): void {
+    // Historical duplicate events must not rewrite the mirrored document while
+    // ON CONFLICT preserves the original fact. Facts are immutable identities.
+    if (this.getFact(fact.id)) return;
     const scopeKind: SourceDocument['scopeKind'] = fact.scopeId === 'shared' ? 'shared' : fact.scopeId.startsWith('p_') ? 'project' : 'team';
     this.upsertDocument({ namespace: 'memory', externalId: fact.id, scopeId: fact.scopeId, scopeKind,
       source: 'pi-memory', kind: fact.kind, title: fact.subject ?? fact.statement.slice(0, 100), text: fact.statement,
@@ -266,16 +341,25 @@ export class Projection {
     for (const episodeId of fact.episodeIds) this.stmt('INSERT OR IGNORE INTO fact_episodes(fact_id, episode_id) VALUES (?, ?)').run(fact.id, episodeId);
     for (const replaced of fact.supersedes ?? []) {
       this.stmt("INSERT OR IGNORE INTO fact_links(from_fact_id, to_fact_id, relation) VALUES (?, ?, 'supersedes')").run(fact.id, replaced);
-      this.resolveFact(replaced, 'superseded', fact.id, fact.recordedAt);
+      this.resolveFact(replaced, 'superseded', fact.id, recordedAt, fact.validAt ?? fact.recordedAt);
     }
   }
 
-  private resolveFact(id: string, standing: MemoryStanding, replacementId: string | undefined, at: string): void {
+  private resolveFact(id: string, standing: MemoryStanding, replacementId: string | undefined, at: string, effectiveAt = at): void {
+    const fact = this.getFact(id);
+    if (!fact) return;
     const terminal = ['superseded', 'contradicted'].includes(standing);
-    this.stmt(`UPDATE facts SET standing = ?, replacement_id = ?, expired_at = ?,
-      invalid_at = CASE WHEN ?=1 AND (invalid_at IS NULL OR invalid_at > ?) THEN ? ELSE invalid_at END WHERE id = ?`)
-      .run(standing, replacementId ?? null, terminal ? Date.parse(at) : null,
-        terminal ? 1 : 0, Date.parse(at), Date.parse(at), id);
+    if (!terminal && ['superseded', 'contradicted'].includes(fact.standing)) return;
+    // valid time is the replacement's effective date; transaction time is the
+    // journal event. Cancelling a planned fact leaves an empty, not inverted,
+    // interval. Repeated resolution cannot postpone its original cutoff/GC.
+    const cutoff = Math.max(Date.parse(fact.validAt ?? fact.recordedAt),
+      Math.min(Date.parse(effectiveAt), fact.invalidAt ? Date.parse(fact.invalidAt) : Infinity));
+    this.stmt(`UPDATE facts SET standing=?, replacement_id=COALESCE(?, replacement_id),
+      expired_at=CASE WHEN ?=1 THEN COALESCE(expired_at, ?) ELSE expired_at END,
+      invalid_at=CASE WHEN ?=1 THEN ? ELSE invalid_at END WHERE id=?`)
+      .run(standing, replacementId ?? null, terminal ? 1 : 0, Date.parse(at), terminal ? 1 : 0, cutoff, id);
+    if (terminal) this.stmt("UPDATE documents SET valid_to=? WHERE namespace='memory' AND external_id=?").run(cutoff, id);
     if (replacementId) this.stmt("INSERT OR IGNORE INTO fact_links(from_fact_id, to_fact_id, relation) VALUES (?, ?, 'resolves')").run(replacementId, id);
   }
 
@@ -341,13 +425,15 @@ export class Projection {
   vectorSearch(model: string, dims: number, vector: readonly number[], limit: number): VectorHit[] {
     if (vector.some(value => !Number.isFinite(value))) throw new Error('Embedding query must be finite.');
     const collection = this.ensureVectorCollection(model, dims);
-    const rows = this.stmt(`SELECT v.distance, vm.chunk_id, c.document_key
+    const rows = this.stmt(`SELECT v.distance, vm.chunk_id, c.document_key,
+      1 - vec_distance_cosine(v.embedding, vec_quantize_int8(?, 'unit')) AS similarity
       FROM ${collection.table} v
       JOIN vector_map vm ON vm.rowid=v.rowid AND vm.model_key=?
       JOIN chunks c ON c.id=vm.chunk_id
       WHERE v.embedding MATCH vec_quantize_int8(?, 'unit') AND k=?
-      ORDER BY v.distance`).all(collection.key, vectorBlob(vector), Math.max(1, Math.min(1000, limit))) as Row[];
-    return rows.map(row => ({ chunkId: String(row.chunk_id), documentKey: String(row.document_key), distance: Number(row.distance) }));
+      ORDER BY v.distance`).all(vectorBlob(vector), collection.key, vectorBlob(vector), Math.max(1, Math.min(1000, limit))) as Row[];
+    return rows.map(row => ({ chunkId: String(row.chunk_id), documentKey: String(row.document_key), distance: Number(row.distance),
+      dimensions: dims, similarity: typeof row.similarity === 'number' && Number.isFinite(row.similarity) ? Math.max(-1, Math.min(1, row.similarity)) : 0 }));
   }
 
   // Keeps the most selective terms of a query and discards the rest. OR-ing
@@ -376,6 +462,19 @@ export class Projection {
       for (const term of missing) this.termFrequency.set(term, found.get(term) ?? 0);
     }
     return new Map(terms.map(term => [term, this.termFrequency.get(term) ?? 0]));
+  }
+
+  /** Full-corpus statistics, not statistics of a query-selected candidate pool. */
+  lexicalStatistics(terms: readonly string[]): { documents: number; tokens: number; frequencies: ReadonlyMap<string, number> } {
+    const revision = `${String((this.stmt('PRAGMA data_version').get() as Row).data_version)}:${String((this.stmt('SELECT total_changes() AS n').get() as Row).n)}`;
+    if (revision !== this.lexicalRevision) {
+      this.lexicalRevision = revision;
+      this.lexicalTokens = undefined;
+      this.chunks_ = undefined;
+      this.termFrequency.clear();
+    }
+    if (this.lexicalTokens === undefined) this.lexicalTokens = Number((this.stmt('SELECT coalesce(sum(cnt),0) AS n FROM chunks_fts_vocab').get() as Row).n);
+    return { documents: this.chunkTotal(), tokens: this.lexicalTokens, frequencies: this.documentFrequencies(terms) };
   }
 
   selectiveTerms(tokens: readonly string[]): string[] {
@@ -444,6 +543,19 @@ export class Projection {
     return [...inText, ...inUri];
   }
 
+  /** Small-to-large retrieval: carry the continuation of a selected heading or paragraph. */
+  chunkWindow(chunkId: string, maxChars = 2400): { text: string; chunkIds: string[] } | undefined {
+    const first = this.stmt('SELECT document_key, ordinal FROM chunks WHERE id=?').get(chunkId) as Row | undefined;
+    if (!first) return undefined;
+    const rows = this.stmt('SELECT id, text FROM chunks WHERE document_key=? AND ordinal>=? ORDER BY ordinal LIMIT 3')
+      .all(first.document_key!, first.ordinal!) as Row[];
+    return rows.reduce<{ text: string; chunkIds: string[] }>((window, row) => {
+      if (window.text.length >= maxChars) return window;
+      const next = `${window.text ? '\n\n' : ''}${String(row.text)}`;
+      return { text: `${window.text}${next}`.slice(0, maxChars), chunkIds: [...window.chunkIds, String(row.id)] };
+    }, { text: '', chunkIds: [] });
+  }
+
   chunkCount(document: Pick<SourceDocument, 'namespace' | 'externalId'>): number {
     const row = this.stmt('SELECT COUNT(*) AS n FROM chunks WHERE document_key=?').get(documentKey(document)) as Row;
     return Number(row.n);
@@ -465,7 +577,7 @@ export class Projection {
     const rows = this.stmt(`SELECT c.id AS chunk_id, c.document_key AS chunk_document_key, c.namespace AS chunk_namespace,
       c.ordinal AS chunk_ordinal, c.text AS chunk_text, c.content_hash AS chunk_hash, c.metadata AS chunk_metadata,
       d.namespace, d.external_id, d.scope_id, d.scope_kind, d.source, d.kind, d.title, d.text AS document_text,
-      d.uri, d.version, d.content_hash, d.observed_at, d.valid_from, d.valid_to, d.trust, d.metadata
+      d.uri, d.version, d.content_hash, d.observed_at, d.valid_from, d.valid_to, d.trust, d.metadata, d.source_adapter, d.source_revision
       FROM chunks c JOIN documents d ON d.document_key=c.document_key WHERE c.id IN (${placeholders})`).all(...ids) as Row[];
     const byId = new Map(rows.map(row => [String(row.chunk_id), row]));
     return ids.flatMap(id => {
@@ -488,6 +600,7 @@ export class Projection {
       FROM evidence e JOIN fact_evidence fe ON fe.evidence_id=e.id WHERE fe.fact_id=? LIMIT ?`).all(id, RELATION_LIMIT) as Row[];
     const entityRows = this.stmt(`SELECT e.id, e.scope_id, e.name, e.type, e.aliases, e.summary
       FROM entities e JOIN fact_entities fe ON fe.entity_id=e.id WHERE fe.fact_id=? LIMIT ?`).all(id, RELATION_LIMIT) as Row[];
+    const supersededRows = this.stmt("SELECT to_fact_id FROM fact_links WHERE from_fact_id=? AND relation='supersedes' ORDER BY to_fact_id LIMIT ?").all(id, RELATION_LIMIT) as Row[];
     const episodeRows = this.stmt('SELECT episode_id FROM fact_episodes WHERE fact_id=? LIMIT ?').all(id, RELATION_LIMIT) as Row[];
     return {
       id, scopeId: String(row.scope_id), kind: String(row.kind) as StoredFact['kind'], statement: String(row.statement),
@@ -504,7 +617,7 @@ export class Projection {
         ...(evidence.actor_id ? { actorId: String(evidence.actor_id) } : {}), ...(evidence.session_id ? { sessionId: String(evidence.session_id) } : {}),
         ...(evidence.tool_call_id ? { toolCallId: String(evidence.tool_call_id) } : {}) })),
       episodeIds: episodeRows.map(episode => String(episode.episode_id)),
-      ...(row.replacement_id ? { supersedes: [String(row.replacement_id)] } : {}), usefulness: Number(row.utility),
+      ...(supersededRows.length ? { supersedes: supersededRows.map(link => String(link.to_fact_id)) } : {}), usefulness: Number(row.utility),
     };
   }
 
@@ -514,6 +627,7 @@ export class Projection {
     const rows = this.stmt(`SELECT DISTINCT f2.id FROM fact_entities a
       JOIN fact_entities b ON b.entity_id=a.entity_id AND b.fact_id<>a.fact_id
       JOIN facts f2 ON f2.id=b.fact_id
+      JOIN documents d ON d.namespace='memory' AND d.external_id=f2.id AND d.deleted_at IS NULL
       WHERE a.fact_id IN (${placeholders})
       ORDER BY f2.recorded_at DESC LIMIT ?`).all(...factIds, limit) as Row[];
     return rows.flatMap(row => this.getFact(String(row.id)) ?? []);
@@ -547,16 +661,17 @@ export class Projection {
     }
   }
 
-  // Two columns instead of the whole row: a source sync only needs to know
+  // Compact fingerprints instead of the whole row: a source sync only needs to know
   // which keys changed, not to load the corpus it is about to compare against.
-  *eachDocumentHash(batch = PAGE_SIZE): Generator<{ documentKey: string; contentHash: string }> {
+  *eachDocumentHash(batch = PAGE_SIZE): Generator<{ documentKey: string; contentHash: string; adapter?: string; revision?: string }> {
     const cursor: { after?: string } = {};
     for (;;) {
       const rows = (cursor.after === undefined
-        ? this.stmt('SELECT document_key, content_hash FROM documents WHERE deleted_at IS NULL ORDER BY document_key LIMIT ?').all(batch)
-        : this.stmt(`SELECT document_key, content_hash FROM documents WHERE deleted_at IS NULL AND document_key > ?
+        ? this.stmt('SELECT document_key, content_hash, source_adapter, source_revision FROM documents WHERE deleted_at IS NULL ORDER BY document_key LIMIT ?').all(batch)
+        : this.stmt(`SELECT document_key, content_hash, source_adapter, source_revision FROM documents WHERE deleted_at IS NULL AND document_key > ?
             ORDER BY document_key LIMIT ?`).all(cursor.after, batch)) as Row[];
-      for (const row of rows) yield { documentKey: String(row.document_key), contentHash: String(row.content_hash) };
+      for (const row of rows) yield { documentKey: String(row.document_key), contentHash: String(row.content_hash),
+        ...(row.source_adapter ? { adapter: String(row.source_adapter), revision: String(row.source_revision) } : {}) };
       if (rows.length < batch) return;
       cursor.after = String(rows[rows.length - 1]!.document_key);
     }
@@ -592,6 +707,13 @@ export class Projection {
     return this.activity();
   }
 
+  sourceGaps(): string[] {
+    const rows = this.stmt(`SELECT DISTINCT d.source_adapter AS adapter FROM documents d
+      LEFT JOIN sync_state s ON s.adapter=d.source_adapter
+      WHERE d.source_adapter IS NOT NULL AND d.deleted_at IS NULL AND (s.adapter IS NULL OR s.ok=0) LIMIT ?`).all(PAGE_SIZE) as Row[];
+    return rows.map(row => `Source ${String(row.adapter)} could not be fully checked; retained content may be stale.`);
+  }
+
   syncState(adapter: string): SyncRun | undefined {
     const row = this.stmt(`SELECT adapter, last_at, at_turns, at_tokens, at_inserts, discovered, indexed, ok, detail
       FROM sync_state WHERE adapter = ? LIMIT 1`).get(adapter) as Row | undefined;
@@ -616,6 +738,29 @@ export class Projection {
     return this.syncState(adapter)!;
   }
 
+  private assertOperationalOwner(projectId: string): void {
+    const row = this.stmt('SELECT project_id FROM memory_owner LIMIT 1').get() as Row | undefined;
+    if (typeof row?.project_id !== 'string' || row.project_id !== projectId) {
+      throw new Error('Operational checkpoint projectId does not own this memory database.');
+    }
+  }
+
+  operationalCheckpoint(projectId: string, sessionId: string): string | undefined {
+    this.assertOperationalOwner(projectId);
+    const row = this.stmt(`SELECT body FROM operational_checkpoints
+      WHERE project_id=? AND session_id=? LIMIT 1`).get(projectId, sessionId) as Row | undefined;
+    return typeof row?.body === 'string' ? row.body : undefined;
+  }
+
+  upsertOperationalCheckpoint(projectId: string, sessionId: string, body: string, updatedAt: number): boolean {
+    this.assertOperationalOwner(projectId);
+    const result = this.transaction(() => this.stmt(`INSERT INTO operational_checkpoints(project_id, session_id, body, updated_at)
+      VALUES (?, ?, ?, ?) ON CONFLICT(project_id, session_id) DO UPDATE SET
+      body=excluded.body, updated_at=excluded.updated_at
+      WHERE excluded.updated_at >= operational_checkpoints.updated_at`).run(projectId, sessionId, body, updatedAt));
+    return Number(result.changes) > 0;
+  }
+
   stats(): { documents: number; chunks: number; vectors: number; facts: number; events: number; bytes: number } {
     const count = (table: string): number => Number((this.stmt(`SELECT COUNT(*) AS n FROM ${table}`).get() as Row).n);
     const pageCount = Number((this.stmt('PRAGMA page_count').get() as Row).page_count);
@@ -629,7 +774,8 @@ export class Projection {
       FROM documents d LEFT JOIN facts f ON d.namespace='memory' AND f.id=d.external_id
       LEFT JOIN usefulness u ON u.fact_id=f.id
       WHERE d.deleted_at IS NOT NULL
-         OR (d.namespace='memory' AND f.standing IN ('superseded','contradicted') AND f.recorded_at < ?)
+         OR (d.namespace='memory' AND f.standing IN ('superseded','contradicted')
+           AND MAX(COALESCE(f.expired_at, f.recorded_at), COALESCE(f.invalid_at, f.recorded_at)) < ?)
          OR (d.namespace='memory' AND f.standing IN ('candidate','needs_review') AND COALESCE(u.used + u.helpful, 0)=0 AND f.recorded_at < ?)
       LIMIT ?`)
       .all(now - 7 * 86_400_000, now - 30 * 86_400_000, MAX_PAGE_SIZE) as Row[];

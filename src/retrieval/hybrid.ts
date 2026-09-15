@@ -1,7 +1,8 @@
-import type { SourceDocument } from '../contracts/documents.ts';
+import type { ScopeKind, SourceDocument } from '../contracts/documents.ts';
 import { factIsValidAt } from '../contracts/memory.ts';
-import type { Projection, StoredFact } from '../storage/projection.ts';
+import type { LexicalHit, Projection, StoredFact, VectorHit } from '../storage/projection.ts';
 import type { VectorIndex } from '../vector/vector-index.ts';
+import { relevantKeys, relevanceTerms } from './relevance.ts';
 
 export type MemoryQuery = Readonly<{
   queries: readonly string[];
@@ -19,7 +20,11 @@ export type MemoryQuery = Readonly<{
 export type MemoryHit = Readonly<{
   id: string;
   chunkId: string;
+  scopeId?: string;
+  scopeKind?: ScopeKind;
   statement: string;
+  excerptTruncated?: boolean;
+  contextChunkIds?: readonly string[];
   title?: string;
   uri?: string;
   namespace: string;
@@ -27,6 +32,8 @@ export type MemoryHit = Readonly<{
   kind: string;
   score: number;
   standing?: string;
+  observedAt?: string;
+  expiredAt?: string;
   validAt?: string;
   invalidAt?: string;
   provenance: string;
@@ -41,6 +48,21 @@ export type HybridSearchResult = Readonly<{
   omitted: number;
 }>;
 
+export type SearchLegs = Readonly<{
+  queries: readonly string[];
+  exact: readonly (readonly LexicalHit[])[];
+  lexical: readonly (readonly LexicalHit[])[];
+  dense: readonly (readonly VectorHit[])[];
+  denseGaps: readonly string[];
+  denseModel?: string;
+}>;
+
+export type RankedCandidate = Readonly<{
+  item: MemoryHit;
+  tokenSet: Set<string>;
+  fact?: StoredFact;
+}>;
+
 const tokens = (text: string): Set<string> => new Set(text.toLocaleLowerCase().match(/[\p{L}\p{N}_./:-]{2,}/gu) ?? []);
 const jaccard = (a: Set<string>, b: Set<string>): number => {
   const intersection = [...a].filter(value => b.has(value)).length;
@@ -50,68 +72,119 @@ const jaccard = (a: Set<string>, b: Set<string>): number => {
 const GRAPH_ITEM_SCORE = 0.01;
 const trustWeight = (trust: SourceDocument['trust']): number => ({ host: 1, user: 0.95, imported: 0.8, agent: 0.65 })[trust];
 
-const addRanking = (scores: Map<string, number>, reasons: Map<string, string[]>, ids: readonly string[], label: string, weight: number): void => {
+export const addRanking = (scores: Map<string, number>, reasons: Map<string, string[]>, ids: readonly string[], label: string, weight: number, qualities?: readonly number[]): void => {
   ids.forEach((id, index) => {
-    scores.set(id, (scores.get(id) ?? 0) + weight / (60 + index + 1));
+    scores.set(id, (scores.get(id) ?? 0) + weight * (qualities?.[index] ?? 1) / (60 + index + 1));
     reasons.set(id, [...(reasons.get(id) ?? []), label]);
   });
 };
 
-export const clipItems = (items: readonly MemoryHit[], maxBytes: number): { items: MemoryHit[]; omitted: number } => {
-  const fit = items.reduce<{ items: MemoryHit[]; bytes: number; stopped: boolean }>((state, item) => {
-    if (state.stopped) return state;
-    const bytes = Buffer.byteLength(JSON.stringify(item), 'utf8') + 1;
-    return state.bytes + bytes <= maxBytes
-      ? { items: [...state.items, item], bytes: state.bytes + bytes, stopped: false }
-      : { ...state, stopped: true };
-  }, { items: [], bytes: 0, stopped: false });
-  return { items: fit.items, omitted: items.length - fit.items.length };
+export const clipItems = (items: readonly MemoryHit[], maxBytes: number): { items: MemoryHit[]; omitted: number; truncated: number } => {
+  const fit = items.reduce<{ items: MemoryHit[]; bytes: number; truncated: number }>((state, item) => {
+    const size = (value: MemoryHit): number => Buffer.byteLength(JSON.stringify(value), 'utf8') + 1;
+    if (state.bytes + size(item) <= maxBytes) return { ...state, items: [...state.items, item], bytes: state.bytes + size(item) };
+    const chars = Array.from(item.statement);
+    const shortened = (end: number): MemoryHit => ({ ...item, statement: `${chars.slice(0, end).join('')}…`, excerptTruncated: true });
+    // Keep attribution intact. If even the envelope does not fit, try the next
+    // result rather than returning an empty answer because the first was large.
+    if (state.bytes + size(shortened(0)) > maxBytes) return state;
+    const range = { low: 0, high: chars.length };
+    while (range.low < range.high) {
+      const mid = Math.ceil((range.low + range.high) / 2);
+      if (state.bytes + size(shortened(mid)) <= maxBytes) range.low = mid;
+      else range.high = mid - 1;
+    }
+    const clipped = shortened(range.low);
+    return { items: [...state.items, clipped], bytes: state.bytes + size(clipped), truncated: state.truncated + 1 };
+  }, { items: [], bytes: 2, truncated: 0 });
+  return { items: fit.items, omitted: items.length - fit.items.length, truncated: fit.truncated };
 };
 
-export const hybridSearch = async (projection: Projection, vector: VectorIndex, request: MemoryQuery): Promise<HybridSearchResult> => {
+/**
+ * Per-leg candidate lists for one scope. Dense distance and BM25 scores are
+ * left intact so a later merge can re-rank with a comparable signal; this
+ * function does not fuse.
+ */
+export const collectLegs = async (
+  projection: Projection,
+  vector: VectorIndex,
+  request: MemoryQuery,
+): Promise<SearchLegs> => {
   const queries = [...new Set(request.queries.map(query => query.trim()).filter(Boolean))].slice(0, 4);
-  if (!queries.length) return { status: 'abstained', items: [], gaps: ['No retrieval query was provided.'], omitted: 0 };
   const limit = Math.max(1, Math.min(50, request.limit ?? 12));
   const candidateLimit = Math.max(30, limit * 8);
-  const scores = new Map<string, number>();
-  const reasons = new Map<string, string[]>();
-  const denseGaps: string[] = [];
-  for (const query of queries) {
-    addRanking(scores, reasons, projection.exactSearch(query, candidateLimit).map(hit => hit.chunkId), 'exact', 2.5);
-    addRanking(scores, reasons, projection.lexicalSearch(query, candidateLimit).map(hit => hit.chunkId), 'bm25', 1);
-    if (request.dense !== false) {
-      try {
-        addRanking(scores, reasons, (await vector.search({ text: query, limit: candidateLimit, signal: request.signal })).map(hit => hit.chunkId), 'dense', 1.25);
-      } catch (error) {
-        denseGaps.push(`Dense retrieval unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-  }
-  const threshold = Math.max(0, Math.min(1, request.scoreThreshold ?? 0));
-  const chunks = projection.chunks([...scores.keys()]);
-  const asOf = request.asOf ? Date.parse(request.asOf) : Date.now();
+  const asOf = request.asOf !== undefined ? Date.parse(request.asOf) : Date.now();
   if (!Number.isFinite(asOf)) throw new Error('asOf must be ISO-8601.');
-  const ranked = chunks.flatMap(chunk => {
+  const collect = async (query: string, budget: number): Promise<{
+    exact: LexicalHit[]; lexical: LexicalHit[]; dense: VectorHit[]; gaps: string[];
+  }> => {
+    request.signal?.throwIfAborted();
+    const exact = projection.exactSearch(query, budget);
+    const lexical = projection.lexicalSearch(query, budget);
+    const gaps: string[] = [];
+    const dense = request.dense === false ? [] : await vector.search({ text: query, limit: budget, signal: request.signal }).catch(error => {
+      gaps.push(`Dense retrieval unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    });
+    const ids = [...new Set([...exact, ...lexical, ...dense].map(hit => hit.chunkId))];
+    const eligible = new Set(candidatesFromScores(projection, request, new Map(ids.map(id => [id, 0])), new Map(), 0, asOf, false)
+      .map(candidate => candidate.item.chunkId));
+    const needsMore = [exact, lexical, dense].some(hits => hits.length >= budget
+      && hits.filter(hit => eligible.has(hit.chunkId)).length < candidateLimit);
+    if (needsMore && budget < 1000) return collect(query, Math.min(1000, budget * 2));
+    if (needsMore) gaps.push('Candidate budget exhausted while filtering; eligible matches may remain.');
+    return { exact: exact.filter(hit => eligible.has(hit.chunkId)), lexical: lexical.filter(hit => eligible.has(hit.chunkId)),
+      dense: dense.filter(hit => eligible.has(hit.chunkId)), gaps };
+  };
+  const results = await Promise.all(queries.map(query => collect(query, candidateLimit)));
+  return { queries, exact: results.map(result => result.exact), lexical: results.map(result => result.lexical),
+    dense: results.map(result => result.dense), denseGaps: [...results.flatMap(result => result.gaps), ...projection.sourceGaps()],
+    denseModel: `${vector.provider.model}:${[...new Set(results.flatMap(result => result.dense[0]?.dimensions ?? []))].sort().join(',')}` };
+
+};
+
+export const candidatesFromScores = (
+  projection: Projection,
+  request: MemoryQuery,
+  scores: ReadonlyMap<string, number>,
+  reasons: ReadonlyMap<string, readonly string[]>,
+  threshold: number,
+  asOf: number,
+  priors = true,
+): RankedCandidate[] => {
+  const chunks = projection.chunks([...scores.keys()]);
+  return chunks.flatMap(chunk => {
     const document = chunk.document;
     if (document.scopeId !== request.scopeId) return [];
+    // Compatibility for projections ingested by the old presets. Raw prompts
+    // and unanswered threads are not durable answers; keep them in their owner
+    // journals, not in ordinary recall. Explicit namespace inspection can still
+    // retrieve them without pretending that host observation proves relevance.
+    if (!request.namespaces?.length) {
+      if (document.namespace === 'prjct.observation' && document.kind === 'instruction' && document.trust !== 'user') return [];
+      if (document.namespace === 'pi-team.journal' && (document.metadata.outcome === 'interrupted'
+        || document.kind === 'thread' && !/^(Delivered|Result|Replies):\s*\S/mu.test(document.text))) return [];
+    }
     if (request.namespaces?.length && !request.namespaces.includes(document.namespace)) return [];
     if (request.kinds?.length && !request.kinds.includes(document.kind)) return [];
-    if (document.validFrom && Date.parse(document.validFrom) > asOf) return [];
-    if (document.validTo && Date.parse(document.validTo) <= asOf) return [];
     const fact = document.namespace === 'memory' ? projection.getFact(document.externalId) : undefined;
-    if (fact && !factIsValidAt(fact, asOf)) return [];
+    if (fact ? !factIsValidAt(fact, asOf) : !(Date.parse(document.validFrom ?? document.observedAt) <= asOf
+      && asOf < (document.validTo ? Date.parse(document.validTo) : Infinity))) return [];
     const base = scores.get(chunk.id) ?? 0;
     const utility = fact ? Math.max(-0.25, Math.min(0.25, fact.usefulness * 0.025)) : 0;
     const evidenceBoost = fact?.evidence.some(evidence => ['native_observation', 'declared'].includes(evidence.provenance)) ? 0.08 : 0;
     const confidence = fact?.confidence ?? trustWeight(document.trust);
-    const score = base * (0.65 + 0.35 * confidence) + utility + evidenceBoost;
+    const score = priors ? base * (0.65 + 0.35 * confidence) + utility + evidenceBoost : base;
     if (score < threshold) return [];
     const item: MemoryHit = {
       id: fact?.id ?? document.externalId, chunkId: chunk.id, statement: chunk.text,
+      scopeId: document.scopeId, scopeKind: document.scopeKind,
       ...(document.title ? { title: document.title } : {}), ...(document.uri ? { uri: document.uri } : {}),
       namespace: document.namespace, source: document.source, kind: document.kind, score,
-      ...(fact ? { standing: fact.standing } : {}), ...(fact?.validAt ? { validAt: fact.validAt } : {}),
-      ...(fact?.invalidAt ? { invalidAt: fact.invalidAt } : {}), provenance: fact
+      observedAt: document.observedAt, ...(fact ? { standing: fact.standing } : {}),
+      ...((fact?.validAt ?? document.validFrom) ? { validAt: fact?.validAt ?? document.validFrom } : {}),
+      ...((fact?.invalidAt ?? document.validTo) ? { invalidAt: fact?.invalidAt ?? document.validTo } : {}),
+      ...(fact?.expiredAt ? { expiredAt: fact.expiredAt } : {}), provenance: fact
         ? (fact.evidence.some(evidence => evidence.provenance === 'native_observation') ? 'native_observation'
           : fact.evidence.some(evidence => evidence.provenance === 'declared') ? 'declared' : 'agent_report')
         : document.trust,
@@ -119,14 +192,31 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
     };
     return [{ item, tokenSet: tokens(chunk.text), fact }];
   }).sort((a, b) => b.item.score - a.item.score || a.item.id.localeCompare(b.item.id));
+};
 
+export const presentCandidates = (
+  ranked: readonly RankedCandidate[],
+  options: Readonly<{
+    limit: number;
+    maxBytes: number;
+    threshold: number;
+    asOf: number;
+    gaps: readonly string[];
+    neighbors: (factIds: readonly string[], limit: number) => readonly StoredFact[];
+    sourceCap?: boolean;
+    identity?: (item: MemoryHit) => string;
+    expand?: (selected: readonly RankedCandidate[]) => readonly MemoryHit[];
+  }>,
+): HybridSearchResult => {
+  const { limit, threshold, asOf } = options;
+  const identity = options.identity ?? ((item: MemoryHit): string => JSON.stringify([item.scopeId, item.namespace, item.id]));
   // Source capping only makes sense when there is more than one source to
   // balance. Applied unconditionally it silently truncates every result set in a
   // single-source scope to limit/3 items, which costs recall and buys nothing.
   const sourceCount = new Set(ranked.map(candidate => candidate.item.source)).size;
-  const perSourceCap = sourceCount > 1 ? Math.max(2, Math.ceil(limit / 3)) : limit;
-  const diverse = ranked.reduce<typeof ranked>((selected, candidate) => {
-    if (selected.length >= limit) return selected;
+  const perSourceCap = options.sourceCap !== false && sourceCount > 1 ? Math.max(2, Math.ceil(limit / 3)) : limit;
+  const diverse = ranked.reduce<RankedCandidate[]>((selected, candidate) => {
+    if (selected.length >= limit || selected.some(prior => identity(prior.item) === identity(candidate.item))) return selected;
     const redundancy = selected.reduce((highest, prior) => Math.max(highest, jaccard(candidate.tokenSet, prior.tokenSet)), 0);
     const sameSource = selected.filter(prior => prior.item.source === candidate.item.source).length;
     return redundancy > 0.82 || sameSource >= perSourceCap ? selected : [...selected, candidate];
@@ -136,10 +226,12 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
   // a caller asking for high-confidence hits got them anyway.
   const factIds = diverse.flatMap(candidate => candidate.fact?.id ?? []);
   const graph = GRAPH_ITEM_SCORE < threshold ? []
-    : projection.graphNeighbors(factIds, Math.min(6, limit)).filter(fact => factIsValidAt(fact, asOf));
+    : options.neighbors(factIds, Math.min(6, limit)).filter(fact => factIsValidAt(fact, asOf)).slice(0, Math.min(6, limit));
   const graphItems: MemoryHit[] = graph.map((fact: StoredFact) => ({
     id: fact.id, chunkId: `graph:${fact.id}`, statement: fact.statement, namespace: 'memory', source: 'graph',
-    kind: fact.kind, score: GRAPH_ITEM_SCORE, standing: fact.standing, ...(fact.validAt ? { validAt: fact.validAt } : {}),
+    scopeId: fact.scopeId, scopeKind: fact.scopeId === 'shared' ? 'shared' : fact.scopeId.startsWith('p_') ? 'project' : 'team',
+    kind: fact.kind, score: GRAPH_ITEM_SCORE, standing: fact.standing, observedAt: fact.recordedAt,
+    ...(fact.expiredAt ? { expiredAt: fact.expiredAt } : {}), ...(fact.validAt ? { validAt: fact.validAt } : {}),
     ...(fact.invalidAt ? { invalidAt: fact.invalidAt } : {}), provenance: fact.evidence.some(item => item.provenance === 'native_observation')
       ? 'native_observation' : fact.evidence.some(item => item.provenance === 'declared') ? 'declared' : 'agent_report',
     evidenceIds: fact.evidence.map(item => item.id), reason: ['temporal-graph'],
@@ -147,19 +239,57 @@ export const hybridSearch = async (projection: Projection, vector: VectorIndex, 
   // Keyed by id with the RANKED item winning. Building the map the other way
   // round let a graph neighbour that also surfaced through ranking replace a
   // properly scored hit with its fixed-score stub.
-  const selectedRankedIds = new Set(diverse.map(candidate => candidate.item.id));
+  const selectedRankedIds = new Set(diverse.map(candidate => identity(candidate.item)));
+  const expanded = options.expand?.(diverse) ?? graphItems;
   const unique = [...diverse.map(candidate => candidate.item),
-    ...graphItems.filter(item => !selectedRankedIds.has(item.id))];
-  const clipped = clipItems(unique, Math.max(512, Math.min(32_768, request.maxBytes ?? 4096)));
-  const diversityOmitted = [...new Set(ranked.map(candidate => candidate.item.id))]
+    ...expanded.filter(item => !selectedRankedIds.has(identity(item)))];
+  const bounded = unique.slice(0, limit);
+  const clipped = clipItems(bounded, options.maxBytes);
+  const diversityOmitted = [...new Set(ranked.map(candidate => identity(candidate.item)))]
     .filter(id => !selectedRankedIds.has(id)).length;
-  const omitted = diversityOmitted + clipped.omitted;
-  const gaps = [...new Set(denseGaps)];
+  const omitted = diversityOmitted + (unique.length - bounded.length) + clipped.omitted;
+  const gaps = [...new Set(options.gaps)];
   // 'partial' means the answer is degraded — a retrieval leg failed, or the byte
   // budget cut results the caller asked for. Having more matches than `limit` is
   // ordinary and still reported through `omitted`; folding it into the status
   // made 'ok' unreachable for any query that matched more than it returned.
-  const degraded = gaps.length > 0 || clipped.omitted > 0;
+  const degraded = gaps.length > 0 || clipped.omitted > 0 || clipped.truncated > 0;
   return { status: clipped.items.length ? (degraded ? 'partial' : 'ok') : 'abstained',
     items: clipped.items, gaps: clipped.items.length ? gaps : [...gaps, 'No active memory matched the requested scope and time.'], omitted };
+};
+
+export const hybridSearch = async (projection: Projection, vector: VectorIndex, request: MemoryQuery): Promise<HybridSearchResult> => {
+  const queries = [...new Set(request.queries.map(query => query.trim()).filter(Boolean))].slice(0, 4);
+  if (!queries.length) return { status: 'abstained', items: [], gaps: ['No retrieval query was provided.'], omitted: 0 };
+  const limit = Math.max(1, Math.min(50, request.limit ?? 12));
+  const asOf = request.asOf !== undefined ? Date.parse(request.asOf) : Date.now();
+  if (!Number.isFinite(asOf)) throw new Error('asOf must be ISO-8601.');
+  const legs = await collectLegs(projection, vector, { ...request, asOf: new Date(asOf).toISOString() });
+  const scores = new Map<string, number>();
+  const reasons = new Map<string, string[]>();
+  const statistics = projection.lexicalStatistics(relevanceTerms(queries));
+  legs.queries.forEach((query, index) => {
+    const ids = [...new Set([...legs.exact[index] ?? [], ...legs.lexical[index] ?? [], ...legs.dense[index] ?? []].map(hit => hit.chunkId))];
+    const chunks = projection.chunks(ids);
+    const accepted = new Set(relevantKeys(query, chunks.map(chunk => ({ key: chunk.id,
+      text: `${chunk.document.title ?? ''}\n${chunk.text}` })), statistics,
+    new Map((legs.dense[index] ?? []).map(hit => [hit.chunkId, hit.similarity]))));
+    for (const chunk of chunks) {
+      if (query === chunk.id || query === chunk.document.externalId || query === chunk.document.uri) {
+        accepted.add(chunk.id);
+      }
+    }
+    addRanking(scores, reasons, (legs.exact[index] ?? []).filter(hit => accepted.has(hit.chunkId)).map(hit => hit.chunkId), 'exact', 2.5);
+    addRanking(scores, reasons, (legs.lexical[index] ?? []).filter(hit => accepted.has(hit.chunkId)).map(hit => hit.chunkId), 'bm25', 1);
+    addRanking(scores, reasons, (legs.dense[index] ?? []).filter(hit => accepted.has(hit.chunkId)).map(hit => hit.chunkId), 'dense', 1.25);
+  });
+  const threshold = Math.max(0, Math.min(1, request.scoreThreshold ?? 0));
+  const ranked = candidatesFromScores(projection, request, scores, reasons, threshold, asOf);
+  return presentCandidates(ranked, {
+    limit, maxBytes: Math.max(512, Math.min(32_768, request.maxBytes ?? 4096)),
+    threshold, asOf, gaps: ranked.length ? legs.denseGaps : [...legs.denseGaps, 'Insufficient evidence: no candidate meets the default relevance gate.'],
+    neighbors: (factIds, hop) => request.namespaces?.length && !request.namespaces.includes('memory') ? []
+      : projection.graphNeighbors(factIds, hop).filter(fact => fact.scopeId === request.scopeId
+        && (!request.kinds?.length || request.kinds.includes(fact.kind))),
+  });
 };

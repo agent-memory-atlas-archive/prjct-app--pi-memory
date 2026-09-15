@@ -50,9 +50,9 @@ export const assertTemporalFact = (fact: TemporalFact): TemporalFact => {
   if (!fact.statement.trim() || Buffer.byteLength(fact.statement, 'utf8') > 8192) throw new Error('Memory statement must be 1–8192 bytes.');
   if (fact.confidence < 0 || fact.confidence > 1) throw new Error('Memory confidence must be between 0 and 1.');
   if (!Number.isFinite(Date.parse(fact.recordedAt))) throw new Error('Memory recordedAt must be ISO-8601.');
-  if (fact.validAt && !Number.isFinite(Date.parse(fact.validAt))) throw new Error('Memory validAt must be ISO-8601.');
-  if (fact.invalidAt && !Number.isFinite(Date.parse(fact.invalidAt))) throw new Error('Memory invalidAt must be ISO-8601.');
-  if (fact.expiredAt && !Number.isFinite(Date.parse(fact.expiredAt))) throw new Error('Memory expiredAt must be ISO-8601.');
+  if (fact.validAt !== undefined && !Number.isFinite(Date.parse(fact.validAt))) throw new Error('Memory validAt must be ISO-8601.');
+  if (fact.invalidAt !== undefined && !Number.isFinite(Date.parse(fact.invalidAt))) throw new Error('Memory invalidAt must be ISO-8601.');
+  if (fact.expiredAt !== undefined && !Number.isFinite(Date.parse(fact.expiredAt))) throw new Error('Memory expiredAt must be ISO-8601.');
   if (fact.validAt && fact.invalidAt && Date.parse(fact.validAt) >= Date.parse(fact.invalidAt)) throw new Error('Memory validAt must precede invalidAt.');
   if (fact.entities.length > 24 || fact.evidence.length > 32 || fact.episodeIds.length > 32 || (fact.supersedes?.length ?? 0) > 32) {
     throw new Error('Memory relationship limit exceeded.');
@@ -63,8 +63,8 @@ export const assertTemporalFact = (fact: TemporalFact): TemporalFact => {
   return fact;
 };
 
-export const factIsValidAt = (fact: Pick<TemporalFact, 'standing' | 'validAt' | 'invalidAt'>, asOf: number): boolean => {
-  const starts = fact.validAt ? Date.parse(fact.validAt) : Number.NEGATIVE_INFINITY;
+export const factIsValidAt = (fact: Pick<TemporalFact, 'standing' | 'validAt' | 'invalidAt' | 'recordedAt'>, asOf: number): boolean => {
+  const starts = Date.parse(fact.validAt ?? fact.recordedAt);
   const ends = fact.invalidAt ? Date.parse(fact.invalidAt) : Number.POSITIVE_INFINITY;
   const terminalWithoutHistory = (fact.standing === 'contradicted' || fact.standing === 'superseded') && !fact.invalidAt;
   return !terminalWithoutHistory && starts <= asOf && asOf < ends;

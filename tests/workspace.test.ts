@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { componentPath, projectIdFrom, resolveProject, scopeRoot } from '../src/workspace/project-identity.ts';
+import { componentPath, memoryDatabasePath, projectIdFrom, resolveProject, scopeRoot } from '../src/workspace/project-identity.ts';
 
 test('project identity converges independently and honors a moved-checkout locator', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-scope-'));
@@ -15,4 +15,5 @@ test('project identity converges independently and honors a moved-checkout locat
   assert.match(projectIdFrom(checkout), /^p_[0-9a-f]{12}$/);
   assert.equal(componentPath(join(root, 'store'), 'team', 'team_1'), join(root, 'store', 'teams', 'team_1', 'memory'));
   assert.equal(scopeRoot(join(root, 'store'), 'shared', 'shared'), join(root, 'store', 'shared'));
+  assert.equal(memoryDatabasePath(join(root, 'store'), 'p_stable123456'), join(root, 'store', 'p_stable123456', 'memory', 'memory.sqlite'));
 });

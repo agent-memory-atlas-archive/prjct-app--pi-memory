@@ -111,3 +111,20 @@ test('lexical search keeps the rare terms of a long prose query and drops ubiqui
   const hits = engine.projection.lexicalSearch(prompt, 10);
   assert.equal(engine.projection.chunks([hits[0]!.chunkId])[0]!.document.externalId, 'needle');
 });
+
+test('dense hits expose cosine similarity independently of int8 L2 units', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-cosine-'));
+  const provider = {
+    model: 'orthogonal-v1', isLocal: true,
+    embed: async (texts: readonly string[]) => texts.map(text => text === 'north'
+      ? [1, 0, 0, 0, 0, 0, 0, 0] : [0, 1, 0, 0, 0, 0, 0, 0]),
+  };
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider });
+  t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
+  for (const text of ['north', 'east']) await engine.index({ namespace: 'test', externalId: text,
+    scopeId: 'p_test', scopeKind: 'project', source: 'fixture', kind: 'fact', text,
+    contentHash: sha256(text), version: '1', observedAt: '2026-01-01T00:00:00Z', trust: 'host', metadata: {} });
+  const hits = await engine.vector.search({ text: 'north' });
+  assert.ok(Math.abs(hits.find(hit => hit.externalId === 'north')!.similarity - 1) < 0.001);
+  assert.ok(Math.abs(hits.find(hit => hit.externalId === 'east')!.similarity) < 0.001);
+});

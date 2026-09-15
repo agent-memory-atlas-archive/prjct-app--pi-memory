@@ -24,7 +24,7 @@ export const PRJCT_OBSERVATION_SELECTION: SelectionRules = {
   keep: [
     { field: 'execution.outcome', equals: 'failed' },
     { field: 'verification', equals: true },
-    { field: 'execution.toolName', oneOf: ['user_input'] },
+    { field: 'provenance', equals: 'declared' },
   ],
 };
 
@@ -54,30 +54,43 @@ export const prjctObservationMapping = (select: SelectionRules = PRJCT_OBSERVATI
 
 /**
  * pi-team's journal carries four entry types. `message` and `control` are the
- * turn-by-turn traffic of an exchange; `thread` is its outcome and `checkin` a
- * round of reported state. Only the settled two are durable knowledge — the 487
- * raw messages on a real machine are narration.
+ * turn-by-turn traffic of an exchange. A thread without a delivery is only a
+ * request; a result message may contain the actual answer missing from the
+ * thread summary. Keep published answers and reported check-in state, never
+ * mere requests or interrupted-turn placeholders.
  */
 export const TEAM_JOURNAL_SELECTION: SelectionRules = {
-  keep: [{ field: 'type', oneOf: ['thread', 'checkin'] }],
+  keep: [
+    { field: 'delivered', matches: '\\S' },
+    { field: 'result.body', matches: '\\S' },
+    { field: 'replies.*.state', matches: '\\S' },
+  ],
+  drop: [
+    { field: 'type', equals: 'control' },
+    { field: 'outcome', equals: 'interrupted' },
+    { field: 'result.outcome', equals: 'interrupted' },
+  ],
 };
 
 export const teamJournalMapping = (select: SelectionRules = TEAM_JOURNAL_SELECTION): RecordMapping => ({
   namespace: 'pi-team.journal',
-  id: ['rootId', 'broadcastId', 'id'],
-  text: ['requested', 'subject'],
+  id: ['id', 'rootId', 'broadcastId'],
+  text: ['subject'],
   title: ['subject'],
   observedAt: ['at'],
-  kind: { from: ['type'], fallback: 'thread' },
+  kind: { rules: [{ when: [{ field: 'result.body', matches: '\\S' }], kind: 'result' }], from: ['type'], fallback: 'thread' },
   trust: 'imported',
   append: [
+    { label: 'Result', field: 'result.body' },
     { label: 'Delivered', field: 'delivered' },
     { label: 'Outcome', field: 'outcome' },
     { label: 'Files', field: 'files' },
     { label: 'Tests', field: 'tests', join: '; ' },
     { label: 'Replies', field: 'replies.*.state' },
+    { label: 'Request', field: 'requested' },
   ],
-  metadata: { outcome: 'outcome', team: 'team', from: 'from', to: 'to', exchanges: 'exchanges' },
+  metadata: { outcome: 'outcome', team: 'team', from: 'from', to: 'to', exchanges: 'exchanges', rootId: 'rootId' },
+  maxChars: 64_000,
   select,
 });
 
@@ -90,6 +103,7 @@ export const teamArtifactMapping = (blobDir: string): RecordMapping => ({
   kind: 'artifact',
   trust: 'host',
   contentFrom: { dir: blobDir, field: 'sha' },
+  maxChars: 512_000,
   metadata: { path: 'path', alias: 'alias', tool: 'tool', bytes: 'bytes' },
   select: { keep: [{ field: 'stored', equals: true }], drop: [{ field: 'bytes', gt: 512_000 }] },
   latestPerId: true,

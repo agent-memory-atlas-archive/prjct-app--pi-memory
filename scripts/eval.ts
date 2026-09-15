@@ -2,6 +2,7 @@ import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { MemoryEngine } from '../src/engine.ts';
+import { federatedSearch } from '../src/retrieval/federated.ts';
 import { TransformerEmbeddingProvider } from '../src/vector/providers.ts';
 import { sha256 } from '../src/workspace/project-identity.ts';
 import { retrievalMetrics } from '../tests/eval/metrics.ts';
@@ -44,22 +45,34 @@ const metrics = (rankings: string[][]): Metrics => {
 const root = await mkdtemp(join(tmpdir(), 'pi-memory-eval-'));
 const provider = new TransformerEmbeddingProvider();
 const engine = new MemoryEngine({ root, scopeId: 'p_eval', sessionId: 'eval', provider });
+const scopes = [engine];
 try {
   for (const doc of docs) await engine.index({ namespace: 'gold', externalId: doc.id, scopeId: 'p_eval', scopeKind: 'project',
     source: 'gold', kind: doc.kind, title: doc.id, text: doc.text, version: sha256(doc.text), contentHash: sha256(doc.text),
     observedAt: '2026-01-01T00:00:00.000Z', ...(doc.validTo ? { validTo: doc.validTo } : {}), trust: doc.trust, metadata: {} });
+  // Project-isolated eval: the gold corpus lives only in p_eval.
   const docVectors = new Map(docs.map(doc => [doc.id, hash(doc.text)]));
   const lexical = cases.map(item => engine.projection.lexicalSearch(item.query, 100).map(hit => engine.projection.chunks([hit.chunkId])[0]?.document.externalId).filter((id): id is string => !!id));
   const hashing = cases.map(item => [...docVectors].map(([id, vector]) => ({ id, score: cosine(hash(item.query), vector) })).sort((a, b) => b.score - a.score).map(row => row.id));
   const fused = lexical.map((ranking, index) => rrf([ranking, hashing[index]!.slice(0, 10)]));
   const candidateNoExpansion = [] as string[][];
   const candidate = [] as string[][];
+  const federated = [] as string[][];
+  const perScopeRrf = [] as string[][];
   for (const item of cases) {
     candidateNoExpansion.push((await engine.search({ queries: [item.query], dense: true, limit: 10, maxBytes: 16384 })).items.map(hit => hit.id));
     candidate.push((await engine.search({ queries: [item.query, ...(item.expansions ?? [])], dense: true, limit: 10, maxBytes: 16384 })).items.map(hit => hit.id));
+    federated.push((await federatedSearch(scopes, { queries: [item.query], dense: true, limit: 10, maxBytes: 16384 })).items.map(hit => hit.id));
+    // Frozen reference strategy: merge independently ranked scopes using the
+    // former project/team/shared priors. Same corpus partition, no expansions.
+    const local = await Promise.all(scopes.map(async (scope, index) =>
+      (await scope.search({ queries: [item.query], dense: true, limit: 10, maxBytes: 32768 })).items
+        .map(hit => ({ id: hit.id, score: hit.score * [1, 0.9, 0.85][index]! }))));
+    perScopeRrf.push(local.flat().sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)).slice(0, 10).map(hit => hit.id));
   }
   const report = { bm25: metrics(lexical), hashing: metrics(hashing), fused: metrics(fused),
-    candidateNoExpansion: metrics(candidateNoExpansion), candidate: metrics(candidate) };
+    candidateNoExpansion: metrics(candidateNoExpansion), candidate: metrics(candidate),
+    perScopeRrf: metrics(perScopeRrf), federatedNoExpansion: metrics(federated) };
   const worstCases = cases.map((item, index) => ({ query: item.query, positives: item.positives,
     rank: candidateNoExpansion[index]!.findIndex(id => item.positives.includes(id)) + 1,
     rankWithExpansions: candidate[index]!.findIndex(id => item.positives.includes(id)) + 1,
@@ -77,11 +90,17 @@ try {
   const measured = report.candidateNoExpansion;
   const passed = measured.ndcgAt10 >= best.ndcgAt10 * 1.2
     && measured.recallAt10 >= best.recallAt10 && measured.mrr >= best.mrr;
+  const federatedPassed = report.federatedNoExpansion.ndcgAt10 >= best.ndcgAt10 * 1.2
+    && report.federatedNoExpansion.recallAt10 >= best.recallAt10 && report.federatedNoExpansion.mrr >= best.mrr
+    && report.federatedNoExpansion.ndcgAt10 >= report.perScopeRrf.ndcgAt10
+    && report.federatedNoExpansion.recallAt10 >= report.perScopeRrf.recallAt10
+    && report.federatedNoExpansion.mrr >= report.perScopeRrf.mrr;
   console.log(JSON.stringify({ suite, corpus: docs.length, queries: cases.length, ...report, worstCases,
+    federatedGate: { passed: federatedPassed, scopes: scopes.length, measures: 'federatedNoExpansion' },
     gate: { passed, measures: 'candidateNoExpansion', best, requiredNdcgAt10: Number((best.ndcgAt10 * 1.2).toFixed(4)),
       actualNdcgAt10: Number(measured.ndcgAt10.toFixed(4)),
       expansionLift: Number((report.candidate.ndcgAt10 - measured.ndcgAt10).toFixed(4)) } }, null, 2));
-  if (!passed) process.exitCode = 1;
+  if (!passed || !federatedPassed) process.exitCode = 1;
 } finally {
   await engine.dispose();
   await rm(root, { recursive: true, force: true });

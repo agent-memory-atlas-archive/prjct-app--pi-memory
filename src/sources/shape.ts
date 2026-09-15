@@ -51,7 +51,7 @@ export const asTimestamp = (value: JsonValue): string | undefined => {
   }
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   const millis = Math.abs(value) < 1e11 ? value * 1000 : value;
-  return Number.isFinite(millis) ? new Date(millis).toISOString() : undefined;
+  return Number.isFinite(new Date(millis).getTime()) ? new Date(millis).toISOString() : undefined;
 };
 
 export const firstTimestamp = (source: unknown, paths: readonly FieldPath[]): string | undefined => {

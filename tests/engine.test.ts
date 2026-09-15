@@ -59,6 +59,21 @@ test('dense outages leave lexical chunks available for an explicit backfill', as
   assert.equal((await engine.search({ queries: ['recover'], dense: true })).items[0]?.id, 'offline');
 });
 
+test('authority commit is lexically searchable without vector upsert', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-lex-'));
+  const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
+  t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
+  const fact = engine.composeFact({
+    kind: 'decision', statement: 'Use north-datastore-alpha for durable project storage',
+    entities: [], evidence: [], episodeIds: [], confidence: 0.9, tags: {},
+  });
+  engine.authorityTransaction(() => engine.commitAuthority({ type: 'fact.recorded', fact }));
+  assert.equal(engine.projection.getFact(fact.id)?.statement, fact.statement);
+  assert.ok(engine.projection.chunkCount({ namespace: 'memory', externalId: fact.id }) >= 1);
+  const found = await engine.search({ queries: ['north-datastore-alpha'], dense: false });
+  assert.equal(found.items[0]?.id, fact.id);
+});
+
 test('rebuild is locked and still reconstructs the projection', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-rebuild-'));
   const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });

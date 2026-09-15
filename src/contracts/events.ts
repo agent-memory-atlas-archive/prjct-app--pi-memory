@@ -11,7 +11,10 @@ export type MemoryEventPayload =
   | Readonly<{ type: 'fact.recorded'; fact: TemporalFact }>
   | Readonly<{ type: 'fact.resolved'; factId: string; standing: MemoryStanding; rationale: string; replacementId?: string }>
   | Readonly<{ type: 'retrieval.feedback'; factId: string; signal: 'used' | 'helpful' | 'wrong' | 'stale'; queryHash: string }>
-  | Readonly<{ type: 'gc.compacted'; removed: readonly string[]; retained: number; generation: string }>;
+  | Readonly<{ type: 'gc.compacted'; removed: readonly string[]; retained: number; generation: string }>
+  | Readonly<{ type: 'curation.batch.begin'; batchId: string; sourceRevision: string }>
+  | Readonly<{ type: 'curation.batch.commit'; batchId: string; sourceRevision: string; facts: readonly TemporalFact[]; documents: readonly SourceDocument[];
+    resolves?: readonly Readonly<{ factId: string; standing: MemoryStanding; rationale: string }>[] }>;
 
 export type MemoryEvent = Readonly<{
   schemaVersion: 1;
@@ -51,7 +54,8 @@ export const assertEventPayload = (value: unknown): MemoryEventPayload => {
   if (payload.type === 'document.upserted') {
     if (!isObject(payload.document)) throw new Error('Memory document.upserted payload requires a document.');
     fields(payload.document as unknown as Record<string, unknown>,
-      ['namespace', 'externalId', 'scopeId', 'scopeKind', 'source', 'kind', 'text', 'version', 'contentHash', 'observedAt', 'trust'], 'document');
+      ['namespace', 'externalId', 'scopeId', 'scopeKind', 'source', 'kind', 'version', 'contentHash', 'observedAt', 'trust'], 'document');
+    if (typeof payload.document.text !== 'string') throw new Error('Memory document payload is missing text.');
     if (!isObject((payload.document as unknown as Record<string, unknown>).metadata)) throw new Error('Memory document metadata must be an object.');
     assertSourceDocument(payload.document);
     return payload;
@@ -98,6 +102,22 @@ export const assertEventPayload = (value: unknown): MemoryEventPayload => {
     if (!Array.isArray(payload.removed) || payload.removed.some(key => !text(key, 4096))) throw new Error('Memory gc.compacted removed must be an array of keys.');
     if (!Number.isSafeInteger(payload.retained) || payload.retained < 0) throw new Error('Memory gc.compacted retained must be a non-negative integer.');
     if (!text(payload.generation, 128)) throw new Error('Memory gc.compacted generation must be a string.');
+    return payload;
+  }
+  if (payload.type === 'curation.batch.begin') {
+    fields(payload as unknown as Record<string, unknown>, ['batchId', 'sourceRevision'], 'curation.batch.begin');
+    return payload;
+  }
+  if (payload.type === 'curation.batch.commit') {
+    fields(payload as unknown as Record<string, unknown>, ['batchId', 'sourceRevision'], 'curation.batch.commit');
+    if (!Array.isArray(payload.facts) || !Array.isArray(payload.documents)) throw new Error('Curation batch commit requires facts and documents arrays.');
+    payload.facts.forEach(assertTemporalFact);
+    payload.documents.forEach(assertSourceDocument);
+    if (payload.resolves !== undefined) {
+      if (!Array.isArray(payload.resolves) || payload.resolves.some(item => !item || typeof item.factId !== 'string' || typeof item.standing !== 'string' || typeof item.rationale !== 'string')) {
+        throw new Error('Curation batch commit resolves must be factId/standing/rationale records.');
+      }
+    }
     return payload;
   }
   throw new Error(`Unknown memory event payload type: ${String((value as { type?: unknown }).type)}`);

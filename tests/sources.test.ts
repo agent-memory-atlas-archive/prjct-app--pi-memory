@@ -102,7 +102,7 @@ test('prjct preset keeps failures, verifications and user statements, dropping r
   t.after(() => rm(home, { recursive: true, force: true }));
   await writeObservations(home, 'p_test', [
     observation('obs_fail', { execution: { toolName: 'bash', outcome: 'failed', sourcePaths: ['src/auth.ts'] } }),
-    observation('obs_said', { execution: { toolName: 'user_input', outcome: 'succeeded' } }),
+    observation('obs_said', { provenance: 'declared', execution: { toolName: 'user_input', outcome: 'succeeded' } }),
     observation('obs_read', { execution: { toolName: 'read', outcome: 'succeeded' } }),
     observation('obs_ok', { execution: { toolName: 'bash', outcome: 'succeeded', command: 'ls' } }),
     observation('obs_verified', { verification: true, execution: { toolName: 'bash', outcome: 'succeeded' } }),
@@ -188,22 +188,18 @@ test('sync routes each adapter to the scope that owns it and is idempotent', asy
   const project = await MemoryEngine.forScope('project', 'p_test', 's1', { home: root, provider: new TestEmbeddingProvider() });
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root, mailboxRoot: mailbox });
-  assert.deepEqual(registry.list(), ['pi-team:t_demo:artifacts', 'pi-team:t_demo:journal', 'prjct-observations']);
+  assert.deepEqual(registry.list(), ['prjct-observations']);
 
   const engines = scopedEngines('s1', project, { home: root });
   t.after(() => engines.dispose());
   const first = await registry.syncAll(engines.resolve);
-  assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [
-    ['pi-team:t_demo:artifacts', 1], ['pi-team:t_demo:journal', 1], ['prjct-observations', 1]]);
+  assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [['prjct-observations', 1]]);
   const second = await registry.syncAll(engines.resolve);
-  assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [
-    ['pi-team:t_demo:artifacts', 0, 1], ['pi-team:t_demo:journal', 0, 1], ['prjct-observations', 0, 1]]);
+  assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [['prjct-observations', 0, 1]]);
 
-  assert.equal(project.projection.stats().documents, 1);
-  const team = await MemoryEngine.forScope('team', 't_demo', 's1', { home: root, provider: new TestEmbeddingProvider() });
-  t.after(() => team.dispose());
-  assert.equal(team.projection.stats().documents, 2);
-  assert.equal((await team.search({ queries: ['Fixed OAuth auth'], dense: false, limit: 5 })).items.length > 0, true);
+  assert.equal(project.projection.stats().documents, 0);
+  assert.equal(project.curation.stats().fingerprints, 1);
+  await assert.rejects(engines.resolve({ kind: 'team', id: 't_demo' }), /not this project's memory/);
 });
 
 test('an extra adapter can be registered without changing pi-memory', async t => {
@@ -219,4 +215,42 @@ test('an extra adapter can be registered without changing pi-memory', async t =>
 test('the mailbox root follows the Pi agent directory, not PRJCT_HOME', () => {
   assert.equal(teamMailboxRoot('/explicit'), '/explicit');
   assert.match(teamMailboxRoot(), /teams$/);
+});
+
+test('source recall keeps delivered answers, not repeated questions or raw prompts', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-source-value-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const scope = { kind: 'team', id: 't_demo' } as const;
+  const journal = join(root, 'demo', 'journal');
+  await mkdir(journal, { recursive: true });
+  await writeFile(join(journal, 'day.jsonl'), [
+    { type: 'thread', rootId: 'question', subject: 'Storage decision?', requested: 'What did the team decide?' },
+    { type: 'message', id: 'request', rootId: 'question', subject: 'Storage decision?', kind: 'request', body: 'What did the team decide?' },
+    { type: 'message', id: 'answer', rootId: 'question', subject: 'Storage decision', kind: 'result',
+      result: { outcome: 'completed', body: 'Decision: use SQLite, not a server database.' } },
+    { type: 'thread', rootId: 'interrupted', subject: 'Storage decision?', outcome: 'interrupted', delivered: 'Agent turn interrupted; no final text.' },
+  ].map(row => JSON.stringify({ v: 1, at: 1767225600000, ...row })).join('\n'));
+  const docs = await teamJournalSource({ mailboxRoot: root, teamName: 'demo', scope }).scan();
+  assert.deepEqual(docs.map(doc => doc.externalId), ['answer']);
+  assert.match(docs[0]!.text, /Decision: use SQLite/);
+  await writeObservations(root, 'p_test', [
+    observation('echo', { summary: 'user_input: What did the team decide?', execution: { toolName: 'user_input' } }),
+    observation('declared', { provenance: 'declared', summary: 'We require local storage.', execution: { toolName: 'user_input' } }),
+  ]);
+  const observations = await prjctObservationSource({ home: root, scope: { kind: 'project', id: 'p_test' } }).scan();
+  assert.deepEqual(observations.map(doc => doc.externalId), ['declared']);
+});
+
+test('artifact ingestion retains evidence beyond the record preview limit', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-artifact-tail-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const artifacts = join(root, 'teams', 't_test', 'team', 'artifacts');
+  await mkdir(join(artifacts, 'blobs'), { recursive: true });
+  await mkdir(join(artifacts, 'index'), { recursive: true });
+  const text = `${'Introduction. '.repeat(700)}\nDecision: ingest external documents using SourceAdapter.`;
+  const sha = createHash('sha256').update(text).digest('hex');
+  await writeFile(join(artifacts, 'blobs', sha), text);
+  await writeFile(join(artifacts, 'index', 'day.jsonl'), JSON.stringify({ artifactId: 'design', sha, stored: true, bytes: text.length, name: 'design.md' }));
+  const docs = await teamArtifactSource({ home: root, scope: { kind: 'team', id: 't_test' } }).scan();
+  assert.match(docs[0]!.text, /Decision: ingest external documents using SourceAdapter/);
 });

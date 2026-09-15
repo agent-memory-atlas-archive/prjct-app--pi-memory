@@ -1,10 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { EvidenceRef } from '../contracts/evidence.ts';
 import { hostEvidence, MemoryEngine } from '../engine.ts';
+import { createHandoffController, installHandoffHooks } from '../handoff/hooks.ts';
+import type { HandoffBudget } from '../handoff/select.ts';
 import { federatedSearch } from '../retrieval/federated.ts';
 import { redactSecrets } from '../security/redact.ts';
-import { discoverTeams } from '../sources/discovery.ts';
-import { prjctHomeFor } from '../workspace/project-identity.ts';
 
 export type MemorySession = Readonly<{
   engine?: Promise<MemoryEngine>;
@@ -26,13 +26,14 @@ const clip = (text: string, max = 2048): string => text.length <= max ? text : `
 
 export type MemorySearch = (request: Parameters<typeof federatedSearch>[1]) => ReturnType<typeof federatedSearch>;
 
-// Score a candidate must reach before it is injected into the system prompt
-// unasked. Low enough to let a solid lexical-only match through, high enough to
-// keep a single weak signal out.
-export const DEFAULT_RECALL_THRESHOLD = 0.055;
+// The shared evidence-coverage gate runs before ranking for both lookup and
+// automatic recall. Do not confuse a rank-fusion score with answerability:
+// an additional positive floor discarded supported Spanish/qualified matches.
+export const DEFAULT_RECALL_THRESHOLD = 0;
 
 export const installMemoryHooks = (pi: ExtensionAPI, options: {
   home?: string; recallThreshold?: number; federate?: boolean;
+  handoff?: HandoffBudget;
   /** Called after each turn is counted, so the caller can sync when due. */
   onActivity?: (project: MemoryEngine) => Promise<void> | void;
 } = {}) => {
@@ -51,36 +52,17 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     return pending;
   };
 
-  /**
-   * Every scope this session may read: the project it is working in, each team
-   * registered on this machine, and the shared scope. Retrieval filters on
-   * scopeId, so without this the agent could only ever see the project — team
-   * knowledge would be indexed and never returned.
-   *
-   * Opened once per session and reused. A scope that will not open is left out
-   * rather than failing the search.
-   */
+  /** The active project's memory only. Team/shared databases are not readable. */
   const readable = async (): Promise<readonly MemoryEngine[]> => {
     const current = get();
     if (current.readable) return current.readable;
-    const project = await engine();
-    if (options.federate === false) return [project];
-    const sessionId = current.ctx!.sessionManager.getSessionId();
-    const home = prjctHomeFor(options.home);
-    const scoped = options.home === undefined ? {} : { home: options.home };
-    const pending = (async (): Promise<readonly MemoryEngine[]> => {
-      const teams = await discoverTeams(home).catch(() => []);
-      const others = await Promise.all([
-        MemoryEngine.forShared(sessionId, scoped).catch(() => undefined),
-        ...teams.map(team => MemoryEngine.forScope('team', team.id, sessionId, scoped).catch(() => undefined)),
-      ]);
-      return [project, ...others.flatMap(found => found ?? [])];
-    })();
+    const pending = engine().then(project => [project] as const);
     set({ readable: pending });
     return pending;
   };
 
   const search: MemorySearch = async request => federatedSearch(await readable(), request);
+  const handoff = createHandoffController({ engine, ...(options.handoff === undefined ? {} : { budget: options.handoff }) });
 
   /**
    * Records what this turn cost. The host reports the size of the whole
@@ -98,20 +80,30 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
   };
 
   pi.on('session_start', async (_event, ctx) => {
-    set({ ctx, prompt: '', evidence: new Map(), contextTokens: 0 });
+    handoff.clear();
+    if (ctx.model) handoff.observeModel(ctx.cwd, ctx.sessionManager.getSessionId(), ctx.model);
+    const previous = get();
+    if (previous.ctx && previous.ctx.cwd !== ctx.cwd) {
+      const opened = await previous.readable?.catch(() => []) ?? [];
+      const pending = previous.engine ? [await previous.engine.catch(() => undefined)] : [];
+      for (const memory of [...opened, ...pending]) await memory?.dispose().catch(() => undefined);
+    }
+    set({ engine: undefined, readable: undefined, ctx, prompt: '', evidence: new Map(), contextTokens: 0 });
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
     set({ ctx, prompt: event.prompt });
     await countTurn(ctx).catch(() => undefined);
-    const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 2200, dense: false, scoreThreshold: recallThreshold })
+    const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 1500, dense: false, scoreThreshold: recallThreshold, namespaces: ['memory', 'memory.topic'] })
       .catch(() => undefined);
     const highConfidence = recalled?.items.slice(0, 4) ?? [];
     const memoryBlock = highConfidence.length
       ? `\n\nRetained memory candidates for this turn (the active agent must rerank and verify them):\n${highConfidence.map(item =>
-        `- ${item.id} [${item.standing ?? 'source'}/${item.provenance}; ${item.reason.join('+')}]: ${clip(item.statement, 420)}`).join('\n')}\nUse memory_context to inspect or expand the search; ignore irrelevant candidates.`
-      : '';
-    return { systemPrompt: `${event.systemPrompt}\n\nPi-memory rules: The current Pi agent is the only reasoning engine. Use memory_context for bounded retrieval and memory_record for selective durable knowledge. Never store routine reads, generic summaries, secrets, credentials, or unsupported claims.${memoryBlock}` };
+        `- ${item.scopeKind}/${item.scopeId}/${item.namespace}:${item.id} [${item.standing ?? 'source'}/${item.provenance}; ${item.reason.join('+')}; observed ${item.observedAt ?? 'unknown'}; validity ${item.validAt ?? '?'} .. ${item.invalidAt ?? '?'}]: ${item.statement}`).join('\n')}\n${recalled?.gaps.length ? `Limitations: ${recalled.gaps.join(' ')}\n` : ''}Use memory_context to inspect or expand the search; ignore irrelevant candidates. Observation dates do not prove current validity; verify historical proposals against current sources.`
+      : recalled?.status === 'abstained'
+        ? '\n\nRetained memory abstained: insufficient evidence for this turn. No memory candidates were injected; this is not proof that the requested fact does not exist.'
+        : '';
+    return { systemPrompt: `${event.systemPrompt}\n\nPi-memory rules: This interactive agent retrieves and records; it does not start the memory daemon or run background analysis. Use memory_context for bounded retrieval and memory_record for selective durable knowledge. Never store routine reads, generic summaries, secrets, credentials, or unsupported claims.${memoryBlock}` };
   });
 
   pi.on('tool_result', async (event, ctx) => {
@@ -124,8 +116,11 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     return { content: [...event.content, { type: 'text', text: `[pi-memory evidence: ${evidence.id}]` }] };
   });
 
+  installHandoffHooks(pi, handoff, engine);
+
   pi.on('session_shutdown', async () => {
     const { engine: pending, readable: opened } = get();
+    handoff.clear();
     set({ engine: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '', contextTokens: 0 });
     // The project engine is one of the readable ones; dispose the set, not both.
     const engines = await opened?.catch(() => []) ?? (pending ? [await pending] : []);
@@ -133,5 +128,5 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     if (!engines.length && pending) await (await pending).dispose().catch(() => undefined);
   });
 
-  return { engine, readable, search, stagedEvidence: () => get().evidence, currentPrompt: () => get().prompt };
+  return { engine, readable, search, stagedEvidence: () => get().evidence, currentPrompt: () => get().prompt, handoff };
 };

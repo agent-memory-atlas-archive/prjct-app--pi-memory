@@ -2,7 +2,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import type { SourceDocument } from '../contracts/documents.ts';
 import { sha256 } from '../workspace/project-identity.ts';
-import type { AdapterScope, SourceAdapter } from './registry.ts';
+import type { AdapterScope, SourceAdapter, SourceSnapshot } from './registry.ts';
 import {
   ID_HINTS, KIND_HINTS, TEXT_HINTS, TIME_HINTS, TITLE_HINTS,
   firstText, firstTimestamp, isRecord, matchesRule, paths, selects, valueAt, valuesAt,
@@ -23,6 +23,8 @@ export type RecordMapping = Readonly<{
   text?: readonly FieldPath[];
   title?: readonly FieldPath[];
   observedAt?: readonly FieldPath[];
+  validFrom?: readonly FieldPath[];
+  validTo?: readonly FieldPath[];
   uri?: readonly FieldPath[];
   /**
    * A literal kind, or how to derive one. `rules` are tried in order and the
@@ -62,29 +64,50 @@ export type RecordSourceOptions = Readonly<{
 const DEFAULT_MAX_CHARS = 8_000;
 const DEFAULT_BLOB_BYTES = 512_000;
 
-const walk = async (root: string, depth: number): Promise<string[]> => {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+const walk = async (root: string, depth: number, gaps: string[]): Promise<string[]> => {
+  const entries = await readdir(root, { withFileTypes: true }).catch(error => {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    gaps.push('Source directory unavailable; retained index may be stale.');
+    return [];
+  });
   const here = entries.filter(entry => entry.isFile() && ['.json', '.jsonl'].includes(extname(entry.name)))
     .map(entry => join(root, entry.name));
   if (depth <= 0) return here.sort();
   const nested = await Promise.all(entries.filter(entry => entry.isDirectory())
-    .map(entry => walk(join(root, entry.name), depth - 1)));
+    .map(entry => walk(join(root, entry.name), depth - 1, gaps)));
   return [...here, ...nested.flat()].sort();
 };
 
 const recordsIn = async (path: string, container?: FieldPath): Promise<JsonRecord[]> => {
-  const raw = await readFile(path, 'utf8').catch(() => '');
-  if (!raw.trim()) return [];
+  const raw = await readFile(path, 'utf8');
+  if (!raw.trim()) {
+    if (extname(path) === '.jsonl') return [];
+    throw new Error('Source JSON file is empty.');
+  }
   if (extname(path) === '.jsonl') {
     return raw.split('\n').flatMap(line => {
       if (!line.trim()) return [];
-      try { const parsed: unknown = JSON.parse(line); return isRecord(parsed) ? [parsed] : []; } catch { return []; }
+      const parsed: unknown = JSON.parse(line);
+      if (!isRecord(parsed)) throw new Error('Source JSONL records must be objects.');
+      return [parsed];
     });
   }
-  const parsed = ((): unknown => { try { return JSON.parse(raw); } catch { return undefined; } })();
-  if (parsed === undefined) return [];
+  const parsed: unknown = JSON.parse(raw);
   const found = container ? valuesAt(parsed, container) : [parsed];
+  if (!found.length) throw new Error('Source record container is missing.');
+  if (found.some(value => Array.isArray(value) ? value.some(row => !isRecord(row)) : !isRecord(value))) {
+    throw new Error('Source record container must contain objects.');
+  }
   return found.flatMap(value => Array.isArray(value) ? value.filter(isRecord) : isRecord(value) ? [value] : []);
+};
+
+const observedAtOf = (record: JsonRecord, mapping: RecordMapping): string => {
+  const declared = paths(mapping.observedAt, TIME_HINTS);
+  const stamp = firstTimestamp(record, declared);
+  if (!stamp && declared.some(path => valuesAt(record, path).some(value => value !== null))) {
+    throw new Error('Invalid observation timestamp in source record.');
+  }
+  return stamp ?? new Date(0).toISOString();
 };
 
 const trustOf = (record: JsonRecord, mapping: RecordMapping): SourceDocument['trust'] => {
@@ -139,11 +162,14 @@ export class JsonRecordAdapter implements SourceAdapter {
     this.source = options.source ?? options.mapping.namespace;
   }
 
-  private async documentFor(record: JsonRecord, path: string, signal?: AbortSignal): Promise<SourceDocument | undefined> {
+  private async documentFor(record: JsonRecord, path: string, gaps: string[], signal?: AbortSignal): Promise<SourceDocument | undefined> {
     signal?.throwIfAborted();
     if (!selects(record, this.mapping.select ?? {})) return undefined;
     const externalId = firstText(record, paths(this.mapping.id, ID_HINTS));
-    if (!externalId) return undefined;
+    if (!externalId) {
+      gaps.push('Selected source record has no identity; retained index may be stale.');
+      return undefined;
+    }
     const blob = this.mapping.contentFrom;
     const body = blob ? await (async (): Promise<string | undefined> => {
       const name = firstText(record, [blob.field]);
@@ -153,11 +179,23 @@ export class JsonRecordAdapter implements SourceAdapter {
       if (!info?.isFile() || info.size > (blob.maxBytes ?? DEFAULT_BLOB_BYTES)) return undefined;
       return readFile(file, 'utf8').catch(() => undefined);
     })() : textOf(record, this.mapping);
-    if (!body?.trim()) return undefined;
+    if (!body?.trim()) {
+      gaps.push('Selected source content unavailable; retained index may be stale.');
+      return undefined;
+    }
     const text = body.slice(0, this.mapping.maxChars ?? DEFAULT_MAX_CHARS);
     const hash = sha256(text);
     const title = firstText(record, paths(this.mapping.title, TITLE_HINTS));
     const uri = firstText(record, paths(this.mapping.uri, [])) ?? path;
+    const validity = (field: 'validFrom' | 'validTo'): string | undefined => {
+      const declared = paths(this.mapping[field], [field]);
+      const present = declared.some(path => valuesAt(record, path).some(value => value !== null));
+      const stamp = firstTimestamp(record, declared);
+      if (present && !stamp) throw new Error(`Invalid ${field} in source record ${externalId}.`);
+      return stamp;
+    };
+    const validFrom = validity('validFrom');
+    const validTo = validity('validTo');
     const metadata = Object.fromEntries(Object.entries(this.mapping.metadata ?? {}).flatMap(([key, field]) => {
       const value = valueAt(record, field);
       return value === undefined || typeof value === 'object' ? [] : [[key, String(value)]];
@@ -165,23 +203,37 @@ export class JsonRecordAdapter implements SourceAdapter {
     return { namespace: this.mapping.namespace, externalId, scopeId: this.scope.id, scopeKind: this.scope.kind,
       source: this.source, kind: kindOf(record, this.mapping), ...(title ? { title } : {}), text, uri,
       version: hash, contentHash: hash,
-      observedAt: firstTimestamp(record, paths(this.mapping.observedAt, TIME_HINTS)) ?? new Date(0).toISOString(),
+      observedAt: observedAtOf(record, this.mapping),
+      ...(validFrom ? { validFrom } : {}), ...(validTo ? { validTo } : {}),
       trust: trustOf(record, this.mapping), metadata };
   }
 
   async scan(signal?: AbortSignal): Promise<readonly SourceDocument[]> {
-    const files = await walk(this.root, this.depth);
-    const perFile = await Promise.all(files.map(async path =>
-      (await Promise.all((await recordsIn(path, this.mapping.container))
-        .map(record => this.documentFor(record, path, signal))))
-        .filter((document): document is SourceDocument => document !== undefined)));
-    const documents = perFile.flat();
-    if (!this.mapping.latestPerId) return documents;
-    const newest = documents.reduce<Map<string, SourceDocument>>((map, document) => {
-      const prior = map.get(document.externalId);
-      if (!prior || Date.parse(prior.observedAt) <= Date.parse(document.observedAt)) map.set(document.externalId, document);
+    return (await this.snapshot(signal)).documents;
+  }
+
+  async snapshot(signal?: AbortSignal): Promise<SourceSnapshot> {
+    signal?.throwIfAborted();
+    const gaps: string[] = [];
+    const files = await walk(this.root, this.depth, gaps);
+    const rows = (await Promise.all(files.map(async path =>
+      (await recordsIn(path, this.mapping.container)).map(record => ({ record, path }))))).flat();
+    // Choose the latest raw revision BEFORE selection/materialization. Otherwise
+    // a newer withdrawn or unavailable revision resurrects an older answer.
+    const newest = this.mapping.latestPerId ? [...rows.reduce<Map<string, typeof rows[number]>>((map, row) => {
+      const id = firstText(row.record, paths(this.mapping.id, ID_HINTS));
+      if (!id) {
+        if (selects(row.record, this.mapping.select ?? {})) gaps.push('Selected source record has no identity; retained index may be stale.');
+        return map;
+      }
+      const prior = map.get(id);
+      const time = (record: JsonRecord): number => Date.parse(observedAtOf(record, this.mapping));
+      if (!prior || time(prior.record) <= time(row.record)) map.set(id, row);
       return map;
-    }, new Map());
-    return [...newest.values()];
+    }, new Map()).values()] : rows;
+    const documents = (await Promise.all(newest.map(row => this.documentFor(row.record, row.path, gaps, signal))))
+      .filter((document): document is SourceDocument => document !== undefined);
+    signal?.throwIfAborted();
+    return { documents, complete: !gaps.length, gaps: [...new Set(gaps)] };
   }
 }

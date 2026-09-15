@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import type { SourceDocument } from '../contracts/documents.ts';
 import { assertSourceDocument, documentKey } from '../contracts/documents.ts';
 import { Projection, type VectorHit } from '../storage/projection.ts';
@@ -46,7 +47,7 @@ export class SqliteVectorIndex implements VectorIndex {
     assertSourceDocument(document);
     signal?.throwIfAborted();
     const existing = this.projection.documentByKey(document);
-    if (!existing || existing.contentHash !== document.contentHash || existing.version !== document.version) this.projection.upsertDocument(document);
+    if (!existing || !isDeepStrictEqual(existing, document)) this.projection.upsertDocument(document);
     const chunks = chunkDocument(document, this.chunkOptions);
     // The lexical index is committed before optional model work. If the local
     // model cannot be downloaded or a remote provider is unavailable, recall
@@ -69,7 +70,7 @@ export class SqliteVectorIndex implements VectorIndex {
     this.projection.transaction(() => {
       for (const document of documents) {
         const existing = this.projection.documentByKey(document);
-        if (!existing || existing.contentHash !== document.contentHash || existing.version !== document.version) this.projection.upsertDocument(document);
+        if (!existing || !isDeepStrictEqual(existing, document)) this.projection.upsertDocument(document);
       }
     });
     const chunks = documents.flatMap(document => chunkDocument(document, this.chunkOptions));
@@ -93,7 +94,7 @@ export class SqliteVectorIndex implements VectorIndex {
   }
 
   async search(query: VectorQuery): Promise<VectorSearchHit[]> {
-    const limit = Math.max(1, Math.min(100, query.limit ?? 20));
+    const limit = Math.max(1, Math.min(1000, query.limit ?? 20));
     const [vector] = await this.provider.embed([query.text], { signal: query.signal, inputType: 'query' });
     if (!vector) return [];
     const hits = this.projection.vectorSearch(this.provider.model, vector.length, vector, limit);

@@ -36,5 +36,5 @@ test('Pi loads the package and executes /memory status without an LLM provider c
   const scopes = await readdir(home);
   assert.equal(scopes.length, 1);
   assert.match(scopes[0]!, /^p_[0-9a-f]{12}$/);
-  assert.ok((await stat(join(home, scopes[0]!, 'memory', 'index.sqlite'))).isFile());
+  assert.ok((await stat(join(home, scopes[0]!, 'memory', 'memory.sqlite'))).isFile());
 });

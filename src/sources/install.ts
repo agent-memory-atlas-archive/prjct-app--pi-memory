@@ -1,5 +1,4 @@
-import type { ScopeKind } from '../contracts/documents.ts';
-import { MemoryEngine } from '../engine.ts';
+import type { MemoryEngine } from '../engine.ts';
 import { prjctHomeFor } from '../workspace/project-identity.ts';
 import { discoverTeams, teamMailboxRoot } from './discovery.ts';
 import { prjctObservationSource, teamArtifactSource, teamJournalSource } from './presets.ts';
@@ -32,7 +31,7 @@ export const registerKnownSources = async (registry: SourceRegistry, projectId: 
   registry.register(prjctObservationSource({ home, scope,
     ...(options.observations ? { select: options.observations } : {}),
     ...(options.mappings?.observations ? { mapping: options.mappings.observations } : {}) }));
-  if (options.teams !== false) {
+  if (options.teams === true) {
     const mailboxRoot = teamMailboxRoot(options.mailboxRoot);
     for (const team of await discoverTeams(home)) {
       const teamScope: AdapterScope = { kind: 'team', id: team.id };
@@ -62,13 +61,13 @@ export const scopedEngines = (sessionId: string, project: MemoryEngine, options:
   const cache = new Map<string, Promise<MemoryEngine>>();
   const key = (scope: AdapterScope): string => `${scope.kind}:${scope.id}`;
   const resolve: EngineResolver = async scope => {
+    if (scope.kind !== 'project' || scope.id !== project.scopeId) {
+      throw new Error(`Source scope ${scope.kind}/${scope.id} is not this project's memory.`);
+    }
     if (scope.kind === project.scopeKind && scope.id === project.scopeId) return project;
     const existing = cache.get(key(scope));
     if (existing) return existing;
-    const pending = MemoryEngine.forScope(scope.kind as ScopeKind, scope.id, sessionId,
-      options.home === undefined ? {} : { home: options.home });
-    cache.set(key(scope), pending);
-    return pending;
+    throw new Error(`Source scope ${scope.kind}/${scope.id} is not this project's memory.`);
   };
   return {
     resolve,

@@ -7,6 +7,9 @@ import { assertEventPayload } from '../contracts/events.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 
 const MAX_EVENT_BYTES = 64 * 1024;
+// SourceDocument already permits up to 1 MB of text. Do not silently preview
+// artifacts to fit a fact-sized envelope; allow a bounded serialized document.
+const MAX_DOCUMENT_EVENT_BYTES = 2 * 1024 * 1024;
 
 const isTimestamp = (value: unknown): boolean =>
   typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().length > 0;
@@ -88,7 +91,8 @@ export class MemoryJournal {
   private async writeRun(events: readonly MemoryEvent[], recordedAt: string): Promise<void> {
     const lines = events.map(event => {
       const line = `${JSON.stringify(event)}\n`;
-      if (Buffer.byteLength(line, 'utf8') > MAX_EVENT_BYTES) throw new Error('Memory event exceeds 64 KiB.');
+      const max = event.payload.type === 'document.upserted' ? MAX_DOCUMENT_EVENT_BYTES : MAX_EVENT_BYTES;
+      if (Buffer.byteLength(line, 'utf8') > max) throw new Error(`Memory event exceeds ${max / 1024} KiB.`);
       return line;
     });
     const day = dayKey(new Date(recordedAt));

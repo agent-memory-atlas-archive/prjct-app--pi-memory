@@ -3,11 +3,11 @@ import { StringEnum } from '@earendil-works/pi-ai';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import type { EvidenceRef } from '../contracts/evidence.ts';
-import type { MemoryKind, MemoryStanding } from '../contracts/memory.ts';
+import { factIsValidAt, type MemoryKind, type MemoryStanding } from '../contracts/memory.ts';
 import type { MemoryEngine } from '../engine.ts';
 import type { MemorySearch } from './hooks.ts';
+import { admitCapture } from '../retention/capture-gate.ts';
 import { consolidationCandidates } from '../retention/consolidation.ts';
-import { federatedSearch } from '../retrieval/federated.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 import { renderMemoryCall, renderMemoryResult } from './renderers.ts';
 
@@ -77,7 +77,7 @@ const required = (value: string | undefined, name: string): string => {
 export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRuntime): void => {
   pi.registerTool({
     name: 'memory_context', label: 'Memory context',
-    description: 'Search, inspect, find mechanical consolidation candidates, or give feedback on temporal memory. Lookup searches the project, every team on this machine, and the shared scope unless `scopes` narrows it; supply up to four standalone query expansions, and rerank the candidates against the task and evidence.',
+    description: 'Search, inspect, find mechanical consolidation candidates, or give feedback on temporal memory. Lookup searches only the active project memory; supply up to four standalone query expansions, and rerank the candidates against the task and evidence.',
     promptSnippet: 'Retrieve bounded temporal memory with hybrid lexical, vector and graph search',
     promptGuidelines: [
       'Use memory_context lookup with concise standalone query expansions when prior decisions, failures, preferences, or cross-session work could affect the answer.',
@@ -87,20 +87,41 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
     async execute(_toolCallId, params, signal) {
       const engine = await runtime.engine();
       if (params.action === 'lookup') {
-        // Every scope by default: a decision recorded by a teammate answers the
-        // question as well as one recorded here. `scopes` narrows it.
-        const open = await runtime.readable();
-        const chosen = params.scopes?.length ? open.filter(memory => params.scopes!.includes(memory.scopeKind)) : open;
-        return result(await federatedSearch(chosen, { queries: params.queries ?? [],
-          ...(params.asOf ? { asOf: params.asOf } : {}), ...(params.namespaces ? { namespaces: params.namespaces } : {}),
-          ...(params.kinds ? { kinds: params.kinds } : {}), maxBytes: params.maxBytes ?? 4096,
+        if (params.scopes?.some(scope => scope !== 'project')) throw new Error('Memory search is project-local.');
+        return result(await runtime.search({ queries: params.queries ?? [],
+          ...(params.asOf ? { asOf: params.asOf } : {}), namespaces: params.namespaces ?? ['memory', 'memory.topic'],
+          ...(params.kinds ? { kinds: params.kinds } : {}), maxBytes: params.maxBytes ?? 1500,
           ...(params.scoreThreshold !== undefined ? { scoreThreshold: params.scoreThreshold } : {}),
           dense: params.dense ?? true, signal }));
       }
       if (params.action === 'inspect') {
-        const open = await runtime.readable();
-        const items = (params.ids ?? []).flatMap(id => open.flatMap(memory => memory.projection.getFact(id) ?? []));
-        return result({ status: items.length ? 'ok' : 'abstained', items, gaps: items.length ? [] : ['No requested memory ids exist.'] });
+        const memory = await runtime.engine();
+        const asOf = params.asOf ? Date.parse(params.asOf) : Date.now();
+        if (!Number.isFinite(asOf)) throw new Error('asOf must be ISO-8601.');
+        const maxBytes = params.maxBytes ?? 4096;
+        const items: unknown[] = [];
+        const gaps: string[] = [];
+        for (const id of params.ids ?? []) {
+          const fact = memory.projection.getFact(id);
+          if (fact) {
+            if (fact.scopeId !== memory.scopeId) { gaps.push(`${id} is not owned by this project.`); continue; }
+            if (!factIsValidAt(fact, asOf)) { gaps.push(`${id} is not valid at asOf.`); continue; }
+            items.push(fact);
+            continue;
+          }
+          const topic = memory.projection.documentByKey({ namespace: 'memory.topic', externalId: id });
+          if (!topic || topic.scopeId !== memory.scopeId) { gaps.push(`No requested memory ids exist for ${id}.`); continue; }
+          const facts = (topic.metadata.facts ?? '').split(',').filter(Boolean).flatMap(factId => {
+            const found = memory.projection.getFact(factId);
+            return found && found.scopeId === memory.scopeId && factIsValidAt(found, asOf) ? [found] : [];
+          });
+          items.push({ id: topic.externalId, title: topic.title, statement: topic.text, facts, sources: topic.metadata.sources });
+        }
+        const packed = { status: items.length ? 'ok' : 'abstained', items, gaps };
+        const encoded = JSON.stringify(packed);
+        if (Buffer.byteLength(encoded) <= maxBytes) return result(packed);
+        const clipped = { status: 'partial' as const, items: items.slice(0, 1), gaps: [...gaps, 'inspect exceeded maxBytes; returned the first topic or fact.'] };
+        return result(clipped);
       }
       if (params.action === 'consolidate') {
         const candidates = consolidationCandidates(engine.projection.activeFacts(engine.scopeId));
@@ -108,16 +129,13 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
           gaps: candidates.length ? [] : ['No mechanical consolidation candidates were found.'] });
       }
       if (!params.signal || !(params.ids?.length)) throw new Error('feedback requires ids and signal.');
-      // Feedback belongs to the scope that owns the fact. Sending it all to the
-      // project engine would throw for anything recalled from a team.
-      const open = await runtime.readable();
+      const memory = await runtime.engine();
       const query = (params.queries ?? []).join('\n');
       const applied = { count: 0 };
       const missing: string[] = [];
       for (const id of params.ids) {
-        const owner = open.find(memory => memory.projection.getFact(id));
-        if (!owner) { missing.push(id); continue; }
-        await owner.feedback(id, params.signal, query);
+        if (!memory.projection.getFact(id)) { missing.push(id); continue; }
+        await memory.feedback(id, params.signal, query);
         applied.count += 1;
       }
       return result({ status: applied.count ? 'ok' : 'abstained', recorded: applied.count, signal: params.signal,
@@ -157,6 +175,11 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
         return result({ status: indexed.dense ? 'ok' : 'partial', ...indexed, gaps: indexed.dense ? [] : ['Dense indexing deferred; lexical indexing committed.'] });
       }
       const statement = required(params.statement, 'statement');
+      const admission = admitCapture({
+        statement, kind: params.kind ?? 'learning',
+        existing: engine.projection.activeFacts(engine.scopeId, 200).map(item => ({ statement: item.statement, kind: item.kind })),
+      });
+      if (!admission.accept) return result({ status: 'abstained', gaps: [`Capture refused: ${admission.reason}.`] });
       const staged = runtime.stagedEvidence();
       const evidence = (params.evidenceIds ?? []).map(id => {
         const found = staged.get(id);
