@@ -701,7 +701,8 @@ export class CurationStore {
   }
 }
 
-const META_ALLOW = new Set(['adapter', 'revision', 'facts', 'semanticKey', 'sourceRevision', 'sourceAdapter', 'sourceDocumentKey', 'sources', 'parent']);
+const META_ALLOW = new Set(['adapter', 'revision', 'facts', 'semanticKey', 'summaryHash', 'capture',
+  'sourceRevision', 'sourceAdapter', 'sourceDocumentKey', 'sources', 'parent']);
 
 export const safeMetadata = (metadata: Readonly<Record<string, string>>): Record<string, string> =>
   Object.fromEntries(Object.entries(metadata).flatMap(([key, value]) => {

@@ -188,14 +188,14 @@ test('sync routes each adapter to the scope that owns it and is idempotent', asy
   const project = await MemoryEngine.forScope('project', 'p_test', 's1', { home: root, provider: new TestEmbeddingProvider() });
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root });
-  assert.deepEqual(registry.list(), ['prjct-observations']);
+  assert.deepEqual(registry.list(), ['pi-session', 'prjct-observations']);
 
   const engines = scopedEngines('s1', project, { home: root });
   t.after(() => engines.dispose());
   const first = await registry.syncAll(engines.resolve);
-  assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [['prjct-observations', 1]]);
+  assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [['pi-session', 0], ['prjct-observations', 1]]);
   const second = await registry.syncAll(engines.resolve);
-  assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [['prjct-observations', 0, 1]]);
+  assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [['pi-session', 0, 0], ['prjct-observations', 0, 1]]);
 
   assert.equal(project.projection.stats().documents, 0);
   assert.equal(project.curation.stats().fingerprints, 1);
@@ -209,7 +209,7 @@ test('an extra adapter can be registered without changing pi-memory', async t =>
     root, mapping: { namespace: 'my.source' } });
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root, extra: [custom] });
-  assert.deepEqual(registry.list(), ['my-source', 'prjct-observations']);
+  assert.deepEqual(registry.list(), ['my-source', 'pi-session', 'prjct-observations']);
 });
 
 test('the mailbox root follows the Pi agent directory, not PRJCT_HOME', () => {

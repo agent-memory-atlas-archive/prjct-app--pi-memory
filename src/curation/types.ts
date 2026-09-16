@@ -95,6 +95,17 @@ export type AnalysisProposal = Readonly<{
   conflicts: readonly string[];
 }>;
 
+export type LivingContext = Readonly<{
+  goal: string;
+  constraints: readonly string[];
+  done: readonly string[];
+  inProgress: readonly string[];
+  blocked: readonly string[];
+  decisions: readonly string[];
+  evidenceRefs: readonly string[];
+  nextSteps: readonly string[];
+}>;
+
 export type EvidenceBundle = Readonly<{
   identity: SourceIdentity;
   text: string;
@@ -102,6 +113,7 @@ export type EvidenceBundle = Readonly<{
   window?: Readonly<{ offset: number; end: number; total: number }>;
   currentTopic?: Readonly<{ id: string; revision: number; summary: string }>;
   currentFacts: readonly TemporalFact[];
+  livingContext?: LivingContext;
 }>;
 
 export type AnalysisUsage = Readonly<{ inputTokens: number; outputTokens: number; calls: number }>;

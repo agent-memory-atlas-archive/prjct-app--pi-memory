@@ -1,6 +1,6 @@
 import type { MemoryEngine } from '../engine.ts';
 import { prjctHomeFor } from '../workspace/project-identity.ts';
-import { prjctObservationSource } from './presets.ts';
+import { piSessionSource, prjctObservationSource } from './presets.ts';
 import type { RecordMapping } from './records.ts';
 import type { AdapterScope, EngineResolver, SourceAdapter, SourceRegistry } from './registry.ts';
 import type { SelectionRules } from './shape.ts';
@@ -27,6 +27,7 @@ export const registerKnownSources = async (registry: SourceRegistry, projectId: 
   registry.register(prjctObservationSource({ home, scope,
     ...(options.observations ? { select: options.observations } : {}),
     ...(options.mappings?.observations ? { mapping: options.mappings.observations } : {}) }));
+  registry.register(piSessionSource({ home, scope }));
   for (const adapter of options.extra ?? []) registry.register(adapter);
   return registry.list();
 };

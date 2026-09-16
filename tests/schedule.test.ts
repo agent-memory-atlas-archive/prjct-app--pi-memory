@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { MemoryEngine } from '../src/engine.ts';
 import { SourceRegistry, type SourceAdapter } from '../src/sources/registry.ts';
-import { DEFAULT_SYNC_POLICY, dueAdapters, syncDecision } from '../src/sources/schedule.ts';
+import { DEFAULT_SYNC_POLICY, dueAdapters, PI_SESSION_SYNC_POLICY, syncDecision } from '../src/sources/schedule.ts';
 import { Projection } from '../src/storage/projection.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
 
@@ -32,6 +32,13 @@ test('activity accumulates and survives reopening', async t => {
   // Negative or fractional deltas cannot walk the counters backwards.
   second.recordActivity({ turns: -5, tokens: 1.7 });
   assert.deepEqual({ ...second.activity(), updatedAt: 0 }, { turns: 2, tokens: 2_001, inserts: 2, updatedAt: 0 });
+});
+
+test('pi-session has a faster independent cadence without lowering the global prjct interval', () => {
+  assert.equal(PI_SESSION_SYNC_POLICY.everyTurns, 8);
+  assert.equal(PI_SESSION_SYNC_POLICY.minIntervalMs, 60_000);
+  assert.equal(DEFAULT_SYNC_POLICY.everyTurns, 20);
+  assert.equal(DEFAULT_SYNC_POLICY.minIntervalMs, 5 * 60_000);
 });
 
 test('an adapter that has never run is due; one that just ran is not', async t => {

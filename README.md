@@ -68,8 +68,11 @@ npm run daemon -- stop
 `/memory sync` scans configured publishers for the active project and enqueues
 changed identities for explicitly configured maintenance. Source bodies remain
 transient; only validated selected knowledge, fingerprints and citations enter
-the project authority. The built-in eligible source is the project's own prjct
-observation stream.
+the project authority. Built-in sources are the project's prjct observation
+stream and the Pi session log: failed tool results (native host provenance) and
+user corrections/preferences stated in the prompt. Routine successes are not
+written. The extension never calls a model; the standalone daemon analyzes
+fingerprints while Pi is closed.
 
 Each adapter declares its owner. The production registry installs only the
 active project's adapter and rejects a team/shared adapter or a document whose
@@ -209,9 +212,11 @@ PRJCT_HOME=$(mktemp -d) pi --mode rpc --no-session --no-extensions -e ./index.ts
 EOF
 ```
 
-The evaluation gate requires at least 20% relative nDCG@10 improvement over the
-best BM25, feature-hash, or old-style RRF baseline, with no Recall@10 or MRR
-regression. It scores the system **without** the fixture's hand-written query
+The MiniLM run is a diagnostic promotion gate, not evidence that hybrid retrieval
+is better by default. A superiority claim is allowed only when the real-encoder
+report reaches 1.2× the BM25 nDCG@10 score without Recall@10 or MRR regression.
+Until an authorized run records that evidence, BM25 remains the supported quality
+baseline. The diagnostic scores the system **without** fixture-authored query
 expansions; see [Architecture](docs/architecture.md) for why.
 
 ### Measured on an M-series laptop

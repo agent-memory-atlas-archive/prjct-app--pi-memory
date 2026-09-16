@@ -13,17 +13,23 @@ import { assertPublishable } from './validate.ts';
 
 const citation = (excerpt: string, identity: SourceIdentity): EvidenceRef => {
   const text = redactSecrets(excerpt).slice(0, 500);
+  const sessionDeclared = identity.adapter === 'pi-session' && identity.trust === 'user';
+  const sessionNative = identity.adapter === 'pi-session' && identity.trust === 'host';
   return {
     id: `ev_${sha256(`${identity.documentKey}\u0000${identity.revision}\u0000${text}`).slice(0, 24)}`,
-    origin: 'imported_source', provenance: 'imported',
+    origin: sessionDeclared ? 'user_statement' : sessionNative ? 'host_observation' : 'imported_source',
+    provenance: sessionDeclared ? 'declared' : sessionNative ? 'native_observation' : 'imported',
     contentHash: sha256(text), excerpt: text, observedAt: identity.observedAt,
     ...(identity.uri ? { uri: identity.uri } : {}),
   };
 };
 
+const summaryHashFor = (statement: string): string => sha256(statement.normalize('NFC').replaceAll(/\s+/gu, ' ').trim());
+
 const tagsFor = (fact: ProposedFact, identity: SourceIdentity, result: AnalysisResult): Record<string, string> => ({
   epistemic: fact.epistemic,
   semanticKey: fact.semanticKey,
+  summaryHash: summaryHashFor(fact.statement),
   sourceAdapter: identity.adapter,
   sourceRevision: identity.revision,
   sourceDocumentKey: identity.documentKey,
@@ -37,8 +43,15 @@ export const topicSemanticKey = (identity: SourceIdentity, topic?: { id?: string
 export const topicIdFor = (scopeId: string, semanticKey: string): string =>
   `topic_${sha256(`${scopeId}\u0000${semanticKey}`).slice(0, 20)}`;
 
-export const curatedFactId = (scopeId: string, semanticKey: string, revision: string): string =>
-  `mem_${sha256(`curated:${scopeId}:${semanticKey}:${revision}`).slice(0, 32)}`;
+export const curatedFactId = (scopeId: string, semanticKey: string, summaryHash: string): string =>
+  `mem_${sha256(`curated:${scopeId}:${semanticKey}:${summaryHash}`).slice(0, 32)}`;
+
+const sessionFactAllowed = (identity: SourceIdentity, fact: ProposedFact): boolean => {
+  if (identity.adapter !== 'pi-session') return true;
+  if (fact.kind === 'decision') return false;
+  if (identity.kind === 'failure') return ['failure', 'procedure', 'learning'].includes(fact.kind);
+  return ['correction', 'constraint', 'preference', 'procedure', 'learning'].includes(fact.kind);
+};
 
 export type PreparedBatch = Readonly<{ facts: TemporalFact[]; documents: SourceDocument[]; factIds: string[]; resolves: readonly string[] }>;
 
@@ -98,10 +111,13 @@ export const publishProposal = async (engine: MemoryEngine, store: CurationPort,
   const bundle: EvidenceBundle = { identity, text: sourceText, truncated: false, currentFacts: active
     .filter(fact => fact.tags.sourceDocumentKey === identity.documentKey || allowed.has(fact.id)).slice(0, 64) };
   assertPublishable(result.proposal, bundle, allowed);
-  if (result.proposal.noChange && !result.proposal.facts.some(fact => fact.action !== 'keep' && fact.action !== 'discard')) {
+  const facts = result.proposal.facts.filter(fact => sessionFactAllowed(identity, fact));
+  const proposal = facts.length === result.proposal.facts.length ? result.proposal : { ...result.proposal, facts,
+    noChange: facts.every(fact => fact.action === 'keep' || fact.action === 'discard') };
+  if (proposal.noChange && !proposal.facts.some(fact => fact.action !== 'keep' && fact.action !== 'discard')) {
     return { status: 'no_change', factIds: [], embeddings: 0 };
   }
-  const collected = await engine.collectPublication(async () => prepareBatch(engine, identity, result.proposal, result, allowed, active));
+  const collected = await engine.collectPublication(async () => prepareBatch(engine, identity, proposal, result, allowed, active));
   const prepared: PreparedBatch = {
     facts: collected.bag.facts.length ? collected.bag.facts : collected.result.facts,
     documents: collected.bag.documents.length ? collected.bag.documents : collected.result.documents,
@@ -138,9 +154,10 @@ const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
       if (allowed.has(fact.id) && activeById.has(fact.id)) resolves.push(fact.id);
       continue;
     }
-    const duplicate = active.find(item => item.tags.semanticKey === fact.semanticKey && item.tags.sourceAdapter === identity.adapter
-      && item.tags.sourceDocumentKey === identity.documentKey);
-    if (duplicate && duplicate.statement === fact.statement && duplicate.tags.sourceRevision === identity.revision) {
+    const summaryHash = summaryHashFor(fact.statement);
+    const duplicate = [...active, ...facts].find(item => item.tags.semanticKey === fact.semanticKey
+      && (item.tags.summaryHash ?? summaryHashFor(item.statement)) === summaryHash);
+    if (duplicate) {
       factIds.push(duplicate.id);
       continue;
     }
@@ -149,14 +166,18 @@ const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
       existing: [...active, ...facts].map(item => ({ statement: item.statement, kind: item.kind })),
     });
     if (!admission.accept) continue;
-    const standing = fact.standing === 'supported' ? 'needs_review' : fact.standing;
+    const sessionEvidence = identity.adapter === 'pi-session' && (identity.trust === 'user' || identity.trust === 'host');
+    const standing = fact.standing === 'supported' && !sessionEvidence ? 'needs_review' : fact.standing;
     const explicit = (fact.supersedes ?? []).filter(id => allowed.has(id) || (fact.id && id === fact.id));
     const revise = fact.action === 'revise' && fact.id && allowed.has(fact.id) && activeById.has(fact.id) ? [fact.id] : [];
-    const implicit = duplicate && duplicate.tags.sourceDocumentKey === identity.documentKey
-      && Date.parse(duplicate.recordedAt) <= Date.parse(identity.observedAt) ? [duplicate.id] : [];
-    const supersedes = [...new Set([...explicit, ...revise, ...implicit])].filter(id => id !== curatedFactId(engine.scopeId, fact.semanticKey, identity.revision));
+    const priorSemantic = active.find(item => item.tags.semanticKey === fact.semanticKey
+      && item.tags.sourceDocumentKey === identity.documentKey);
+    const implicit = priorSemantic && Date.parse(priorSemantic.recordedAt) <= Date.parse(identity.observedAt)
+      ? [priorSemantic.id] : [];
+    const factId = curatedFactId(engine.scopeId, fact.semanticKey, summaryHash);
+    const supersedes = [...new Set([...explicit, ...revise, ...implicit])].filter(id => id !== factId);
     const recorded = await engine.recordFact({
-      id: curatedFactId(engine.scopeId, fact.semanticKey, identity.revision),
+      id: factId,
       kind: fact.kind, statement: fact.statement, standing, confidence: fact.confidence,
       entities: [], evidence: [citation(fact.excerpt, identity)], episodeIds: [],
       tags: { ...tagsFor(fact, identity, result), topicId },

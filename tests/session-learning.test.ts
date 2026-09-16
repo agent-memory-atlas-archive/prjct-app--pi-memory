@@ -1,0 +1,157 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { installMemoryHooks } from '../src/extension/hooks.ts';
+import { registerKnownSources } from '../src/sources/install.ts';
+import { piSessionSource } from '../src/sources/presets.ts';
+import { SourceRegistry } from '../src/sources/registry.ts';
+import {
+  appendSessionObservation, appendSessionObservations, clipSessionSummary, sessionLogRoot, sessionObservationWorthy,
+} from '../src/sources/session-log.ts';
+import { MemoryEngine } from '../src/engine.ts';
+import { TestEmbeddingProvider } from './helpers.ts';
+
+const ctx = (cwd: string, sessionId = 's1') => ({
+  cwd, sessionManager: { getSessionId: () => sessionId }, getContextUsage: () => ({ tokens: 0 }),
+});
+
+test('session log keeps failures and corrections, not routine successes or secrets', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-log-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed', summary: 'bash failed: missing module' }), false);
+  assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed',
+    summary: 'bash failed because the cache key omitted inode and size, leaving stale generated output' }), true);
+  assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated', summary: 'Always use pnpm in this repo, never npm.' }), true);
+  assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated', summary: 'please list the files' }), false);
+  assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'memory_record', outcome: 'failed', summary: 'memory_record failed: nope' }), false);
+  assert.match(clipSessionSummary('token sk-abcdefghijklmnopqrstuvwxyz012345'), /REDACTED/);
+  assert.equal(await appendSessionObservation({
+    projectId: 'p_test', home, record: {
+      id: 'obs_ok', kind: 'instruction', tool: 'user_input', outcome: 'stated',
+      summary: 'list files in src', observedAt: '2026-01-01T00:00:00.000Z', provenance: 'declared', sessionId: 's1',
+    },
+  }), false);
+  assert.equal(await appendSessionObservation({
+    projectId: 'p_test', home, record: {
+      id: 'obs_fail', kind: 'failure', tool: 'bash', outcome: 'failed',
+      summary: 'bash failed because auth refresh raced while using gh auth token ghp_abcdefghijklmnopqrstuvwxyz012345',
+      observedAt: '2026-01-01T00:00:00.000Z', provenance: 'native_observation', sessionId: 's1',
+    },
+  }), true);
+  const docs = await piSessionSource({ home, scope: { kind: 'project', id: 'p_test' } }).scan();
+  assert.equal(docs.length, 1);
+  assert.equal(docs[0]?.kind, 'failure');
+  assert.equal(docs[0]?.trust, 'host');
+  assert.doesNotMatch(docs[0]?.text ?? '', /ghp_/);
+});
+
+test('failed tools and learnable prompts persist for daemon scan without copying bodies', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-hooks-'));
+  const cwd = join(home, 'work');
+  await mkdir(cwd, { recursive: true });
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const handlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
+  const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  installMemoryHooks(pi, { home });
+  await handlers.get('session_start')!({}, ctx(cwd));
+  await handlers.get('before_agent_start')!(
+    { prompt: 'Always use pnpm in this repo, never npm.', systemPrompt: 'Base' }, ctx(cwd));
+  await handlers.get('tool_result')!(
+    { toolName: 'bash', toolCallId: 'c1', isError: true, content: [{ type: 'text', text: 'cache remained stale because the key omitted inode and size' }] },
+    ctx(cwd));
+  await handlers.get('tool_result')!(
+    { toolName: 'bash', toolCallId: 'c2', isError: false, content: [{ type: 'text', text: 'ok' }] },
+    ctx(cwd));
+  await handlers.get('turn_end')!({}, ctx(cwd));
+  const engine = await MemoryEngine.forProject(cwd, 's1', { home, provider: new TestEmbeddingProvider() });
+  t.after(() => engine.dispose());
+  const root = sessionLogRoot(engine.scopeId, home);
+  const files = await (async () => {
+    for (const _ of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+      const names = await readdir(root).catch(() => [] as string[]);
+      if (names.some(name => name.endsWith('.jsonl'))) return names;
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    return readdir(root).catch(() => [] as string[]);
+  })();
+  assert.ok(files.some(name => name.endsWith('.jsonl')), `expected session jsonl, got ${files.join(',')}`);
+  const body = await readFile(join(sessionLogRoot(engine.scopeId, home), files.find(name => name.endsWith('.jsonl'))!), 'utf8');
+  assert.match(body, /Always use pnpm/);
+  assert.match(body, /cache remained stale because the key omitted inode and size/);
+  assert.doesNotMatch(body, /missing script/);
+  assert.doesNotMatch(body, /"outcome":"succeeded"/);
+  const registry = new SourceRegistry();
+  await registerKnownSources(registry, engine.scopeId, { home });
+  const synced = await registry.sync(async () => engine, 'pi-session');
+  assert.ok(synced.queued >= 1);
+  assert.ok([...engine.projection.eachActiveDocument()].every(document => document.namespace === 'memory'),
+    'source sync must not project raw pi.session observations');
+});
+
+test('one turn flush deduplicates repeated failures by semantic key and summary hash', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-dedup-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const summary = 'bash failed because the cache key omitted inode and size, leaving stale generated output';
+  const records = Array.from({ length: 40 }, (_value, index) => ({
+    id: `ignored-${index}`, kind: 'failure' as const, tool: 'bash', outcome: 'failed' as const, summary,
+    observedAt: '2026-01-01T00:00:00.000Z', provenance: 'native_observation' as const, sessionId: `s${index}`,
+  }));
+  assert.equal(await appendSessionObservations({ projectId: 'p_test', home, records }), 1);
+  const source = piSessionSource({ home, scope: { kind: 'project', id: 'p_test' } });
+  const documents = await source.scan();
+  assert.equal(documents.length, 1);
+  assert.match(documents[0]?.metadata.semanticKey ?? '', /^pi-session\.failure\.bash\./u);
+  assert.match(documents[0]?.metadata.summaryHash ?? '', /^[0-9a-f]{64}$/u);
+  const engine = await MemoryEngine.forScope('project', 'p_test', 'dedup', { home, provider: new TestEmbeddingProvider() });
+  t.after(() => engine.dispose());
+  const registry = new SourceRegistry();
+  registry.register(source);
+  assert.equal((await registry.sync(async () => engine, 'pi-session')).queued, 1);
+  await appendSessionObservations({ projectId: 'p_test', home, records: [{ ...records[0]!,
+    observedAt: '2026-01-02T00:00:00.000Z', sessionId: 'later-session' }] });
+  assert.equal((await registry.sync(async () => engine, 'pi-session')).queued, 0,
+    'a later timestamp for the same semanticKey + summary hash must not requeue analysis');
+});
+
+test('a declared correction is supported and recalled by the next session before agent start', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-correction-'));
+  const cwd = join(home, 'work');
+  await mkdir(cwd, { recursive: true });
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const handlers = new Map<string, (event: any, context: any) => Promise<any>>();
+  const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  const runtime = installMemoryHooks(pi, { home });
+  await handlers.get('session_start')!({}, ctx(cwd, 'correction-session'));
+  await handlers.get('before_agent_start')!({ prompt: 'Never use npm; use pnpm for this repository.', systemPrompt: 'Base' }, ctx(cwd, 'correction-session'));
+  await handlers.get('turn_end')!({}, ctx(cwd, 'correction-session'));
+  const first = await runtime.engine();
+  const correction = first.projection.activeFacts(first.scopeId, 20).find(fact => fact.kind === 'correction');
+  assert.equal(correction?.standing, 'supported');
+  assert.equal(correction?.evidence[0]?.provenance, 'declared');
+  assert.equal(first.projection.stats().vectors, 0, 'interactive corrections stay lexical and never embed raw session text');
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'correction-session'));
+  await handlers.get('session_start')!({}, ctx(cwd, 'new-session'));
+  const recalled = await handlers.get('before_agent_start')!({
+    prompt: 'Should this repository use npm or pnpm?', systemPrompt: 'Base',
+  }, ctx(cwd, 'new-session'));
+  assert.match(recalled.message?.content ?? '', /Never use npm; use pnpm/);
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
+});
+
+test('pi-session provenance is host-owned and its source cannot be symlinked to another project', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-isolation-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await assert.rejects(appendSessionObservation({ projectId: 'p_a', home, record: {
+    id: 'forged', kind: 'failure', tool: 'bash', outcome: 'failed',
+    summary: 'bash failed because a stale cache key omitted the file inode and size',
+    observedAt: '2026-01-01T00:00:00.000Z', provenance: 'declared', sessionId: 'agent',
+  } }), /host-native provenance/);
+  const other = sessionLogRoot('p_b', home);
+  await mkdir(other, { recursive: true });
+  await mkdir(join(home, 'p_a'), { recursive: true });
+  await symlink(other, sessionLogRoot('p_a', home), 'dir');
+  await assert.rejects(piSessionSource({ home, scope: { kind: 'project', id: 'p_a' } }).scan(), /symbolic link/);
+});

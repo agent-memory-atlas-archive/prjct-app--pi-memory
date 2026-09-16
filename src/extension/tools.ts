@@ -32,7 +32,7 @@ const contextParameters = Type.Object({
   asOf: Type.Optional(Type.String({ maxLength: 64 })),
   namespaces: Type.Optional(Type.Array(Type.String({ maxLength: 64 }), { maxItems: 16 })),
   kinds: Type.Optional(Type.Array(Type.String({ maxLength: 64 }), { maxItems: 16 })),
-  signal: Type.Optional(StringEnum(['used', 'helpful'] as const)),
+  signal: Type.Optional(StringEnum(['used', 'helpful', 'wrong', 'stale'] as const)),
   maxBytes: Type.Optional(Type.Integer({ minimum: 512, maximum: 32768 })),
 }, { additionalProperties: false });
 

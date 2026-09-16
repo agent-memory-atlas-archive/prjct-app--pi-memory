@@ -4,4 +4,5 @@ export * from './install.ts';
 export * from './presets.ts';
 export * from './records.ts';
 export * from './registry.ts';
+export * from './session-log.ts';
 export * from './shape.ts';

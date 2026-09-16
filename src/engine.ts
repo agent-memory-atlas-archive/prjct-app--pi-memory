@@ -322,7 +322,8 @@ export class MemoryEngine {
     await this.commit({ type: 'episode.recorded', episode: sanitized });
   }
 
-  async recordFact(input: RecordFactInput, signal?: AbortSignal): Promise<{ fact: TemporalFact; dense: boolean }> {
+  async recordFact(input: RecordFactInput, signal?: AbortSignal,
+    options: Readonly<{ dense?: boolean }> = {}): Promise<{ fact: TemporalFact; dense: boolean }> {
     const fact = this.composeFact(input);
     if (this.projection.getFact(fact.id)) throw new Error(`Memory ${fact.id} already exists; record a new fact instead.`);
     for (const id of fact.supersedes ?? []) {
@@ -342,6 +343,7 @@ export class MemoryEngine {
       this.projection.recordActivity({ inserts: 1 });
     }
     const document = this.projection.documentByKey({ namespace: 'memory', externalId: fact.id })!;
+    if (options.dense === false) return { fact, dense: false };
     const indexed = await this.indexProjectionDocument(document, signal);
     return { fact, dense: indexed };
   }
@@ -374,7 +376,8 @@ export class MemoryEngine {
       this.curation.enqueue({
         id: jobIdFor(this.scopeId, 'review', key, `${fact.id}:${signal}`),
         scopeId: this.scopeId, adapter: fact.tags.sourceAdapter ?? 'legacy-journal', documentKey: key,
-        action: 'review', inputRevision: fact.tags.sourceRevision ?? fact.id, contentHash: fact.evidence[0]?.contentHash ?? sha256(fact.statement),
+        action: 'review', inputRevision: `feedback:${fact.id}:${fact.tags.sourceRevision ?? fact.id}`,
+        contentHash: fact.evidence[0]?.contentHash ?? sha256(fact.statement),
       });
     }
   }

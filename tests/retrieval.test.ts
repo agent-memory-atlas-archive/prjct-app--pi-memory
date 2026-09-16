@@ -26,7 +26,7 @@ test('presentation suppresses only exact duplicates and preserves number, date, 
   assert.equal(result.omitted, 1);
 });
 
-test('hybrid retrieval beats lexical-only on cross-vocabulary cases without losing exact hits', async t => {
+test('the dense leg recovers the cross-vocabulary fixture without losing exact hits', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-retrieval-'));
   const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
   t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });

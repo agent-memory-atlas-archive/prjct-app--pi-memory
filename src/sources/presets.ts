@@ -1,6 +1,7 @@
 import { join } from 'node:path';
-import type { AdapterScope } from './registry.ts';
+import type { AdapterScope, SourceAdapter } from './registry.ts';
 import { JsonRecordAdapter, type RecordMapping } from './records.ts';
+import { assertSessionLogIsolation, SESSION_ADAPTER_ID, sessionLogRoot } from './session-log.ts';
 import type { FieldRule, SelectionRules } from './shape.ts';
 
 /**
@@ -108,6 +109,57 @@ export const teamArtifactMapping = (blobDir: string): RecordMapping => ({
   select: { keep: [{ field: 'stored', equals: true }], drop: [{ field: 'bytes', gt: 512_000 }] },
   latestPerId: true,
 });
+
+export const PI_SESSION_SELECTION: SelectionRules = {
+  keep: [
+    { field: 'outcome', equals: 'failed' },
+    { field: 'kind', equals: 'failure' },
+    { field: 'kind', equals: 'correction' },
+    { field: 'kind', equals: 'instruction' },
+  ],
+  drop: [
+    { field: 'tool', equals: 'memory_context' },
+    { field: 'tool', equals: 'memory_record' },
+  ],
+};
+
+export const piSessionMapping = (select: SelectionRules = PI_SESSION_SELECTION): RecordMapping => ({
+  namespace: 'pi.session',
+  id: ['id'],
+  text: ['summary'],
+  observedAt: ['observedAt'],
+  kind: {
+    rules: [
+      { when: [{ field: 'kind', equals: 'failure' }], kind: 'failure' },
+      { when: [{ field: 'kind', equals: 'correction' }], kind: 'correction' },
+      { when: [{ field: 'kind', equals: 'instruction' }], kind: 'instruction' },
+    ],
+    from: ['kind'],
+    fallback: 'observation',
+  },
+  trust: { from: 'provenance', when: { native_observation: 'host', declared: 'user' }, fallback: 'agent' },
+  metadata: { tool: 'tool', outcome: 'outcome', sessionId: 'sessionId', semanticKey: 'semanticKey',
+    summaryHash: 'summaryHash', capture: 'capture' },
+  select,
+  latestPerId: true,
+  maxChars: 1_500,
+});
+
+export const piSessionSource = (options: Readonly<{
+  home: string; scope: AdapterScope; select?: SelectionRules; mapping?: Partial<RecordMapping>;
+}>): SourceAdapter => {
+  const adapter = new JsonRecordAdapter({
+    id: SESSION_ADAPTER_ID, scope: options.scope, source: 'pi-session',
+    root: sessionLogRoot(options.scope.id, options.home), depth: 0,
+    mapping: { ...piSessionMapping(options.select), ...options.mapping },
+  });
+  const isolated = async (): Promise<void> => { await assertSessionLogIsolation(options.scope.id, options.home); };
+  return {
+    id: adapter.id, scope: adapter.scope,
+    scan: async signal => { await isolated(); return adapter.scan(signal); },
+    snapshot: async signal => { await isolated(); return adapter.snapshot(signal); },
+  };
+};
 
 export const prjctObservationSource = (options: Readonly<{
   home: string; scope: AdapterScope; select?: SelectionRules; mapping?: Partial<RecordMapping>;

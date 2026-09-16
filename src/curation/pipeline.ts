@@ -8,7 +8,10 @@ import { redactSecrets } from '../security/redact.ts';
 import { identityFromDocument, jobIdFor, publicationHold, stillHeld } from './store.ts';
 import type { CurationPort } from '../storage/ports.ts';
 import { invalidateDependents, liveFence, materializeSealedBatches, publishProposal, replayAccepted, topicIdFor, topicSemanticKey } from './publish.ts';
-import { CurationBlockError, isCuratedNamespace, type Analyzer, type CurationJob, type EvidenceBundle, type SourceIdentity } from './types.ts';
+import {
+  CurationBlockError, isCuratedNamespace, type Analyzer, type CurationJob, type EvidenceBundle,
+  type LivingContext, type SourceIdentity,
+} from './types.ts';
 
 export type EnqueueResult = Readonly<{
   discovered: number; changed: number; unchanged: number; queued: number; withdrawn: number; gaps: readonly string[];
@@ -68,6 +71,39 @@ export const windowBounds = (text: string, offset: number, maxChars: number): { 
     : scanForward(tokenEnd, char => char === ' ' || char === '\t');
   return { start, end: sentenceEnd, truncated: sentenceEnd < total };
 };
+
+const boundedList = (values: readonly string[], maxItems = 32, maxChars = 500): string[] =>
+  [...new Set(values.map(value => redactSecrets(value).replaceAll(/\s+/gu, ' ').trim()).filter(Boolean))]
+    .slice(0, maxItems).map(value => value.slice(0, maxChars));
+
+/** Complete operational shape used by the real final synthesis, not only eval fixtures. */
+export const buildLivingContext = (bundle: EvidenceBundle,
+  drafts: readonly { factIds: readonly string[]; qualifications: readonly string[]; summary: string }[]): LivingContext => {
+  const supported = bundle.currentFacts.filter(fact => fact.standing === 'supported');
+  const pending = bundle.currentFacts.filter(fact => fact.standing === 'candidate' || fact.standing === 'needs_review');
+  const decisions = bundle.currentFacts.filter(fact => ['decision', 'constraint', 'correction', 'preference'].includes(fact.kind));
+  return {
+    goal: `Consolidate durable knowledge for ${bundle.currentTopic?.id ?? bundle.identity.externalId}`.slice(0, 500),
+    constraints: boundedList(drafts.flatMap(draft => draft.qualifications)),
+    done: boundedList(supported.map(fact => fact.statement)),
+    inProgress: boundedList(pending.map(fact => fact.statement)),
+    blocked: boundedList(drafts.flatMap(draft => draft.qualifications)),
+    decisions: boundedList(decisions.map(fact => fact.statement)),
+    evidenceRefs: boundedList([`${bundle.identity.adapter}:${bundle.identity.externalId}@${bundle.identity.revision}`], 16, 300),
+    nextSteps: boundedList(bundle.truncated ? ['Continue gathering the unread evidence window before publishing a final summary.']
+      : pending.length ? ['Review candidate and needs-review claims against the gathered evidence.'] : []),
+  };
+};
+
+const synthesisBundle = (bundle: EvidenceBundle,
+  drafts: readonly { factIds: readonly string[]; qualifications: readonly string[]; summary: string }[], maxChars: number): EvidenceBundle => ({
+  ...bundle,
+  // Living context guides consolidation but is deliberately not copied into evidence: model-derived
+  // summaries must never become a citable imported source.
+  text: bundle.text.slice(0, Math.max(1, maxChars)),
+  truncated: false,
+  livingContext: buildLivingContext(bundle, drafts),
+});
 
 export const enqueueSnapshot = (engine: MemoryEngine, adapter: SourceAdapter, snapshot: SourceSnapshot, prepared: readonly SourceDocument[]): EnqueueResult => {
   if (adapter.scope.kind !== 'project' || adapter.scope.id !== engine.scopeId) {
@@ -194,6 +230,15 @@ export const processJob = async (engine: MemoryEngine, adapters: ReadonlyMap<str
   try {
   if (job.action === 'withdraw' || job.action === 'review') {
     if (!stillHeld(store.getJob(job.id), owner, Date.now())) return { ...empty, outcome: 'stale' };
+    const feedbackFactId = job.action === 'review' ? job.inputRevision.match(/^feedback:(mem_[a-z0-9_-]{8,64}):/u)?.[1] : undefined;
+    if (feedbackFactId) {
+      const fact = engine.projection.getFact(feedbackFactId);
+      if (fact && fact.standing !== 'superseded' && fact.standing !== 'contradicted') {
+        await engine.resolveFact(feedbackFactId, 'needs_review', 'Retrieval feedback marked this fact wrong or stale.');
+      }
+      if (!store.finish(job.id, owner, 'published', undefined, Date.now(), false)) return { ...empty, outcome: 'stale' };
+      return { ...empty, outcome: fact ? 'feedback_reviewed' : 'feedback_missing' };
+    }
     const invalidated = await invalidateDependents(engine, store, job.documentKey,
       job.action === 'withdraw' ? 'contradicted' : 'needs_review',
       job.action === 'withdraw' ? 'Source withdrawn; dependent knowledge is no longer supported.' : 'Source changed; dependent knowledge needs review.',
@@ -259,21 +304,62 @@ export const processJob = async (engine: MemoryEngine, adapters: ReadonlyMap<str
     }
     const expectedTopic = job.topicRevision ? Number(job.topicRevision) : 0;
     const priorDrafts = store.windowDrafts(job.documentKey, job.inputRevision);
+    const finalSynthesisBundle = !bundle.truncated && priorDrafts.length > 0 && options.analyzer.synthesize
+      ? synthesisBundle({ ...fresh, text: bundle.text, truncated: false }, priorDrafts, options.maxInputChars)
+      : undefined;
+    const synthesized = await (async () => {
+      if (!finalSynthesisBundle || !options.analyzer?.synthesize) return undefined;
+      store.renew(job.id, owner, leaseMs, Date.now());
+      const synthEstimateIn = Math.ceil(finalSynthesisBundle.text.length / 4);
+      const synthEstimateOut = Math.ceil(options.maxInputChars / 8);
+      const synthReservedAt = Date.now();
+      const synthTicket = options.globalBudget?.reserve(options.budget,
+        { inputTokens: synthEstimateIn, outputTokens: synthEstimateOut }, synthReservedAt);
+      const synthReserved = options.globalBudget ? synthTicket !== undefined
+        : store.reserveCall(options.budget, synthReservedAt, synthEstimateIn + synthEstimateOut);
+      if (!synthReserved) throw new CurationBlockError('budget_exhausted', 'Synthesis budget exhausted.');
+      if (options.globalBudget) store.recordSpend({ calls: 1, inputTokens: synthEstimateIn + synthEstimateOut }, synthReservedAt);
+      const value = await options.analyzer.synthesize(finalSynthesisBundle, combined).catch(error => {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`synthesis_failed: ${detail}`);
+      });
+      if (synthTicket) options.globalBudget?.reconcile(synthTicket, value.usage);
+      store.recordSpend({ inputTokens: Math.max(0, value.usage.inputTokens - synthEstimateIn),
+        outputTokens: value.usage.outputTokens }, Date.now());
+      return value;
+    })();
+    const selected = synthesized ? { ...synthesized, proposal: {
+      ...synthesized.proposal,
+      noChange: synthesized.proposal.noChange && result.proposal.noChange,
+      facts: [...result.proposal.facts, ...synthesized.proposal.facts],
+      conflicts: [...new Set([...result.proposal.conflicts, ...synthesized.proposal.conflicts])],
+      ...(synthesized.proposal.topic ? { topic: synthesized.proposal.topic }
+        : result.proposal.topic ? { topic: result.proposal.topic } : {}),
+    } } : result;
+    if (!stillHeld(store.getJob(job.id), owner, Date.now())) {
+      return { ...empty, outcome: 'stale', modelCalls: synthesized ? 2 : 1,
+        inputTokens: result.usage.inputTokens + (synthesized?.usage.inputTokens ?? 0),
+        outputTokens: result.usage.outputTokens + (synthesized?.usage.outputTokens ?? 0) };
+    }
     const deferWatermark = bundle.truncated || priorDrafts.length > 0;
-    const published = await publishProposal(engine, store, job, fresh.identity, result, expectedTopic, owner, bundle.text, combined, deferWatermark);
+    const published = await publishProposal(engine, store, job, fresh.identity, selected, expectedTopic, owner,
+      finalSynthesisBundle?.text ?? bundle.text, combined, deferWatermark);
+    const usage = { calls: synthesized ? 2 : 1,
+      input: result.usage.inputTokens + (synthesized?.usage.inputTokens ?? 0),
+      output: result.usage.outputTokens + (synthesized?.usage.outputTokens ?? 0) };
     if (published.status === 'stale') {
       store.fail(job.id, owner, 'stale', 'stale', Date.now(), false, Date.now());
-      return { ...empty, outcome: 'stale', modelCalls: 1, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens };
+      return { ...empty, outcome: 'stale', modelCalls: usage.calls, inputTokens: usage.input, outputTokens: usage.output };
     }
     const offset = store.coverage(job.documentKey)?.offset ?? 0;
     const qualifications = [
-      ...result.proposal.conflicts,
-      ...result.proposal.facts.filter(fact => fact.epistemic === 'correction' || fact.epistemic === 'constraint' || fact.kind === 'correction')
+      ...selected.proposal.conflicts,
+      ...selected.proposal.facts.filter(fact => fact.epistemic === 'correction' || fact.epistemic === 'constraint' || fact.kind === 'correction')
         .map(fact => fact.statement),
     ];
-    store.saveWindowDraft(job.documentKey, job.inputRevision, offset, published.factIds, qualifications, result.proposal.topic?.summary ?? '');
+    store.saveWindowDraft(job.documentKey, job.inputRevision, offset, published.factIds, qualifications, selected.proposal.topic?.summary ?? '');
     store.recordSpend({ embeddingCalls: published.embeddings }, Date.now());
-    const totals = { modelCalls: 1, embeddings: published.embeddings, in: result.usage.inputTokens, out: result.usage.outputTokens };
+    const totals = { modelCalls: usage.calls, embeddings: published.embeddings, in: usage.input, out: usage.output };
     if (!bundle.truncated && priorDrafts.length > 0) {
       const draftFacts = engine.projection.getFacts([...priorDrafts.flatMap(draft => draft.factIds), ...published.factIds]);
       const winners = new Map<string, typeof draftFacts[number]>();
@@ -313,7 +399,8 @@ export const processJob = async (engine: MemoryEngine, adapters: ReadonlyMap<str
       return { ...empty, outcome: error.code, modelCalls: error.code === 'stale' ? 0 : 1 };
     }
     store.fail(job.id, owner, 'analysis_failed', error instanceof Error ? error.message : 'analysis_failed', Date.now() + backoffMs(job.attempts), false, Date.now());
-    return { ...empty, outcome: 'analysis_failed', modelCalls: 1 };
+    const synthesisFailed = error instanceof Error && error.message.startsWith('synthesis_failed:');
+    return { ...empty, outcome: 'analysis_failed', modelCalls: synthesisFailed ? 2 : 1 };
   } finally {
     clearInterval(beat);
   }
