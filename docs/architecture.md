@@ -284,9 +284,10 @@ user's prompt and the agent starting, and a second run cannot begin while one is
 in flight.
 
 `pi-session` uses an independent 8-turn/60-second sync cadence. Exact declared
-corrections are promoted lexically after the turn so the next session can recall
-a supported fact without waiting for daemon curation. Raw observations are never
-embedded.
+corrections and secret-free `remember`/`recuerda`/`acuérdate` statements are
+promoted lexically after the turn so the next session can recall a supported
+fact without waiting for daemon curation. Questions containing those words are
+not declarations. Raw observations are never embedded.
 
 Source selection distinguishes a request from an answer. The optional prjct
 mapping keeps failures, verifications and explicitly declared statements, not

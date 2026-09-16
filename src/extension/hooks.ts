@@ -1,13 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { EvidenceRef } from '../contracts/evidence.ts';
+import type { MemoryKind } from '../contracts/memory.ts';
 import { hostEvidence, MemoryEngine } from '../engine.ts';
 import { createHandoffController, installHandoffHooks } from '../handoff/hooks.ts';
 import type { HandoffBudget } from '../handoff/select.ts';
 import { federatedSearch } from '../retrieval/federated.ts';
 import { redactSecrets } from '../security/redact.ts';
 import {
-  appendSessionObservations, clipSessionSummary, declaredCorrectionQuote, sessionObservationId,
-  sessionObservationIdentity, sessionObservationWorthy, type SessionObservation,
+  appendSessionObservations, clipSessionSummary, declaredCorrectionQuote, declaredMemoryQuote,
+  sessionObservationId, sessionObservationIdentity, sessionObservationWorthy, type SessionObservation,
 } from '../sources/session-log.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 
@@ -21,8 +22,10 @@ export type MemorySession = Readonly<{
   contextTokens: number;
   /** One durable JSONL append is performed when the turn settles. */
   observations: readonly SessionObservation[];
-  /** Exact current-prompt corrections awaiting direct declared promotion. */
-  corrections: readonly Readonly<{ quote: string; observedAt: string }>[];
+  /** Exact current-prompt corrections and explicit remember declarations awaiting promotion. */
+  declarations: readonly Readonly<{
+    quote: string; observedAt: string; sessionId: string; kind: Extract<MemoryKind, 'correction' | 'procedure'>;
+  }>[];
 }>;
 
 const textContent = (content: readonly unknown[]): string => content.flatMap(part => {
@@ -58,7 +61,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
   const recallThreshold = options.recallThreshold ?? DEFAULT_RECALL_THRESHOLD;
   const onActivity = options.onActivity;
   const slot: { current: MemorySession } = { current: {
-    prompt: '', evidence: new Map(), contextTokens: 0, observations: [], corrections: [],
+    prompt: '', evidence: new Map(), contextTokens: 0, observations: [], declarations: [],
   } };
   const get = (): MemorySession => slot.current;
   const set = (update: Partial<MemorySession>): MemorySession => (slot.current = { ...slot.current, ...update });
@@ -86,20 +89,21 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     set({ observations: [...current.observations, record].slice(-64) });
   };
 
-  const promoteDeclaredCorrections = async (project: MemoryEngine,
-    corrections: MemorySession['corrections']): Promise<void> => {
-    for (const correction of corrections) {
-      const identity = sessionObservationIdentity('correction', 'user_input', correction.quote);
+  const promoteDeclaredFacts = async (project: MemoryEngine,
+    declarations: MemorySession['declarations']): Promise<void> => {
+    for (const declaration of declarations) {
+      const observationKind = declaration.kind === 'correction' ? 'correction' : 'instruction';
+      const identity = sessionObservationIdentity(observationKind, 'user_input', declaration.quote);
       const id = `mem_${sha256(`declared:${project.scopeId}:${identity.semanticKey}:${identity.summaryHash}`).slice(0, 32)}`;
       if (project.projection.getFact(id)) continue;
       await project.recordFact({
-        id, kind: 'correction', statement: correction.quote, confidence: 1,
-        entities: [], episodeIds: [], validAt: correction.observedAt,
+        id, kind: declaration.kind, statement: declaration.quote, confidence: 1,
+        entities: [], episodeIds: [], validAt: declaration.observedAt,
         evidence: [{
           id: `ev_${sha256(`declared:${project.scopeId}:${identity.summaryHash}`).slice(0, 24)}`,
-          origin: 'user_statement', provenance: 'declared', contentHash: sha256(correction.quote),
-          excerpt: correction.quote, observedAt: correction.observedAt,
-          actorId: get().ctx?.sessionManager.getSessionId(), sessionId: get().ctx?.sessionManager.getSessionId(),
+          origin: 'user_statement', provenance: 'declared', contentHash: sha256(declaration.quote),
+          excerpt: declaration.quote, observedAt: declaration.observedAt,
+          actorId: declaration.sessionId, sessionId: declaration.sessionId,
         }],
         tags: { semanticKey: identity.semanticKey, summaryHash: identity.summaryHash, source: 'pi-session' },
       }, undefined, { dense: false }).catch(error => {
@@ -110,16 +114,16 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
 
   const flushSessionObservations = async (): Promise<void> => {
     const pending = get();
-    if (!pending.observations.length && !pending.corrections.length) return;
-    set({ observations: [], corrections: [] });
+    if (!pending.observations.length && !pending.declarations.length) return;
+    set({ observations: [], declarations: [] });
     const project = await engine();
     try {
       await appendSessionObservations({ projectId: project.scopeId, records: pending.observations,
         ...(options.home === undefined ? {} : { home: options.home }) });
-      await promoteDeclaredCorrections(project, pending.corrections);
+      await promoteDeclaredFacts(project, pending.declarations);
     } catch (error) {
       set({ observations: [...pending.observations, ...get().observations].slice(-64),
-        corrections: [...pending.corrections, ...get().corrections].slice(-16) });
+        declarations: [...pending.declarations, ...get().declarations].slice(-16) });
       throw error;
     }
   };
@@ -162,7 +166,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
       for (const memory of [...opened, ...pending]) await memory?.dispose().catch(() => undefined);
     }
     set({ engine: undefined, readable: undefined, ctx, prompt: '', evidence: new Map(), contextTokens: 0,
-      observations: [], corrections: [] });
+      observations: [], declarations: [] });
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
@@ -171,16 +175,24 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     await countTurn(ctx).catch(() => undefined);
     const prompt = clipSessionSummary(event.prompt);
     const observedAt = new Date().toISOString();
-    const quote = declaredCorrectionQuote(event.prompt);
+    const correction = declaredCorrectionQuote(event.prompt);
+    const remembered = correction ? undefined : declaredMemoryQuote(event.prompt);
+    const quote = correction ?? remembered;
     const summary = quote ?? prompt;
-    const kind = quote ? 'correction' as const : 'instruction' as const;
+    const kind = correction ? 'correction' as const : 'instruction' as const;
     if (sessionObservationWorthy({ kind, tool: 'user_input', outcome: 'stated', summary })) {
       queueSessionObservation({
         id: sessionObservationId(ctx.sessionManager.getSessionId(), 'user_input', summary, kind),
         kind, tool: 'user_input', outcome: 'stated', summary, observedAt, provenance: 'declared',
         sessionId: ctx.sessionManager.getSessionId(),
       });
-      if (quote) set({ corrections: [...get().corrections, { quote, observedAt }].slice(-16) });
+      if (quote) {
+        const declaration: MemorySession['declarations'][number] = {
+          quote, observedAt, sessionId: ctx.sessionManager.getSessionId(),
+          kind: correction ? 'correction' : 'procedure',
+        };
+        set({ declarations: [...get().declarations, declaration].slice(-16) });
+      }
     }
     const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 1500, dense: false, scoreThreshold: recallThreshold, namespaces: ['memory', 'memory.topic'] })
       .catch(() => undefined);
@@ -228,7 +240,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     const { engine: pending, readable: opened } = get();
     handoff.clear();
     set({ engine: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '', contextTokens: 0,
-      observations: [], corrections: [] });
+      observations: [], declarations: [] });
     // The project engine is one of the readable ones; dispose the set, not both.
     const engines = await opened?.catch(() => []) ?? (pending ? [await pending] : []);
     for (const memory of engines) await memory.dispose().catch(() => undefined);

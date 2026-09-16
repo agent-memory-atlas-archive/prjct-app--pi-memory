@@ -8,8 +8,9 @@ import {
 export const SESSION_ADAPTER_ID = 'pi-session';
 const MAX_SUMMARY_CHARS = 1_500;
 const MAX_TURN_OBSERVATIONS = 64;
-const LEARNABLE = /\b(always|never|don't|do not|prefer|instead|wrong|incorrect|remember:|use \S+ not)\b/iu;
-const CORRECTION = /\b(never|don't|do not|instead|wrong|incorrect|use \S+ not|prefer)\b/iu;
+const REMEMBER = /(?:\bremember(?:\s+(?:that|to))?\b|\brecuerda(?:\s+que)?\b|\bacuérdate(?:\s+de)?\b)/iu;
+const LEARNABLE = /(?:\b(always|never|don't|do not|prefer|instead|wrong|incorrect|use \S+ not|nunca|no uses?|en vez de|incorrect[oa]|prefier[eo])\b|\bremember(?:\s+(?:that|to))?\b|\brecuerda(?:\s+que)?\b|\bacuérdate(?:\s+de)?\b)/iu;
+const CORRECTION = /\b(never|don't|do not|instead|wrong|incorrect|use \S+ not|prefer|nunca|no uses?|en vez de|incorrect[oa]|prefier[eo])\b/iu;
 const ROUTINE_FAILURE = /(?:missing script|module not found|cannot find module|command not found|no such file|unknown command|exited? (?:with )?(?:code )?\d+|process failed)\b/iu;
 const REUSABLE_FAILURE = /\b(?:because|caused by|race|deadlock|stale|invalidat|overflow|leak|corrupt|timeout|permission|auth|lock|cache key|regression)\b/iu;
 
@@ -141,12 +142,21 @@ export const appendSessionObservation = async (options: Readonly<{
   record: SessionObservation;
 }>): Promise<boolean> => (await appendSessionObservations({ ...options, records: [options.record] })) === 1;
 
-/** Return a bounded exact substring; it can therefore be used as declared evidence. */
-export const declaredCorrectionQuote = (prompt: string): string | undefined => {
-  if (!CORRECTION.test(prompt)) return undefined;
+const declaredQuote = (prompt: string, marker: RegExp): string | undefined => {
+  if (!marker.test(prompt)) return undefined;
   const candidates = prompt.split(/(?<=[.!?])\s+|\n+/u).map(value => value.trim()).filter(Boolean);
-  const selected = candidates.find(value => CORRECTION.test(value)) ?? prompt.trim();
+  const selected = candidates.find(value => marker.test(value)) ?? prompt.trim();
   if (selected.length < 12 || selected.length > 500 || contentWords(selected).length < 3) return undefined;
   if (redactSecrets(selected) !== selected) return undefined;
   return prompt.includes(selected) ? selected : undefined;
+};
+
+/** Return a bounded exact substring; it can therefore be used as declared evidence. */
+export const declaredCorrectionQuote = (prompt: string): string | undefined => declaredQuote(prompt, CORRECTION);
+
+/** Exact explicit remember/recuerda declarations become durable without waiting for daemon analysis. */
+export const declaredMemoryQuote = (prompt: string): string | undefined => {
+  const quote = declaredQuote(prompt, REMEMBER);
+  if (!quote || /[?¿]/u.test(quote) || /\b(?:don't|do not|no)\s+remember\b/iu.test(quote)) return undefined;
+  return quote;
 };

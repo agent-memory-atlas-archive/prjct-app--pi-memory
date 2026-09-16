@@ -32,11 +32,14 @@ and lexical search continue to work and report that dense indexing is pending.
   of rewriting history, or indexes a generic source document.
 
 The extension keeps a bounded, session-local staging window for host tool
-results and exposes each staged `ev_` id in the corresponding tool result;
-nothing is persisted unless the active agent selectively promotes an observation
-with `memory_record`. Memory's own tools are excluded to prevent self-citation. The agent cannot mint native provenance. An explicit user
-statement is accepted only when `userQuote` occurs verbatim in the current
-prompt.
+results and exposes each staged `ev_` id in the corresponding tool result.
+The agent can selectively promote an observation with `memory_record`.
+Exact, secret-free user declarations beginning with `remember`, `recuerda`, or
+`acuérdate` are also stored directly as supported lexical procedures after the
+turn; corrections follow the same declared-evidence path. Memory's own tools
+are excluded to prevent self-citation. The agent cannot mint native provenance.
+An explicit user statement is accepted only when `userQuote` occurs verbatim in
+the current prompt.
 
 The agent should remember decisions, corrections, stable constraints,
 preferences, verified failures, and reusable procedures—not routine reads,
@@ -69,9 +72,9 @@ npm run daemon -- stop
 changed identities for explicitly configured maintenance. Source bodies remain
 transient; only validated selected knowledge, fingerprints and citations enter
 the project authority. The only built-in source is pi-memory's own Pi session
-log: selected failed tool results (native host provenance) and user
-corrections/preferences stated in the prompt. Routine successes are not
-written. The extension never calls a model; the standalone daemon analyzes
+log: selected failed tool results (native host provenance), exact corrections,
+and explicit remember/recuerda declarations stated in the prompt. Routine
+successes are not written. The extension never calls a model; the standalone daemon analyzes
 fingerprints while Pi is closed.
 
 Each adapter declares its owner. The production registry installs only the
