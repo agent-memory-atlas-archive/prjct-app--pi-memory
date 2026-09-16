@@ -68,8 +68,11 @@ npm run daemon -- stop
 `/memory sync` scans configured publishers for the active project and enqueues
 changed identities for explicitly configured maintenance. Source bodies remain
 transient; only validated selected knowledge, fingerprints and citations enter
-the project authority. The built-in eligible source is the project's own prjct
-observation stream.
+the project authority. Built-in sources are the project's prjct observation
+stream and the Pi session log: failed tool results (native host provenance) and
+user corrections/preferences stated in the prompt. Routine successes are not
+written. The extension never calls a model; the standalone daemon analyzes
+fingerprints while Pi is closed.
 
 Each adapter declares its owner. The production registry installs only the
 active project's adapter and rejects a team/shared adapter or a document whose

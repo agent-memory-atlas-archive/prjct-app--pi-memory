@@ -5,6 +5,10 @@ import { createHandoffController, installHandoffHooks } from '../handoff/hooks.t
 import type { HandoffBudget } from '../handoff/select.ts';
 import { federatedSearch } from '../retrieval/federated.ts';
 import { redactSecrets } from '../security/redact.ts';
+import {
+  appendSessionObservation, clipSessionSummary, sessionObservationId, sessionObservationWorthy,
+  type SessionObservation,
+} from '../sources/session-log.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 
 export type MemorySession = Readonly<{
@@ -71,6 +75,12 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     return pending;
   };
 
+  const persistSessionObservation = (record: SessionObservation): void => {
+    void engine().then(project => appendSessionObservation({
+      projectId: project.scopeId, record, ...(options.home === undefined ? {} : { home: options.home }),
+    })).catch(() => undefined);
+  };
+
   const search: MemorySearch = async request => federatedSearch(await readable(), request);
   const handoff = createHandoffController({ engine, toolOverhead: () => {
     try {
@@ -114,6 +124,16 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
   pi.on('before_agent_start', async (event, ctx) => {
     set({ ctx, prompt: event.prompt });
     await countTurn(ctx).catch(() => undefined);
+    const prompt = clipSessionSummary(event.prompt);
+    const kind = /\b(wrong|incorrect|instead|don't|do not|never)\b/iu.test(prompt) ? 'correction' as const : 'instruction' as const;
+    if (sessionObservationWorthy({ kind, tool: 'user_input', outcome: 'stated', summary: prompt })) {
+      persistSessionObservation({
+        id: sessionObservationId(ctx.sessionManager.getSessionId(), 'user_input', prompt),
+        kind, tool: 'user_input', outcome: 'stated', summary: prompt,
+        observedAt: new Date().toISOString(), provenance: 'declared',
+        sessionId: ctx.sessionManager.getSessionId(),
+      });
+    }
     const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 1500, dense: false, scoreThreshold: recallThreshold, namespaces: ['memory', 'memory.topic'] })
       .catch(() => undefined);
     const highConfidence = (recalled?.items ?? []).filter(item => item.standing === 'supported').slice(0, 4);
@@ -140,6 +160,14 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     const handle = evidenceHandle(get().evidence, evidence.id);
     const entries = [...get().evidence.entries(), [handle, evidence] as const].slice(-64);
     set({ evidence: new Map(entries) });
+    if (event.isError) {
+      persistSessionObservation({
+        id: sessionObservationId(ctx.sessionManager.getSessionId(), event.toolName, excerpt),
+        kind: 'failure', tool: event.toolName, outcome: 'failed', summary: excerpt,
+        observedAt: new Date().toISOString(), provenance: 'native_observation',
+        sessionId: ctx.sessionManager.getSessionId(),
+      });
+    }
     return { content: [...event.content, { type: 'text', text: `[pi-memory evidence: ${handle}]` }] };
   });
 
