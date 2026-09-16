@@ -31,8 +31,9 @@ Rules:
 - Persist decisions, constraints, verified lessons, corrections and reusable procedures. Not transcripts, tool dumps, or progress.
 - A proposal or hypothesis is never a decision. Preserve unresolved conflicts; do not collapse them into certainty.
 - Every created/revised fact MUST cite the provided source identity. Do not invent sources.
+- Living context is planning state, not evidence. Citations and excerpts must come only from the evidence field.
 - Do not copy the source body. Summaries stay compact. Empty noChange is allowed when nothing is worth remembering.
-- Use imported provenance; you are not a host observer.`;
+- Never assign provenance. The publisher derives it from the source boundary; you are not a host observer.`;
 
 const textOf = (message: AssistantMessage): string =>
   message.content.flatMap(block => 'type' in block && block.type === 'text' && 'text' in block ? [String(block.text)] : []).join('\n');
@@ -41,6 +42,7 @@ const bundlePrompt = (bundle: EvidenceBundle): string => JSON.stringify({
   identity: bundle.identity,
   currentTopic: bundle.currentTopic ?? null,
   currentFacts: bundle.currentFacts.slice(0, 256).map(fact => ({ id: fact.id, kind: fact.kind, statement: fact.statement.slice(0, 400), standing: fact.standing })),
+  livingContext: bundle.livingContext ?? null,
   evidence: bundle.text,
 });
 

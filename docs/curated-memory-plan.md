@@ -217,8 +217,10 @@ only if important knowledge, provenance and answer quality survive.
   There is no silent model fallback and no tools/MCP.
 - Publication writes temporal facts plus `memory.topic` summaries, embeds curated
   text only, and rejects stale source/topic revisions. Proposals cannot become
-  `supported` from imported evidence. Withdrawals mark dependents contradicted;
-  changes mark them `needs_review`.
+  `supported` from imported evidence. Host-captured `pi-session` failures retain
+  native provenance and exact prompt corrections retain declared provenance;
+  analyzer output cannot manufacture either. Withdrawals mark dependents
+  contradicted; changes mark them `needs_review`.
 - `/memory migrate-curated` checkpoints the journal/projection and enqueues legacy
   raw documents. It does not rewrite or delete historical events.
 
@@ -231,7 +233,8 @@ only if important knowledge, provenance and answer quality survive.
   can still inspect legacy raw copies already in a projection. New sync does not
   add more of them.
 - Per-source topic documents (hash of the source key) are not a merged concept
-  graph. Fact `semanticKey` values are preserved for later consolidation.
+  graph. Facts are deduplicated by `semanticKey` plus normalized summary hash;
+  broader cross-topic concept merging remains future work.
 - Unit tests inject a scripted analyzer. `eval:curated` uses ModelRuntime only when
   provider and model resolve; otherwise it reports `semantic: mock`.
 - Real-corpus document-id and lifecycle evals remain explicit low-level index tests,

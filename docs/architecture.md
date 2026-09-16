@@ -231,7 +231,10 @@ persistent session message or block startup on a model download. The agent calls
 
 The host stages a bounded window of tool results, excluding memory's own tools,
 to the newest 64 and appends the resulting evidence id to the tool result seen by
-the active agent. Staging is not memory and disappears with the session.
+the active agent. Staging is not memory and disappears with the session. Learnable
+session observations are redacted, deduplicated by semantic key plus summary hash,
+and written in one JSONL append per turn. Generic failures such as a missing npm
+script fail the automatic-source precision gate.
 `memory_record` promotes evidence only when the active agent identifies a
 reusable decision, correction, constraint, preference, failure, or procedure.
 Routine reads and progress are never automatically vectorized.
@@ -277,6 +280,11 @@ The run is fired without being awaited. A source scan must never sit between the
 user's prompt and the agent starting, and a second run cannot begin while one is
 in flight.
 
+`pi-session` uses an independent 8-turn/60-second sync cadence; this does not
+lower prjct's global 20-turn/five-minute minimum. Exact declared corrections are
+promoted lexically after the turn so the next session can recall a supported fact
+without waiting for daemon curation. Raw observations are never embedded.
+
 Source selection distinguishes a request from an answer. prjct's default mapping
 keeps failures, verifications and explicitly declared statements, not arbitrary
 `user_input` prompts. Optional mapping definitions can classify other record
@@ -297,8 +305,11 @@ available without changing their imported provenance.
 ## Consolidation and garbage collection
 
 Mechanical token overlap only proposes consolidation candidates; it never
-changes standing. The active agent must append the supersession or contradiction
-resolution.
+changes standing. Multi-window daemon jobs run a bounded orient/gather/synthesize/
+prune pass under the existing job lease and daily call/token budget. The real
+synthesis request receives the complete living-context shape (goal, constraints,
+done, in-progress, blocked, decisions, evidence references and next steps), not
+a session dump. Standing changes still require validated publication.
 
 Retention value combines evidence, judgment type, actual positive/negative use,
 age, and standing. Novelty alone is not value. Supported user/native decisions,
@@ -320,11 +331,12 @@ topic clusters so that most of a cluster is a *distractor* sharing the target's
 vocabulary, and several queries carry more than one correct answer. It covers
 paraphrases, a bilingual query, temporal policy, failures and constraints.
 
-The gate scores `candidateNoExpansion` — the system given only the user's query
-— against the best score any baseline achieved on each metric, where the
-baselines are BM25, the former feature-hash semantic leg, and old-style RRF.
-Acceptance requires at least +20% relative nDCG@10 with no Recall@10 or MRR
-regression.
+The MiniLM diagnostic scores `candidateNoExpansion` — the system given only the
+user's query — against BM25, the former feature-hash semantic leg, and old-style
+RRF. MiniLM/hybrid retrieval is not described as better unless an authorized,
+reproducible run reaches 1.2× BM25 nDCG@10 with no Recall@10 or MRR regression.
+Until then BM25 is the supported quality baseline and the dense leg is an
+optional candidate source, not a quality claim.
 
 Scoring the no-expansion run is deliberate. Query expansions in the fixture are
 written by hand, so a gate that scores the run *with* them measures how closely
@@ -349,8 +361,10 @@ The script checks lexical, hybrid and automatic-injection budgets, full embeddin
 coverage, and a second idempotent sync. Reports and source data stay outside the
 repository. See [real-data evaluation](real-data-evaluation.md) for reuse and cleanup.
 
-The suite is a regression gate, not proof of broad retrieval quality. 42 queries
-over 113 documents is small; it must grow with observed production failures.
+The suite is a diagnostic promotion gate, not proof of broad retrieval quality.
+Forty-two queries over 113 documents is small; it must grow with observed
+production failures. The session-learning suite separately checks four
+correction → daemon fact → new-session recall paths and keeps N1–N4 abstention.
 
 The benchmark drives the real ingest path (`MemoryEngine.index` and
 `indexAll`) over ~1.05 KB documents whose word frequencies follow a Zipf-like

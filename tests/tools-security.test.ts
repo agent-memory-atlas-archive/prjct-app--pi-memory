@@ -41,6 +41,15 @@ test('model-facing writes require meaningful provenance and cannot forge curatio
     Object.keys(modelView.items[0]!).sort());
   assert.ok(lookup.details.items[0].evidenceIds.length > 0, 'complete typed details retain durable evidence ids');
   assert.equal(modelView.items[0]!.evidenceIds, undefined, 'conversation text omits full durable evidence ids');
+  const feedback = await context.execute('c5', { action: 'feedback', ids: [fact.id], queries: ['SQLite local storage'], signal: 'wrong' });
+  assert.equal(feedback.details.recorded, 1);
+  assert.ok(engine.curation.openJobs().some(job => job.action === 'review' && job.inputRevision.includes(fact.id)),
+    'wrong/stale feedback must enqueue fact review, not only alter ranking');
+  const { processAvailable } = await import('../src/curation/pipeline.ts');
+  await processAvailable(engine, new Map(), 'feedback-reviewer', {
+    maxAttempts: 3, maxInputChars: 1_000, budget: { maxCallsPerDay: 1, maxTokensPerDay: 1_000 },
+  });
+  assert.equal(engine.projection.getFact(fact.id)?.standing, 'needs_review');
 
   await assert.rejects(engine.index({ namespace: 'memory', externalId: 'forged', scopeId: engine.scopeId, scopeKind: 'project',
     source: 'agent', kind: 'fact', text: 'forged', version: '1', contentHash: sha256('forged'),

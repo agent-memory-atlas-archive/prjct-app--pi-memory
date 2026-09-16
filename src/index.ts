@@ -7,7 +7,8 @@ import { installMemoryTools } from './extension/tools.ts';
 import { runGc } from './retention/gc.ts';
 import { registerKnownSources, scopedEngines } from './sources/install.ts';
 import { SourceRegistry, type SourceSyncResult } from './sources/registry.ts';
-import { dueAdapters, type SyncPolicy } from './sources/schedule.ts';
+import { dueAdapters, PI_SESSION_SYNC_POLICY, type SyncPolicy } from './sources/schedule.ts';
+import { SESSION_ADAPTER_ID } from './sources/session-log.ts';
 import { sha256 } from './workspace/project-identity.ts';
 
 export type MemoryExtensionOptions = Readonly<{
@@ -60,11 +61,14 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   const syncIfDue = async (project: MemoryEngine): Promise<void> => {
     if (options.sync?.enabled === false || running.now) return;
     const ready = await sources(project);
-    if (!dueAdapters(project.projection, ready.list(), options.sync ?? {}).some(decision => decision.due)) return;
+    const due = ready.list().filter(adapter => dueAdapters(project.projection, [adapter], adapter === SESSION_ADAPTER_ID
+      ? { ...PI_SESSION_SYNC_POLICY, enabled: options.sync?.enabled ?? true }
+      : options.sync ?? {})[0]?.due);
+    if (!due.length) return;
     running.now = true;
     const engines = scopedEngines(project.journal.sessionId, project, options.home === undefined ? {} : { home: options.home });
     try {
-      await ready.syncDue(engines.resolve, project.projection, options.sync ?? {});
+      for (const adapter of due) await ready.sync(engines.resolve, adapter, undefined, project.projection).catch(() => undefined);
     } finally {
       await engines.dispose().catch(() => undefined);
       running.now = false;

@@ -138,7 +138,9 @@ test('ISO-11 drained continuation yields three sentence-aligned facts', async t 
     registry.register(adapter);
     await registry.sync(async () => engine, 'policies');
   });
+  const living: unknown[] = [];
   const analyzer = scriptedAnalyzer(bundle => {
+    if (bundle.livingContext) living.push(bundle.livingContext);
     const word = bundle.text.trim().split(/\s+/)[0]!.replace(/[^A-Za-z]/g, '') || 'Window';
     return {
       noChange: false,
@@ -159,4 +161,7 @@ test('ISO-11 drained continuation yields three sentence-aligned facts', async t 
   ].sort());
   const docKey = engine.curation.adapterFingerprints('policies')[0]!.documentKey;
   assert.equal(engine.curation.watermark('policies', docKey)?.outcome, 'published');
+  assert.equal(living.length, 1, 'the final window must run one real bounded synthesis');
+  assert.deepEqual(Object.keys(living[0] as Record<string, unknown>).sort(),
+    ['blocked', 'constraints', 'decisions', 'done', 'evidenceRefs', 'goal', 'inProgress', 'nextSteps'].sort());
 });

@@ -212,9 +212,11 @@ PRJCT_HOME=$(mktemp -d) pi --mode rpc --no-session --no-extensions -e ./index.ts
 EOF
 ```
 
-The evaluation gate requires at least 20% relative nDCG@10 improvement over the
-best BM25, feature-hash, or old-style RRF baseline, with no Recall@10 or MRR
-regression. It scores the system **without** the fixture's hand-written query
+The MiniLM run is a diagnostic promotion gate, not evidence that hybrid retrieval
+is better by default. A superiority claim is allowed only when the real-encoder
+report reaches 1.2× the BM25 nDCG@10 score without Recall@10 or MRR regression.
+Until an authorized run records that evidence, BM25 remains the supported quality
+baseline. The diagnostic scores the system **without** fixture-authored query
 expansions; see [Architecture](docs/architecture.md) for why.
 
 ### Measured on an M-series laptop
