@@ -97,7 +97,8 @@ try {
   };
   for (const id of [...new Set(cases.map(item => item.projectId))]) {
     const registry = new SourceRegistry();
-    await registerKnownSources(registry, id, { home: snapshot.source });
+    // This diagnostic intentionally evaluates the optional legacy publisher snapshot.
+    await registerKnownSources(registry, id, { home: snapshot.source, prjct: {} });
     const first = await indexKnown(registry);
     const second = await indexKnown(registry);
     if (second.some(row => row.indexed > 0)) throw new Error('Sync is not idempotent.');

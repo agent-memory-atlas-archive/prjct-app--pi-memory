@@ -68,16 +68,18 @@ npm run daemon -- stop
 `/memory sync` scans configured publishers for the active project and enqueues
 changed identities for explicitly configured maintenance. Source bodies remain
 transient; only validated selected knowledge, fingerprints and citations enter
-the project authority. Built-in sources are the project's prjct observation
-stream and the Pi session log: failed tool results (native host provenance) and
-user corrections/preferences stated in the prompt. Routine successes are not
+the project authority. The only built-in source is pi-memory's own Pi session
+log: selected failed tool results (native host provenance) and user
+corrections/preferences stated in the prompt. Routine successes are not
 written. The extension never calls a model; the standalone daemon analyzes
 fingerprints while Pi is closed.
 
 Each adapter declares its owner. The production registry installs only the
-active project's adapter and rejects a team/shared adapter or a document whose
-project id differs from the open engine. Standalone discovery helpers are not
-part of runtime sync. There is no federated cross-project fallback.
+active project's `pi-session` adapter by default and rejects a team/shared
+adapter or a document whose project id differs from the open engine. It does not inspect prjct observation
+trees unless the compatibility adapter is explicitly enabled. Standalone
+discovery helpers are not part of runtime sync. There is no federated
+cross-project fallback.
 
 Within the project, candidate legs use one ranking with corpus-wide lexical
 statistics and measured cosine similarity. Unrelated sources receive no bonus or
@@ -93,28 +95,53 @@ watermark table in the project's projection — turns taken, context tokens
 consumed, memories written — and a source is re-read only once the work done
 since its last run crosses a threshold:
 
-| | default |
-|---|---|
-| turns since last run | 20 |
-| context tokens since last run | 40,000 |
-| memories written since last run | 10 |
-| minimum time between runs | 5 minutes |
+| | `pi-session` | optional adapters |
+|---|---:|---:|
+| turns since last run | 8 | 20 |
+| context tokens since last run | 16,000 | 40,000 |
+| memories written since last run | 4 | 10 |
+| minimum time between runs | 1 minute | 5 minutes |
 
 Any one threshold is enough; the minimum interval overrides all of them, so a
-burst of activity cannot re-scan project-local source trees every few seconds. The run
-happens in the background, so a turn never waits on it, and never twice at once.
+burst of activity cannot re-scan project-local source trees every few seconds.
+The run happens in the background, so a turn never waits on it, and never twice
+at once.
 
 `/memory sources` shows the counters, each adapter's last run, and why it is or
-is not due. `/memory sync` ignores all of it and runs anyway. Adjust or disable
-with `installMemory(pi, { sync: { everyTurns: 50, enabled: false } })`.
+is not due. `/memory sync` ignores all of it and runs anyway. Configure optional
+adapter thresholds with `installMemory(pi, { sync: { everyTurns: 50 } })`, or
+disable all automatic source sync with `installMemory(pi, { sync: { enabled:
+false } })`. The first-party `pi-session` cadence is fixed apart from that global
+enable switch.
 
 A failed run is recorded like a successful one, so a source that throws every
 time is visible as failing rather than looking like one that has never run.
 
-Source selection distinguishes questions from answers. The built-in prjct
-mapping keeps failures, verifications and explicitly declared statements, not
-raw user prompts. Eligible artifacts retain their full bounded content instead
-of an 8,000-character preview that might omit the answer.
+Source selection distinguishes questions from answers. Ordinary recall
+suppresses non-user instructions independently of publisher or namespace; an
+explicit namespace lookup can still inspect them. Eligible artifacts retain
+their full bounded content instead of an 8,000-character preview that might
+omit the answer.
+
+### Optional prjct compatibility
+
+The package still provides a data-only adapter for existing prjct observation
+streams, but never registers it implicitly. A custom extension entry point can
+opt in without importing or depending on the prjct package:
+
+```ts
+import { installMemory } from '@prjct.app/pi-memory';
+
+export default pi => installMemory(pi, {
+  sources: { prjct: {} },
+});
+```
+
+Use `sources: { prjct: { home: '/path/to/publisher/home' } }` when the publisher
+root differs from memory's current compatibility home. Uninstalling the prjct
+package or omitting this option does not affect pi-memory's first-party session
+learning and retrieval. Identity and storage still use the legacy shared-home
+contract in this migration stage; they are separated in subsequent changes.
 
 ### Connecting anything else
 

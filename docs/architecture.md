@@ -248,11 +248,14 @@ the record's own values, and `keep`/`drop` rules decide what is worth storing.
 Undeclared fields fall back to the conventional names, so an ordinary publisher
 needs no mapping and an unusual one needs configuration rather than code.
 
-No publisher package is imported. The built-in production adapter reads the
-active project's prjct observations through an explicit path mapping. Standalone
-discovery helpers can describe other publisher formats for diagnostics, but the
-production registry never invokes them and routing cannot open their authorities
-or ingest them into the project.
+No publisher package is imported. `pi-session` is the only adapter installed by
+default and is written and read entirely by pi-memory. The data-only prjct
+observation preset remains an explicitly enabled compatibility adapter; default
+source sync and daemon cycles do not inspect its observation tree. Identity and
+storage retain the legacy shared-home contract during this migration stage.
+Standalone discovery helpers can describe other publisher formats for
+diagnostics, but the production registry never invokes them and routing cannot
+open their authorities or ingest them into the project.
 
 Every adapter declares the owner it belongs to. The project-only engine rejects
 a team/shared adapter rather than writing it into a project database. Project
@@ -280,18 +283,19 @@ The run is fired without being awaited. A source scan must never sit between the
 user's prompt and the agent starting, and a second run cannot begin while one is
 in flight.
 
-`pi-session` uses an independent 8-turn/60-second sync cadence; this does not
-lower prjct's global 20-turn/five-minute minimum. Exact declared corrections are
-promoted lexically after the turn so the next session can recall a supported fact
-without waiting for daemon curation. Raw observations are never embedded.
+`pi-session` uses an independent 8-turn/60-second sync cadence. Exact declared
+corrections are promoted lexically after the turn so the next session can recall
+a supported fact without waiting for daemon curation. Raw observations are never
+embedded.
 
-Source selection distinguishes a request from an answer. prjct's default mapping
-keeps failures, verifications and explicitly declared statements, not arbitrary
-`user_input` prompts. Optional mapping definitions can classify other record
-formats, but an adapter is eligible only when it is explicitly bound to the same
-project owner. Ordinary recall also suppresses legacy raw prompts and unanswered
-threads already indexed by older presets; an explicit namespace lookup can still
-inspect project-local legacy material. Existing owner journals are never erased.
+Source selection distinguishes a request from an answer. The optional prjct
+mapping keeps failures, verifications and explicitly declared statements, not
+arbitrary `user_input` prompts. Optional mapping definitions can classify other
+record formats, but an adapter is eligible only when it is explicitly bound to
+the same project owner. Ordinary recall suppresses non-user instructions without
+keying behavior to a publisher namespace, as well as unanswered legacy team
+threads; an explicit namespace lookup can still inspect project-local legacy
+material. Existing owner journals are never erased.
 
 Discovered artifacts retain their full bounded content (up to 512,000 bytes)
 rather than an 8,000-character preview that could omit the answer. Indexed

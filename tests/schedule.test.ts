@@ -34,7 +34,7 @@ test('activity accumulates and survives reopening', async t => {
   assert.deepEqual({ ...second.activity(), updatedAt: 0 }, { turns: 2, tokens: 2_001, inserts: 2, updatedAt: 0 });
 });
 
-test('pi-session has a faster independent cadence without lowering the global prjct interval', () => {
+test('pi-session has a faster independent cadence without lowering the default adapter interval', () => {
   assert.equal(PI_SESSION_SYNC_POLICY.everyTurns, 8);
   assert.equal(PI_SESSION_SYNC_POLICY.minIntervalMs, 60_000);
   assert.equal(DEFAULT_SYNC_POLICY.everyTurns, 20);

@@ -153,12 +153,12 @@ export const candidatesFromScores = (
   return chunks.flatMap(chunk => {
     const document = chunk.document;
     if (document.scopeId !== request.scopeId) return [];
-    // Compatibility for projections ingested by the old presets. Raw prompts
-    // and unanswered threads are not durable answers; keep them in their owner
-    // journals, not in ordinary recall. Explicit namespace inspection can still
-    // retrieve them without pretending that host observation proves relevance.
+    // Compatibility for projections ingested by old or third-party presets.
+    // A non-user instruction is an observed prompt, not a durable answer,
+    // regardless of which publisher named its namespace. Explicit namespace
+    // inspection can still retrieve it. Curated memory remains eligible.
     if (!request.namespaces?.length) {
-      if (document.namespace === 'prjct.observation' && document.kind === 'instruction' && document.trust !== 'user') return [];
+      if (document.namespace !== 'memory' && document.kind === 'instruction' && document.trust !== 'user') return [];
       if (document.namespace === 'pi-team.journal' && (document.metadata.outcome === 'interrupted'
         || document.kind === 'thread' && !/^(Delivered|Result|Replies):\s*\S/mu.test(document.text))) return [];
     }
