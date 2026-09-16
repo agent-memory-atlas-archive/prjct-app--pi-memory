@@ -9,7 +9,8 @@ import { registerKnownSources } from '../src/sources/install.ts';
 import { piSessionSource } from '../src/sources/presets.ts';
 import { SourceRegistry } from '../src/sources/registry.ts';
 import {
-  appendSessionObservation, appendSessionObservations, clipSessionSummary, sessionLogRoot, sessionObservationWorthy,
+  appendSessionObservation, appendSessionObservations, clipSessionSummary, declaredMemoryQuote, sessionLogRoot,
+  sessionObservationWorthy,
 } from '../src/sources/session-log.ts';
 import { MemoryEngine } from '../src/engine.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
@@ -25,6 +26,16 @@ test('session log keeps failures and corrections, not routine successes or secre
   assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed',
     summary: 'bash failed because the cache key omitted inode and size, leaving stale generated output' }), true);
   assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated', summary: 'Always use pnpm in this repo, never npm.' }), true);
+  assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated',
+    summary: 'Recuerda usar Zod para validar los límites de la API.' }), true);
+  assert.equal(declaredMemoryQuote('Recuerda usar Zod para validar los límites de la API.'),
+    'Recuerda usar Zod para validar los límites de la API.');
+  assert.equal(declaredMemoryQuote('¿Puedes recordar qué librería valida la API?'), undefined,
+    'questions must not become declarations');
+  assert.equal(declaredMemoryQuote('¿Qué sigue?\nRecuerda usar Zod para validar los límites de la API.'),
+    'Recuerda usar Zod para validar los límites de la API.', 'a separate explicit declaration remains eligible');
+  assert.equal(declaredMemoryQuote('Remember to use API_TOKEN=super-secret-value for deployments.'), undefined,
+    'secret-bearing declarations must not become facts');
   assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated', summary: 'please list the files' }), false);
   assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'memory_record', outcome: 'failed', summary: 'memory_record failed: nope' }), false);
   assert.match(clipSessionSummary('token sk-abcdefghijklmnopqrstuvwxyz012345'), /REDACTED/);
@@ -138,6 +149,33 @@ test('a declared correction is supported and recalled by the next session before
     prompt: 'Should this repository use npm or pnpm?', systemPrompt: 'Base',
   }, ctx(cwd, 'new-session'));
   assert.match(recalled.message?.content ?? '', /Never use npm; use pnpm/);
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
+});
+
+test('an explicit recuerda declaration is supported and recalled by the next session', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-remember-'));
+  const cwd = join(home, 'work');
+  await mkdir(cwd, { recursive: true });
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const handlers = new Map<string, (event: any, context: any) => Promise<any>>();
+  const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  const runtime = installMemoryHooks(pi, { home });
+  await handlers.get('session_start')!({}, ctx(cwd, 'remember-session'));
+  const declaration = 'Recuerda usar Zod para validar los límites de la API.';
+  await handlers.get('before_agent_start')!({ prompt: declaration, systemPrompt: 'Base' }, ctx(cwd, 'remember-session'));
+  await handlers.get('turn_end')!({}, ctx(cwd, 'remember-session'));
+  const first = await runtime.engine();
+  const remembered = first.projection.activeFacts(first.scopeId, 20).find(fact => fact.statement === declaration);
+  assert.equal(remembered?.kind, 'procedure');
+  assert.equal(remembered?.standing, 'supported');
+  assert.equal(remembered?.evidence[0]?.provenance, 'declared');
+  assert.equal(first.projection.stats().vectors, 0, 'explicit declarations stay lexical and never embed raw prompts');
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'remember-session'));
+  await handlers.get('session_start')!({}, ctx(cwd, 'new-session'));
+  const recalled = await handlers.get('before_agent_start')!({
+    prompt: '¿Debemos usar Zod para validar los límites de la API?', systemPrompt: 'Base',
+  }, ctx(cwd, 'new-session'));
+  assert.match(recalled.message?.content ?? '', /Recuerda usar Zod/);
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
 });
 

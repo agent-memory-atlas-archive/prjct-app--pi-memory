@@ -10,7 +10,10 @@ const aliases: Readonly<Record<string, string>> = {
   oauth: 'authentication', login: 'authentication', autenticacion: 'authentication',
   fail: 'error', failure: 'error', errors: 'error', refresh: 'renewal',
 };
-const filler = new Set(['use', 'uses', 'using', 'still', 'all', 'keep', 'tell', 'please', 'give', 'about', 'base']);
+const filler = new Set([
+  'use', 'uses', 'using', 'still', 'all', 'keep', 'tell', 'please', 'give', 'about', 'base',
+  'usar', 'usa', 'usamos', 'utilizar', 'utiliza', 'utilizamos', 'debo', 'debe', 'debemos', 'deben',
+]);
 const normalize = (terms: readonly string[]): string[] => [...new Set(terms.map(term => aliases[term] ?? term))].filter(term => !filler.has(term));
 
 export type RelevanceCandidate = Readonly<{ key: string; text: string }>;
