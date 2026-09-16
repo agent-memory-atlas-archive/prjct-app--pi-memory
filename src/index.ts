@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { checkpointAndEnqueueLegacy } from './curation/migrate.ts';
 import type { MemoryEngine } from './engine.ts';
 import { installMemoryHooks } from './extension/hooks.ts';
@@ -25,6 +26,33 @@ export type MemoryExtensionOptions = Readonly<{
 
 const USAGE = 'Usage: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
 const ACTIONS = new Set(['init', 'status', 'sources', 'sync', 'index', 'replay', 'rebuild', 'gc', 'checkpoint-wal', 'migrate-curated', 'checkpoint']);
+const ACTION_COMPLETIONS: readonly AutocompleteItem[] = [
+  { value: 'init', label: 'init', description: 'Initialize memory for this checkout' },
+  { value: 'status', label: 'status', description: 'Show project memory status' },
+  { value: 'sources', label: 'sources', description: 'Show source adapters and sync state' },
+  { value: 'sync', label: 'sync', description: 'Scan all sources now, or choose an adapter' },
+  { value: 'index', label: 'index', description: 'Index one JSON source document' },
+  { value: 'checkpoint', label: 'checkpoint', description: 'Save an operational checkpoint from JSON' },
+  { value: 'replay', label: 'replay', description: 'Replay durable memory history' },
+  { value: 'rebuild', label: 'rebuild', description: 'Rebuild the searchable projection' },
+  { value: 'gc', label: 'gc', description: 'Run bounded memory garbage collection' },
+  { value: 'checkpoint-wal', label: 'checkpoint-wal', description: 'Checkpoint the SQLite write-ahead log' },
+  { value: 'migrate-curated', label: 'migrate-curated', description: 'Queue legacy documents for curation' },
+];
+
+const argumentCompletions = (prefix: string, adapterIds: readonly string[]): AutocompleteItem[] | null => {
+  const sync = /^sync\s+([^\s]*)$/u.exec(prefix);
+  if (sync) {
+    const adapterPrefix = sync[1] ?? '';
+    const matching = adapterIds.filter(id => id.startsWith(adapterPrefix)).map(id => ({
+      value: `sync ${id}`, label: `sync ${id}`, description: `Scan only the ${id} source`,
+    }));
+    return matching.length ? matching : null;
+  }
+  if (/\s/u.test(prefix)) return null;
+  const matching = ACTION_COMPLETIONS.filter(item => item.value.startsWith(prefix));
+  return matching.length ? [...matching] : null;
+};
 
 /**
  * Scans publisher sources, records fingerprints and enqueues analysis jobs.
@@ -93,8 +121,15 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   });
   installMemoryTools(pi, runtime);
 
+  const adapterIds = [...new Set([
+    SESSION_ADAPTER_ID,
+    ...(options.sources?.prjct ? ['prjct-observations'] : []),
+    ...(options.sources?.extra ?? []).map(adapter => adapter.id),
+  ].filter(id => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id)))].sort();
+
   pi.registerCommand('memory', {
     description: 'Initialize, inspect or maintain pi-memory: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
+    getArgumentCompletions: prefix => argumentCompletions(prefix, adapterIds),
     handler: async (args, ctx) => {
       try {
       const [action = 'status', target] = args.trim().split(/\s+/).filter(Boolean);
