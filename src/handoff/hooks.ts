@@ -39,6 +39,7 @@ const SAFE: HandoffMessage = {
 export const createHandoffController = (options: {
   engine: () => Promise<MemoryEngine>;
   budget?: HandoffBudget;
+  toolOverhead?: () => { toolSchemaTokens?: number; toolSchemaBytes?: number };
 } ) => {
   const budget = options.budget ?? DEFAULT_HANDOFF_BUDGET;
   const slot: {
@@ -98,6 +99,7 @@ export const createHandoffController = (options: {
     const selected = selectHandoffMessages(current, checkpoint, budget, {
       systemTokens: estimateHandoffTokens({ role: 'user', content: systemPrompt }),
       systemBytes: Buffer.byteLength(systemPrompt, 'utf8'),
+      ...options.toolOverhead?.(),
     });
     if (!selected.ok) return refuse(ctx, selected.instruction);
     ctx.ui.notify(

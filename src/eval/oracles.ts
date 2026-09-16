@@ -10,6 +10,8 @@ export type OracleCase = Readonly<{
 
 export type OracleHit = Readonly<{ statement: string; excerpts?: readonly string[] }>;
 
+export type OracleRanking = Readonly<{ reciprocalRank: number; ndcgAtK: number; firstRelevantRank?: number }>;
+
 export type OracleScore = Readonly<{
   name: string;
   kind: OracleKind;
@@ -18,6 +20,19 @@ export type OracleScore = Readonly<{
   missing: readonly string[];
   passed: boolean;
 }>;
+
+export const oracleHitRelevant = (hit: OracleHit, kase: OracleCase): boolean => kase.expectedStatements.length > 0
+  && kase.expectedStatements.every(statement => hit.statement.toLowerCase().includes(statement.toLowerCase()));
+
+/** Item-level ranking diagnostic. A relevant item must independently contain
+ * every required statement; query pass-rate is never labeled nDCG. */
+export const rankOracle = (hits: readonly OracleHit[], kase: OracleCase, k = 10): OracleRanking => {
+  if (k < 1 || !Number.isSafeInteger(k)) throw new Error('Oracle ranking cutoff must be a positive integer.');
+  const index = hits.slice(0, k).findIndex(hit => oracleHitRelevant(hit, kase));
+  if (index < 0) return { reciprocalRank: 0, ndcgAtK: 0 };
+  const rank = index + 1;
+  return { reciprocalRank: 1 / rank, ndcgAtK: 1 / Math.log2(rank + 1), firstRelevantRank: rank };
+};
 
 export const scoreOracle = (hits: readonly OracleHit[], kase: OracleCase,
   retrieval?: Readonly<{ status: string; gaps: readonly string[] }>): OracleScore => {

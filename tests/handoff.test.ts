@@ -201,19 +201,20 @@ test('context independently detects a missed model_select and arms bounded mode'
   assert.equal(controller.get(engine.scopeId, 's-observe')?.active, true);
 });
 
-test('measured system prompt plus tool reserve can consume the budget and refuses safely', async t => {
+test('measured active tool definitions replace the fixed fallback reserve and can refuse safely', async t => {
   const root = await mkdtemp(join(tmpdir(), 'handoff-overhead-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const engine = new MemoryEngine({ root, scopeId: 'p_overhead', sessionId: 's-overhead', provider: new TestEmbeddingProvider() });
   t.after(() => engine.dispose());
   const controller = createHandoffController({
     engine: async () => engine,
-    budget: { maxTokens: 30, maxBytes: 1_000, maxMessages: 2, toolSchemaReserveTokens: 20 },
+    budget: { maxTokens: 100, maxBytes: 1_000, maxMessages: 2, toolSchemaReserveTokens: 1 },
+    toolOverhead: () => ({ toolSchemaTokens: 150, toolSchemaBytes: 600 }),
   });
   controller.activate(engine.scopeId, root, 's-overhead', 'switched');
   const aborted = { n: 0 };
   const result = await controller.safeContext([user('latest')], {
-    cwd: root, model: { provider: 'offline', id: 'b' }, getSystemPrompt: () => 'large system policy '.repeat(40),
+    cwd: root, model: { provider: 'offline', id: 'b' }, getSystemPrompt: () => 'short system policy',
     abort: () => { aborted.n += 1; }, ui: { notify: () => undefined },
     sessionManager: { getSessionId: () => 's-overhead' },
   } as never);

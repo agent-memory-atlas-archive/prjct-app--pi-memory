@@ -7,13 +7,15 @@ export type HandoffBudget = Readonly<{
   maxTokens: number;
   maxBytes: number;
   maxMessages: number;
-  /** Public Pi has no tool-schema size accessor, so callers reserve it explicitly. */
+  /** Fallback reserve when a host does not expose active tool definitions. */
   toolSchemaReserveTokens: number;
 }>;
 
 export type HandoffOverhead = Readonly<{
   systemTokens: number;
   systemBytes: number;
+  toolSchemaTokens?: number;
+  toolSchemaBytes?: number;
 }>;
 
 export const DEFAULT_HANDOFF_BUDGET: HandoffBudget = {
@@ -34,6 +36,7 @@ export type HandoffResult = Readonly<{
   postMessageTokens: number;
   systemTokens: number;
   toolSchemaReserveTokens: number;
+  toolSchemaBytes: number;
   preBytes: number;
   postBytes: number;
   systemBytes: number;
@@ -46,6 +49,7 @@ export type HandoffResult = Readonly<{
   preBytes: number;
   systemTokens: number;
   toolSchemaReserveTokens: number;
+  toolSchemaBytes: number;
 }>;
 
 const messageBytes = (message: HandoffMessage): number => Buffer.byteLength(JSON.stringify(message), 'utf8');
@@ -53,7 +57,8 @@ const messageBytes = (message: HandoffMessage): number => Buffer.byteLength(JSON
 const assertBudget = (budget: HandoffBudget, overhead: HandoffOverhead): void => {
   const positive = [budget.maxTokens, budget.maxBytes, budget.maxMessages];
   if (positive.some(value => !Number.isSafeInteger(value) || value <= 0)) throw new Error('Handoff limits must be positive safe integers.');
-  const reserves = [budget.toolSchemaReserveTokens, overhead.systemTokens, overhead.systemBytes];
+  const reserves = [budget.toolSchemaReserveTokens, overhead.systemTokens, overhead.systemBytes,
+    overhead.toolSchemaTokens ?? 0, overhead.toolSchemaBytes ?? 0];
   if (reserves.some(value => !Number.isSafeInteger(value) || value < 0)) throw new Error('Handoff overhead must be non-negative safe integers.');
 };
 
@@ -71,8 +76,8 @@ const packCost = (messages: readonly HandoffMessage[], budget: HandoffBudget, ov
   const messageTokens = messages.reduce((sum, message) => sum + estimateHandoffTokens(message), 0);
   return {
     messageTokens,
-    tokens: overhead.systemTokens + budget.toolSchemaReserveTokens + messageTokens,
-    bytes: overhead.systemBytes + messages.reduce((sum, message) => sum + messageBytes(message), 0),
+    tokens: overhead.systemTokens + (overhead.toolSchemaTokens ?? budget.toolSchemaReserveTokens) + messageTokens,
+    bytes: overhead.systemBytes + (overhead.toolSchemaBytes ?? 0) + messages.reduce((sum, message) => sum + messageBytes(message), 0),
   };
 };
 
@@ -119,13 +124,15 @@ export const selectHandoffMessages = (
   const pre = packCost(retained, budget, overhead);
   const prefix = continuityPrefix(retained, checkpoint);
   const turns = groupTurns(retained.filter(message => !isPiSummary(message)));
-  const diagnostic = `Estimated tokens: system ${overhead.systemTokens} + tool-schema reserve ${budget.toolSchemaReserveTokens} + messages ${pre.messageTokens} = ${pre.tokens}. Bytes: system ${overhead.systemBytes} + messages ${pre.bytes - overhead.systemBytes} = ${pre.bytes}.`;
+  const toolTokens = overhead.toolSchemaTokens ?? budget.toolSchemaReserveTokens;
+  const toolBytes = overhead.toolSchemaBytes ?? 0;
+  const diagnostic = `Estimated tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${pre.messageTokens} = ${pre.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${pre.bytes - overhead.systemBytes - toolBytes} = ${pre.bytes}.`;
   const current = turns.at(-1);
   if (current && !turnIsComplete(current)) {
     return {
       ok: false, instruction: `Handoff refused: the current turn has an unmatched, duplicate, or orphaned tool call/result. ${diagnostic}`,
       preTokens: pre.tokens, preBytes: pre.bytes, systemTokens: overhead.systemTokens,
-      toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+      toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     };
   }
   const minimum = current ? [...prefix, ...current.messages] : prefix;
@@ -136,7 +143,7 @@ export const selectHandoffMessages = (
         ? 'Handoff refused: continuity checkpoint plus the current complete turn and provider overhead exceed the token/byte/message budget. Update a smaller checkpoint, increase the explicit budget, or start a new session.'
         : 'Handoff refused: no continuity checkpoint and the current turn plus provider overhead exceed the token/byte/message budget. Write a bounded /memory checkpoint before switching models.'} ${diagnostic}`,
       preTokens: pre.tokens, preBytes: pre.bytes, systemTokens: overhead.systemTokens,
-      toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+      toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     };
   }
   const kept = { turns: current ? [current] : [] as Turn[] };
@@ -154,9 +161,9 @@ export const selectHandoffMessages = (
   return {
     ok: true, messages: selected, preTokens: pre.tokens, postTokens: post.tokens,
     preMessageTokens: pre.messageTokens, postMessageTokens: post.messageTokens,
-    systemTokens: overhead.systemTokens, toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+    systemTokens: overhead.systemTokens, toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     preBytes: pre.bytes, postBytes: post.bytes, systemBytes: overhead.systemBytes,
     omittedTurns: Math.max(0, turns.length - kept.turns.length),
-    reason: `Kept ${continuity} and ${kept.turns.length} complete turn(s); omitted ${Math.max(0, turns.length - kept.turns.length)} older turn(s). Tokens: system ${overhead.systemTokens} + tool-schema reserve ${budget.toolSchemaReserveTokens} + messages ${post.messageTokens} = ${post.tokens}. Bytes: system ${overhead.systemBytes} + messages ${post.bytes - overhead.systemBytes} = ${post.bytes}.`,
+    reason: `Kept ${continuity} and ${kept.turns.length} complete turn(s); omitted ${Math.max(0, turns.length - kept.turns.length)} older turn(s). Tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${post.messageTokens} = ${post.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${post.bytes - overhead.systemBytes - toolBytes} = ${post.bytes}.`,
   };
 };

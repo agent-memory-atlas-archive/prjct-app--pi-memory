@@ -34,9 +34,6 @@ const contextParameters = Type.Object({
   kinds: Type.Optional(Type.Array(Type.String({ maxLength: 64 }), { maxItems: 16 })),
   signal: Type.Optional(StringEnum(['used', 'helpful'] as const)),
   maxBytes: Type.Optional(Type.Integer({ minimum: 512, maximum: 32768 })),
-  scoreThreshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-  dense: Type.Optional(Type.Boolean()),
-  scopes: Type.Optional(Type.Array(StringEnum(['project'] as const), { maxItems: 1 })),
 }, { additionalProperties: false });
 
 const recordParameters = Type.Object({
@@ -60,7 +57,33 @@ const recordParameters = Type.Object({
   replacementId: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
 }, { additionalProperties: false });
 
-const result = (details: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(details) }], details });
+const normalized = (value: string): string => value.normalize('NFC').replace(/\s+/gu, ' ').trim();
+const compactItem = (value: unknown): unknown => {
+  if (!value || typeof value !== 'object') return value;
+  const item = value as Record<string, unknown>;
+  const statement = typeof item.statement === 'string' ? item.statement : undefined;
+  const title = typeof item.title === 'string' ? item.title : undefined;
+  const includeTitle = title && statement && !normalized(statement).startsWith(normalized(title));
+  return {
+    ...(typeof item.id === 'string' ? { id: item.id } : {}),
+    ...(typeof item.kind === 'string' ? { type: item.kind } : typeof item.namespace === 'string' ? { type: item.namespace } : {}),
+    ...(typeof item.standing === 'string' ? { standing: item.standing } : {}),
+    ...(includeTitle ? { title } : {}), ...(statement ? { statement } : {}),
+    ...(typeof item.observedAt === 'string' ? { observedAt: item.observedAt } : {}),
+    ...(typeof item.validAt === 'string' ? { validAt: item.validAt } : {}),
+    ...(typeof item.invalidAt === 'string' ? { invalidAt: item.invalidAt } : {}),
+    ...(typeof item.score === 'number' ? { score: Number(item.score.toFixed(4)) } : {}),
+  };
+};
+const compactView = (details: unknown): unknown => {
+  if (!details || typeof details !== 'object') return details;
+  const value = details as Record<string, unknown>;
+  if (!Array.isArray(value.items)) return details;
+  return { status: value.status, items: value.items.map(compactItem),
+    ...(typeof value.omitted === 'number' ? { omitted: value.omitted } : {}),
+    ...(Array.isArray(value.gaps) && value.gaps.length ? { gaps: value.gaps } : {}) };
+};
+const result = (details: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(compactView(details)) }], details });
 const required = (value: string | undefined, name: string): string => {
   if (!value?.trim()) throw new Error(`${name} is required for this action.`);
   return value;
@@ -86,22 +109,15 @@ const safeTags = (tags: Readonly<Record<string, string>> | undefined): Record<st
 export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRuntime): void => {
   pi.registerTool({
     name: 'memory_context', label: 'Memory context',
-    description: 'Search or inspect project memory, find mechanical consolidation candidates, and record positive retrieval feedback.',
-    promptSnippet: 'Retrieve bounded temporal memory with hybrid lexical, vector and graph search',
-    promptGuidelines: [
-      'Use memory_context lookup with concise standalone query expansions when prior decisions, failures, preferences, or cross-session work could affect the answer.',
-      'Treat memory_context items as evidence-ranked candidates: reject stale or irrelevant items, inspect important ids, and compose only what the current task needs.',
-    ],
+    description: 'Search or inspect bounded project memory; consolidate exact candidates or record positive retrieval feedback.',
     parameters: contextParameters,
     async execute(_toolCallId, params, signal) {
       const engine = await runtime.engine();
       if (params.action === 'lookup') {
-        if (params.scopes?.some(scope => scope !== 'project')) throw new Error('Memory search is project-local.');
         return result(await runtime.search({ queries: params.queries ?? [],
           ...(params.asOf ? { asOf: params.asOf } : {}), namespaces: params.namespaces ?? ['memory', 'memory.topic'],
           ...(params.kinds ? { kinds: params.kinds } : {}), maxBytes: params.maxBytes ?? 1500,
-          ...(params.scoreThreshold !== undefined ? { scoreThreshold: params.scoreThreshold } : {}),
-          dense: params.dense ?? true, signal }));
+          dense: true, signal }));
       }
       if (params.action === 'inspect') {
         const memory = await runtime.engine();
@@ -156,13 +172,7 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
 
   pi.registerTool({
     name: 'memory_record', label: 'Record memory',
-    description: 'Record selective durable knowledge or resolve an existing memory with current-session evidence.',
-    promptSnippet: 'Record durable decisions, corrections, failures, preferences, or procedures with evidence',
-    promptGuidelines: [
-      'Use memory_record only for reusable decisions, verified failures, corrections, stable constraints, procedures, or explicit user preferences—not routine reads or progress narration.',
-      'When evidence is available, cite staged ev_ ids; use userQuote only for an exact statement in the current user prompt. Never claim native provenance yourself.',
-      'Resolve obsolete memory with memory_record instead of rewriting history; supersession and contradiction are append-only temporal events.',
-    ],
+    description: 'Record selective durable knowledge or resolve memory using current-session evidence handles or an exact user quote.',
     parameters: recordParameters,
     async execute(_toolCallId, params, signal) {
       const engine = await runtime.engine();

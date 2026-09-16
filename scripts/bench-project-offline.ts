@@ -3,9 +3,12 @@
 import { readFileSync, statSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { scoreOracle, type OracleCase } from '../src/eval/oracles.ts';
+import { once } from 'node:events';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { rankOracle, scoreOracle, type OracleCase } from '../src/eval/oracles.ts';
 import { TestEmbeddingProvider } from '../tests/helpers.ts';
 
 const arg = (name: string): string => {
@@ -58,27 +61,28 @@ for (const [name, files] of [['tiny', tiny], ['large', tracked]] as const) {
   const source = files.map(path => ({ path, text: readFileSync(join(corpus, path), 'utf8') }));
   const rawBytes = source.reduce((sum, item) => sum + Buffer.byteLength(item.text), 0);
   const open = () => new MemoryEngine({ root, scopeId: 'p_benchmark', sessionId: 'offline', provider });
+  const samplerOutput = join(workspace, `.storage-samples-${name}.json`);
+  const sampler = spawn(process.execPath, [fileURLToPath(new URL('./storage-sampler.mjs', import.meta.url)), root, samplerOutput],
+    { stdio: 'ignore' });
+  const waitForSampler = async (remaining = 100): Promise<void> => {
+    if (existsSync(samplerOutput)) return;
+    if (remaining <= 0 || sampler.exitCode !== null) throw new Error('Independent storage sampler did not start.');
+    await sleep(10);
+    await waitForSampler(remaining - 1);
+  };
+  await waitForSampler();
   const engine = open();
   const fixedOverhead = measure(root);
-  const peak = { value: fixedOverhead, wal: fixedOverhead.wal };
-  const sample = () => {
-    const current = measure(root);
-    if (current.total > peak.value.total) peak.value = current;
-    peak.wal = Math.max(peak.wal, current.wal);
-  };
-  // Sample at each completed authority/store transaction as well as job checkpoint
-  // boundaries; instrumentation does not alter transaction contents or durability.
-  for (const [object, method] of [[engine, 'authorityTransaction'], [engine.curation, 'transaction'], [engine.projection, 'transaction']] as const) {
-    const original = object[method].bind(object);
-    object[method] = (...args: unknown[]) => { const result = original(...args); sample(); return result; };
-  }
   const adapter = { id: 'real-docs', scope: { kind: 'project', id: 'p_benchmark' }, scan: async () => source.map(file => ({
     namespace: 'project.docs', externalId: file.path, scopeId: 'p_benchmark', scopeKind: 'project', source: 'real-docs', kind: 'document',
     title: file.path, text: file.text, uri: join(corpus, file.path), version: hash(file.text), contentHash: hash(file.text),
     observedAt: '2026-09-01T00:00:00.000Z', trust: 'imported', metadata: { path: file.path },
   })) };
   const registry = new SourceRegistry(); registry.register(adapter);
+  const syncStarted = performance.now();
   await registry.sync(async () => engine, adapter.id);
+  const syncMs = performance.now() - syncStarted;
+  const curationStarted = performance.now();
   await processAvailable(engine, new Map([[adapter.id, adapter]]), 'offline', {
     analyzer: scriptedAnalyzer((bundle: any) => {
       const facts = rules.flatMap(([needle, semanticKey, statement]) => {
@@ -93,7 +97,7 @@ for (const [name, files] of [['tiny', tiny], ['large', tracked]] as const) {
         title: bundle.identity.title, summary: facts.map((fact: any) => fact.statement).join(' ') || 'No durable facts in this window.' }, facts, conflicts: [] };
     }), maxAttempts: 5, maxInputChars: 8_000, budget: { maxCallsPerDay: 100_000, maxTokensPerDay: 100_000_000 },
   });
-  sample();
+  const curationMs = performance.now() - curationStarted;
   const live = measure(root);
   if (engine.projection.checkpointWal) engine.projection.checkpointWal();
   else {
@@ -113,10 +117,10 @@ for (const [name, files] of [['tiny', tiny], ['large', tracked]] as const) {
       const warmMs = [];
       for (const _ of [1, 2, 3, 4, 5]) { const begin = performance.now(); await search(); warmMs.push(performance.now() - begin); }
       const score = scoreOracle(result.items, kase, result);
-      const first = result.items.findIndex((item: any) => kase.expectedStatements.every(text => item.statement.toLowerCase().includes(text.toLowerCase())));
-      diagnostics.push({ ...score, route, coldMs, warmMs,
+      const ranking = rankOracle(result.items, kase, 10);
+      diagnostics.push({ ...score, ...ranking, route, coldMs, warmMs,
         supportedItems: result.items.filter((item: any) => kase.expectedStatements.length > 0 && kase.expectedStatements.every(text => item.statement.toLowerCase().includes(text.toLowerCase()))).length,
-        items: result.items.length, reciprocalRank: first < 0 ? 0 : 1 / (first + 1),
+        items: result.items.length,
         statements: result.items.map((item: any) => item.statement), gaps: result.gaps });
     }
   }
@@ -124,17 +128,25 @@ for (const [name, files] of [['tiny', tiny], ['large', tracked]] as const) {
   await engine.dispose();
   const closed = measure(root);
   const reopened = open(); const postReopen = measure(root); await reopened.dispose();
+  sampler.kill('SIGTERM');
+  await once(sampler, 'exit');
+  const sampled = JSON.parse(readFileSync(samplerOutput, 'utf8')) as {
+    peakTotalSnapshot: ReturnType<typeof measure>; peakWalSnapshot: ReturnType<typeof measure>;
+  };
   const negatives = diagnostics.filter(row => row.kind === 'unanswerable');
   const positives = diagnostics.filter(row => row.kind !== 'unanswerable');
   const timings = diagnostics.flatMap(row => row.warmMs).sort((a, b) => a - b);
   reports.push({ name, sourceFiles: files.length, rawBytes, sourceDigest: hash(source.map(file => `${file.path}:${hash(file.text)}`).join('\n')),
-    facts, fixedOverhead, peakLive: peak.value, peakWal: peak.wal, live, cleanQuiescent, closed, postReopen,
+    facts, ingestMs: { sync: syncMs, curation: curationMs, total: syncMs + curationMs },
+    fixedOverhead, peakLive: sampled.peakTotalSnapshot, peakWal: sampled.peakWalSnapshot.wal,
+    peakWalSnapshot: sampled.peakWalSnapshot, live, cleanQuiescent, closed, postReopen,
     storage: cleanQuiescent.total < rawBytes ? 'WIN' : 'NOT A WIN', breakEvenBytes: cleanQuiescent.total,
     falsePositives: negatives.filter(row => row.items > 0).length, negativeCases: negatives.length,
     negativeAbstentionRate: negatives.filter(row => row.passed).length / negatives.length,
     diagnosticCandidatePrecision: positives.reduce((sum, row) => sum + row.supportedItems, 0) / Math.max(1, positives.reduce((sum, row) => sum + row.items, 0)),
     diagnosticRecall: positives.filter(row => row.passed).length / positives.length,
     diagnosticMrr: positives.reduce((sum, row) => sum + row.reciprocalRank, 0) / positives.length,
+    diagnosticNdcgAt10: positives.reduce((sum, row) => sum + row.ndcgAtK, 0) / positives.length,
     latency: { firstQueryMs: diagnostics[0]?.coldMs, warmP50Ms: timings[Math.floor(timings.length * 0.5)], warmP95Ms: timings[Math.floor(timings.length * 0.95)] }, diagnostics });
 }
 const report = { implementation, corpus, pin: execFileSync('git', ['-C', corpus, 'rev-parse', 'HEAD']).toString().trim(),

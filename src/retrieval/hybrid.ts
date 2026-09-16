@@ -65,11 +65,7 @@ export type RankedCandidate = Readonly<{
 }>;
 
 const tokens = (text: string): Set<string> => new Set(text.toLocaleLowerCase().match(/[\p{L}\p{N}_./:-]{2,}/gu) ?? []);
-const jaccard = (a: Set<string>, b: Set<string>): number => {
-  const intersection = [...a].filter(value => b.has(value)).length;
-  const union = new Set([...a, ...b]).size;
-  return union ? intersection / union : 0;
-};
+const exactContent = (item: MemoryHit): string => item.statement.normalize('NFC').replace(/\s+/gu, ' ').trim();
 const GRAPH_ITEM_SCORE = 0.01;
 const trustWeight = (trust: SourceDocument['trust']): number => ({ host: 1, user: 0.95, imported: 0.8, agent: 0.65 })[trust];
 
@@ -217,10 +213,11 @@ export const presentCandidates = (
   const sourceCount = new Set(ranked.map(candidate => candidate.item.source)).size;
   const perSourceCap = options.sourceCap !== false && sourceCount > 1 ? Math.max(2, Math.ceil(limit / 3)) : limit;
   const diverse = ranked.reduce<RankedCandidate[]>((selected, candidate) => {
-    if (selected.length >= limit || selected.some(prior => identity(prior.item) === identity(candidate.item))) return selected;
-    const redundancy = selected.reduce((highest, prior) => Math.max(highest, jaccard(candidate.tokenSet, prior.tokenSet)), 0);
+    const duplicate = selected.some(prior => identity(prior.item) === identity(candidate.item)
+      || exactContent(prior.item) === exactContent(candidate.item));
+    if (selected.length >= limit || duplicate) return selected;
     const sameSource = selected.filter(prior => prior.item.source === candidate.item.source).length;
-    return redundancy > 0.82 || sameSource >= perSourceCap ? selected : [...selected, candidate];
+    return sameSource >= perSourceCap ? selected : [...selected, candidate];
   }, []);
   // Graph neighbours carry a fixed low score, so they have to clear the same
   // threshold as everything else. Before, they were merged after the filter and

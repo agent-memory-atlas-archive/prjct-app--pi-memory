@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, copyFileSync, existsSync, fsyncSync, openSync, renameSync, rmSync, statfsSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import * as sqliteVec from 'sqlite-vec';
 import { migrate } from './migrations.ts';
 import { privateDatabaseFiles, privateDirectorySync } from './private-files.ts';
 import { acquireMaintenanceLock } from './maintenance-lock.ts';
@@ -31,6 +32,13 @@ const integrity = (db: DatabaseSync): void => {
   if (db.prepare('PRAGMA foreign_key_check').get()) throw new Error('Memory migration foreign-key verification failed.');
 };
 
+const openMigrationDatabase = (path: string, readOnly = false): DatabaseSync => {
+  const db = new DatabaseSync(path, { allowExtension: true, readOnly });
+  db.enableLoadExtension(true);
+  try { sqliteVec.load(db); } finally { db.enableLoadExtension(false); }
+  return db;
+};
+
 const fsyncPath = (path: string): void => {
   const fd = openSync(path, 'r');
   try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -48,7 +56,10 @@ const versionAt = (path: string): number | undefined => {
   } finally { db.close(); }
 };
 
-export const migrateIndexedPath = (path: string, maintenanceHeld = false): string | undefined => {
+export type MigrationPhase = 'backup-created' | 'backup-published' | 'rewrite-verified' | 'live-replaced';
+
+export const migrateIndexedPath = (path: string, maintenanceHeld = false,
+  observe: (phase: MigrationPhase) => void = () => undefined): string | undefined => {
   if (versionAt(path) !== 4) return undefined;
   const root = dirname(path);
   privateDirectorySync(root);
@@ -59,7 +70,7 @@ export const migrateIndexedPath = (path: string, maintenanceHeld = false): strin
   const backupTemporary = join(checkpoints, `pre-v5-${stamp}.sqlite.tmp`);
   const backup = join(checkpoints, `pre-v5-${stamp}.sqlite`);
   const rewrite = join(root, `.${basename(path)}.v5-${stamp}.tmp`);
-  const source = new DatabaseSync(path);
+  const source = openMigrationDatabase(path);
   try {
     const available = statfsSync(root).bavail * statfsSync(root).bsize;
     const liveBytes = statSync(path).size + (statSync(`${path}-wal`, { throwIfNoEntry: false })?.size ?? 0);
@@ -68,8 +79,9 @@ export const migrateIndexedPath = (path: string, maintenanceHeld = false): strin
     const before = snapshot(source);
     if (!before.owner) throw new Error('V4 memory database has no project owner; refusing migration.');
     source.exec(`VACUUM INTO '${backupTemporary.replaceAll("'", "''")}'`);
+    observe('backup-created');
     privateDatabaseFiles(backupTemporary);
-    const backupDb = new DatabaseSync(backupTemporary, { readOnly: true });
+    const backupDb = openMigrationDatabase(backupTemporary, true);
     try {
       integrity(backupDb);
       const version = Number((backupDb.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value?: unknown } | undefined)?.value ?? 0);
@@ -78,9 +90,10 @@ export const migrateIndexedPath = (path: string, maintenanceHeld = false): strin
     fsyncPath(backupTemporary);
     renameSync(backupTemporary, backup);
     fsyncPath(checkpoints);
+    observe('backup-published');
     copyFileSync(backup, rewrite);
     privateDatabaseFiles(rewrite);
-    const candidate = new DatabaseSync(rewrite);
+    const candidate = openMigrationDatabase(rewrite);
     try {
       candidate.exec('PRAGMA journal_mode=DELETE; PRAGMA page_size=4096; PRAGMA auto_vacuum=INCREMENTAL; VACUUM');
       migrate(candidate);
@@ -96,6 +109,7 @@ export const migrateIndexedPath = (path: string, maintenanceHeld = false): strin
         || Number(Object.values(candidate.prepare('PRAGMA auto_vacuum').get() ?? {})[0]) !== 2) throw new Error('V5 storage pragmas were not applied.');
       candidate.exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE');
     } finally { candidate.close(); }
+    observe('rewrite-verified');
     privateDatabaseFiles(rewrite);
     fsyncPath(rewrite);
     source.close();
@@ -104,6 +118,7 @@ export const migrateIndexedPath = (path: string, maintenanceHeld = false): strin
     renameSync(rewrite, path);
     privateDatabaseFiles(path);
     fsyncPath(root);
+    observe('live-replaced');
     return backup;
   } catch (error) {
     try { source.close(); } catch { /* preserve the migration error */ }

@@ -14,7 +14,7 @@ const hookHarness = (): { runtime: ReturnType<typeof installMemoryHooks>; handle
 
 test('installs only Pi-native hooks, tools and commands', () => {
   const tools: string[] = [];
-  const definitions: Array<{ name: string; parameters: { properties?: { action?: { enum?: string[] } } } }> = [];
+  const definitions: any[] = [];
   const commands: string[] = [];
   const events: string[] = [];
   const pi = {
@@ -26,6 +26,10 @@ test('installs only Pi-native hooks, tools and commands', () => {
   assert.deepEqual(tools, ['memory_context', 'memory_record']);
   assert.deepEqual(commands, ['memory']);
   assert.deepEqual(definitions.find(definition => definition.name === 'memory_record')?.parameters.properties?.action?.enum, ['remember', 'resolve']);
+  const context = definitions.find(definition => definition.name === 'memory_context');
+  assert.equal(context.promptSnippet, undefined);
+  assert.equal(context.promptGuidelines, undefined);
+  for (const obsolete of ['scopes', 'dense', 'scoreThreshold']) assert.equal(context.parameters.properties?.[obsolete], undefined);
   assert.deepEqual(events, ['session_start', 'before_agent_start', 'tool_result', 'model_select', 'context', 'before_provider_request', 'session_shutdown']);
 });
 
@@ -38,15 +42,20 @@ test('explicit public handoff budget reaches the controller', () => {
   assert.deepEqual(runtime.handoff.budget, handoff);
 });
 
-test('host tool results expose session-local evidence ids to the active agent', async () => {
+test('host tool results expose session-local evidence handles to the active agent', async () => {
   const { runtime, handlers } = hookHarness();
   const content = [{ type: 'text', text: 'npm test passed' }];
   const patched = await handlers.get('tool_result')!({ toolName: 'bash', toolCallId: 'call_1', isError: false, content },
     { sessionManager: { getSessionId: () => 'session_1' } });
   const marker = patched.content.at(-1).text as string;
-  assert.match(marker, /^\[pi-memory evidence: ev_[a-z0-9_-]+\]$/);
+  assert.match(marker, /^\[pi-memory evidence: e_[a-z0-9_-]+\]$/);
   const id = marker.slice('[pi-memory evidence: '.length, -1);
-  assert.equal(runtime.stagedEvidence().get(id)?.excerpt, 'bash succeeded\nnpm test passed');
+  const staged = runtime.stagedEvidence().get(id);
+  assert.equal(staged?.excerpt, 'bash succeeded\nnpm test passed');
+  assert.match(staged?.id ?? '', /^ev_/u);
+  assert.notEqual(staged?.id, id);
+  await handlers.get('session_start')!({}, { cwd: '/tmp/new-session', sessionManager: { getSessionId: () => 'session_2' } });
+  assert.equal(runtime.stagedEvidence().size, 0, 'a handle cannot cross the session boundary');
 });
 
 test('memory tool results do not stage evidence and staged excerpts are redacted', async () => {

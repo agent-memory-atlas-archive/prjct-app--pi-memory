@@ -15,7 +15,7 @@ import { privateDatabaseFiles, privateDirectorySync } from './private-files.ts';
 import { migrateIndexedPath } from './migration-coordinator.ts';
 import { acquireMaintenanceLock } from './maintenance-lock.ts';
 
-export const MAX_QUIESCENT_WAL_BYTES = 8 * 1024 * 1024;
+export const MAX_QUIESCENT_WAL_BYTES = 512 * 1024;
 export type LexicalHit = Readonly<{ chunkId: string; documentKey: string; score: number }>;
 /** distance is int8 L2 (not cosine); similarity is cosine on the stored quantized vectors. */
 export type VectorHit = Readonly<{ chunkId: string; documentKey: string; distance: number; similarity: number; dimensions: number }>;

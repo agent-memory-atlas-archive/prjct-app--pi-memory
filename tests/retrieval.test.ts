@@ -5,8 +5,26 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { MemoryEngine } from '../src/engine.ts';
 import { sha256 } from '../src/workspace/project-identity.ts';
+import { presentCandidates, type MemoryHit, type RankedCandidate } from '../src/retrieval/hybrid.ts';
 import { retrievalMetrics } from './eval/metrics.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
+
+test('presentation suppresses only exact duplicates and preserves number, date, and negation contrasts', () => {
+  const candidate = (id: string, statement: string, score: number): RankedCandidate => ({
+    item: { id, chunkId: `chunk_${id}`, scopeId: 'p_test', scopeKind: 'project', namespace: 'memory', source: 'test',
+      kind: 'decision', statement, score, standing: 'supported', observedAt: '2026-01-01T00:00:00.000Z',
+      provenance: 'declared', evidenceIds: [], reason: ['test'] } satisfies MemoryHit,
+    tokenSet: new Set(statement.toLowerCase().split(/\s+/u)),
+  });
+  const first = 'Deploy version 2 on 2026-04-01; backups are required.';
+  const result = presentCandidates([
+    candidate('a', first, 1),
+    candidate('b', 'Deploy version 3 on 2026-04-02; backups are not required.', 0.9),
+    candidate('c', `  ${first.replaceAll(' ', '  ')}  `, 0.8),
+  ], { limit: 10, maxBytes: 10_000, threshold: 0, asOf: Date.now(), gaps: [], neighbors: () => [] });
+  assert.deepEqual(result.items.map(item => item.id), ['a', 'b']);
+  assert.equal(result.omitted, 1);
+});
 
 test('hybrid retrieval beats lexical-only on cross-vocabulary cases without losing exact hits', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-retrieval-'));

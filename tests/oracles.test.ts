@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { scoreOracle } from '../src/eval/oracles.ts';
+import { rankOracle, scoreOracle } from '../src/eval/oracles.ts';
 
 test('oracle mechanics score recall, grounding and completeness without a model', () => {
   const hits = [{ statement: 'Use north-alpha-store.', excerpts: ['Decision: use north-alpha-store.'] }];
@@ -16,6 +16,17 @@ test('oracle mechanics score recall, grounding and completeness without a model'
   });
   assert.equal(missing.passed, false);
   assert.deepEqual(missing.missing, ['not for replica traffic']);
+});
+
+test('ranking metrics require one independently relevant item and use its actual rank', () => {
+  const kase = { name: 'O7', query: 'primary store?', kind: 'evidence-complete' as const,
+    expectedStatements: ['SQLite', 'prjct.db'] };
+  assert.deepEqual(rankOracle([{ statement: 'SQLite is used.' }, { statement: 'The store is prjct.db.' }], kase),
+    { reciprocalRank: 0, ndcgAtK: 0 });
+  const ranked = rankOracle([{ statement: 'MongoDB is used.' }, { statement: 'SQLite stores state in prjct.db.' }], kase);
+  assert.equal(ranked.reciprocalRank, 0.5);
+  assert.equal(ranked.firstRelevantRank, 2);
+  assert.ok(ranked.ndcgAtK > 0 && ranked.ndcgAtK < 1);
 });
 
 test('unanswerable oracle requires explicit empty abstention, never missing forbidden text', () => {
