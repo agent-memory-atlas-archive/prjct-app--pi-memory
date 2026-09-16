@@ -1,5 +1,5 @@
 import type { MemoryEngine } from '../engine.ts';
-import { prjctHomeFor } from '../workspace/project-identity.ts';
+import { memoryHomeFor } from '../workspace/project-identity.ts';
 import { piSessionSource } from './presets.ts';
 import { prjctObservationSource } from './prjct.ts';
 import type { RecordMapping } from './records.ts';
@@ -28,7 +28,7 @@ export type SourceInstallOptions = Readonly<{
 
 export const registerKnownSources = async (registry: SourceRegistry, projectId: string,
   options: SourceInstallOptions = {}): Promise<readonly string[]> => {
-  const home = prjctHomeFor(options.home);
+  const home = memoryHomeFor(options.home);
   const scope: AdapterScope = { kind: 'project', id: projectId };
   registry.register(piSessionSource({ home, scope }));
   if (options.prjct) registry.register(prjctObservationSource({

@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { prjctHomeFor } from '../workspace/project-identity.ts';
+import { memoryHomeFor } from '../workspace/project-identity.ts';
 
 export type DaemonConfig = Readonly<{
   home: string;
@@ -23,7 +23,7 @@ const integer = (value: string | undefined, fallback: number): number => {
 };
 
 export const loadDaemonConfig = async (overrides: Partial<DaemonConfig> = {}): Promise<DaemonConfig> => {
-  const home = overrides.home ?? process.env.PI_MEMORY_DAEMON_HOME ?? process.env.PRJCT_HOME ?? prjctHomeFor();
+  const home = overrides.home ?? process.env.PI_MEMORY_DAEMON_HOME ?? memoryHomeFor();
   const shared = join(home, 'shared', 'memory', 'config.json');
   const raw = await readFile(shared, 'utf8').catch(() => undefined);
   const parsed = raw ? JSON.parse(raw) as { analysis?: Partial<DaemonConfig> } : {};

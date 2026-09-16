@@ -2,7 +2,7 @@ import { appendFile, lstat, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { redactSecrets } from '../security/redact.ts';
 import {
-  assertProjectId, assertProjectLocalPath, prjctHomeFor, scopeRoot, sha256,
+  assertProjectId, assertProjectLocalPath, memoryHomeFor, scopeRoot, sha256,
 } from '../workspace/project-identity.ts';
 
 export const SESSION_ADAPTER_ID = 'pi-session';
@@ -30,13 +30,13 @@ export type SessionObservation = Readonly<{
 }>;
 
 export const sessionLogRoot = (projectId: string, home?: string): string => {
-  const owner = scopeRoot(prjctHomeFor(home), 'project', assertProjectId(projectId));
+  const owner = scopeRoot(memoryHomeFor(home), 'project', assertProjectId(projectId));
   return join(owner, 'pi-session');
 };
 
 /** Reject a symlinked pi-session root that resolves into another p_* authority. */
 export const assertSessionLogIsolation = async (projectId: string, home?: string): Promise<string> => {
-  const owner = scopeRoot(prjctHomeFor(home), 'project', assertProjectId(projectId));
+  const owner = scopeRoot(memoryHomeFor(home), 'project', assertProjectId(projectId));
   const root = join(owner, 'pi-session');
   const ownerInfo = await lstat(owner).catch(() => undefined);
   const info = await lstat(root).catch(() => undefined);

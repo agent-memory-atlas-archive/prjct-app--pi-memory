@@ -22,7 +22,7 @@ test('default lookup and automatic recall retain positives/qualified evidence an
   const statements = JSON.parse(await readFile(new URL('./fixtures/real-project-statements.json', import.meta.url), 'utf8')) as string[];
   const cases = JSON.parse(await readFile(new URL('./fixtures/real-project-oracles.json', import.meta.url), 'utf8')) as OracleCase[];
   for (const statement of statements) await engine.recordFact({ kind: 'fact', statement, confidence: 1, evidence: [], entities: [], episodeIds: [], tags: {} });
-  t.mock.method(MemoryEngine, 'forProject', async () => engine);
+  t.mock.method(MemoryEngine, 'forInitializedProject', async () => engine);
   const handlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
   const tools = new Map<string, any>();
   const pi = { on: (name: string, handler: any) => handlers.set(name, handler),

@@ -30,13 +30,29 @@ text to numbers; it cannot promote a claim or decide what is true.
 
 ## Scope and identity
 
-`src/workspace/project-identity.ts` deliberately copies prjct's pure identity
-rule. The `.prjct/prjct.config.json` locator wins when a checkout moved;
-otherwise the id is `p_` plus the first twelve hexadecimal characters of
-SHA-256 over its canonical path. No extension needs another installed to agree on the project root:
-`$PRJCT_HOME/<projectId>/memory`. MemoryEngine accepts only project scopes. Team
-and shared publishers may be discovered as sources, but cannot open an authority
-or route documents outside the engine's project owner.
+Pi-memory owns checkout binding in the checksummed, atomically replaced
+`<memory-home>/pi-memory/projects.json` registry. Startup, ordinary prompts and
+`/memory status` do not infer or create a binding. `/memory init` canonicalizes
+the checkout, serializes concurrent initialization with an exclusive registry
+lock, publishes the binding, and opens the owner-bound database. A partial claim
+is rolled back when database ownership validation fails. Missing databases are
+reported as incomplete rather than recreated by status or daemon discovery.
+
+A new binding uses `p_` plus the first twelve hexadecimal characters of SHA-256
+over the canonical path. For migration only, initialization may adopt a
+`.prjct/prjct.config.json` id when the legacy checksummed identity index confirms
+the same canonical location and project id. A locator by itself is never trusted.
+This compatibility read imports no prjct package and does not let prjct open the
+memory database.
+
+The home is selected by an explicit API/CLI option, then `PI_MEMORY_HOME`, then
+the compatibility fallbacks `PRJCT_HOME` and `~/.prjct`. Changing the selected
+home does not move or duplicate live storage automatically. The authority remains
+`<memory-home>/<projectId>/memory/memory.sqlite`. MemoryEngine accepts only
+project scopes. Team and shared publishers may be discovered as sources, but
+cannot open an authority or route documents outside the engine's project owner.
+The standalone daemon unions ready ids from the memory-owned registry and the
+legacy verified index; it never scans arbitrary `p_*` directories.
 
 The old sibling `vector/` component is not used. `src/vector/` is a public module
 inside the pi-memory npm package.

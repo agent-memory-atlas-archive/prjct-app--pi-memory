@@ -22,7 +22,10 @@ import { IndexedAuthority, type AuthorityPort, type CurationPort, type JournalPo
 import { Projection } from './storage/projection.ts';
 import { createEmbeddingProvider, type EmbeddingConfig, type EmbeddingProvider } from './vector/providers.ts';
 import { createVectorIndex, EmbeddingUnavailableError, type VectorIndex } from './vector/vector-index.ts';
-import { MEMORY_DATABASE, assertExclusiveMemoryPath, assertProjectId, assertProjectLocalPath, componentPath, prjctHomeFor, resolveProject, sha256 } from './workspace/project-identity.ts';
+import { MEMORY_DATABASE, assertExclusiveMemoryPath, assertProjectId, assertProjectLocalPath, componentPath, memoryDatabasePath, memoryHomeFor, resolveProject, sha256 } from './workspace/project-identity.ts';
+import {
+  initializeMemoryProjectWith, resolveMemoryProject, type MemoryProjectBinding,
+} from './workspace/memory-registry.ts';
 
 export type MemoryEngineOptions = Readonly<{
   root: string;
@@ -446,7 +449,7 @@ export class MemoryEngine {
   static async forScope(kind: ScopeKind, scopeId: string, sessionId: string,
     options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<MemoryEngine> {
     if (kind !== 'project') throw new Error('Memory opens only a project-owned database.');
-    const home = prjctHomeFor(options.home);
+    const home = memoryHomeFor(options.home);
     const root = componentPath(home, kind, assertProjectId(scopeId));
     await mkdir(root, { recursive: true, mode: 0o700 });
     assertExclusiveMemoryPath(home, scopeId, join(root, MEMORY_DATABASE));
@@ -455,10 +458,41 @@ export class MemoryEngine {
       ...(options.storage ? { storage: options.storage } : {}), embedding: config });
   }
 
+  /** Compatibility API for explicit programmatic authorities. Pi uses forInitializedProject(). */
   static async forProject(cwd: string, sessionId: string,
     options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<MemoryEngine> {
-    const project = await resolveProject(cwd, prjctHomeFor(options.home));
+    const project = await resolveProject(cwd, memoryHomeFor(options.home));
     return MemoryEngine.forScope('project', project.projectId, sessionId, options);
+  }
+
+  static async forInitializedProject(cwd: string, sessionId: string,
+    options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<MemoryEngine> {
+    const home = memoryHomeFor(options.home);
+    const binding = await resolveMemoryProject(cwd, home);
+    if (!binding) throw new Error('Memory is not initialized for this checkout. Run /memory init.');
+    if (!existsSync(memoryDatabasePath(home, binding.projectId))) {
+      throw new Error('Memory initialization is incomplete for this checkout. Run /memory init to repair it.');
+    }
+    return MemoryEngine.forScope('project', binding.projectId, sessionId, options);
+  }
+
+  static async initializeProject(cwd: string, sessionId: string,
+    options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<Readonly<{
+      engine: MemoryEngine; binding: MemoryProjectBinding; created: boolean;
+    }>> {
+    const home = memoryHomeFor(options.home);
+    const opened: { engine?: MemoryEngine } = {};
+    try {
+      const initialized = await initializeMemoryProjectWith(cwd, home, async binding => {
+        const engine = await MemoryEngine.forScope('project', binding.projectId, sessionId, options);
+        opened.engine = engine;
+        return engine;
+      });
+      return { engine: initialized.value, binding: initialized.binding, created: initialized.created };
+    } catch (error) {
+      await opened.engine?.dispose().catch(() => undefined);
+      throw error;
+    }
   }
 
   static forTeam(_teamId: string, _sessionId: string, _options: { home?: string; provider?: EmbeddingProvider } = {}): Promise<MemoryEngine> {

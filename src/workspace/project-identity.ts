@@ -9,7 +9,11 @@ export const MEMORY_COMPONENT = 'memory';
 export const MEMORY_DATABASE = 'memory.sqlite';
 export const SHARED_SCOPE_ID = 'shared';
 export const sha256 = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex');
-export const prjctHomeFor = (override?: string): string => override ?? process.env.PRJCT_HOME ?? join(homedir(), '.prjct');
+/** Resolve pi-memory's storage authority without moving legacy data implicitly. */
+export const memoryHomeFor = (override?: string): string => resolve(override ?? process.env.PI_MEMORY_HOME
+  ?? process.env.PRJCT_HOME ?? join(homedir(), '.prjct'));
+/** @deprecated Compatibility alias; new code should use memoryHomeFor(). */
+export const prjctHomeFor = memoryHomeFor;
 export const projectIdFrom = (canonicalLocation: string): string => `p_${sha256(canonicalLocation).slice(0, 12)}`;
 export const checkoutIdFrom = (canonicalLocation: string): string => `co_${sha256(canonicalLocation).slice(0, 12)}`;
 export const assertProjectId = (projectId: string): string => {
@@ -42,7 +46,7 @@ export const assertExclusiveMemoryPath = (home: string, projectId: string, candi
     const realProject = (existsSync(projectRoot) ? realpathSync(projectRoot) : projectRoot).replaceAll('\\', '/');
     const realHome = (existsSync(home) ? realpathSync(home) : resolve(home)).replaceAll('\\', '/');
     if (real !== realProject && !real.startsWith(`${realProject}/`)) throw new Error('Memory path resolves to another project.');
-    if (real !== realHome && !real.startsWith(`${realHome}/`)) throw new Error('Memory path resolves outside PRJCT_HOME.');
+    if (real !== realHome && !real.startsWith(`${realHome}/`)) throw new Error('Memory path resolves outside the configured memory home.');
   }
   return expected;
 };
@@ -52,7 +56,7 @@ export const scopeRoot = (home: string, kind: ScopeKind, id: string): string => 
   if (kind === 'project' && !/^p_[A-Za-z0-9_-]+$/.test(id)) throw new Error('A project scope requires a p_ id.');
   if (kind === 'shared' && id !== SHARED_SCOPE_ID) throw new Error('The shared scope id is fixed.');
   const root = kind === 'project' ? resolve(home, id) : kind === 'team' ? resolve(home, 'teams', id) : resolve(home, SHARED_SCOPE_ID);
-  if (!root.replaceAll('\\', '/').startsWith(`${resolve(home).replaceAll('\\', '/')}/`)) throw new Error('Scope root escaped PRJCT_HOME.');
+  if (!root.replaceAll('\\', '/').startsWith(`${resolve(home).replaceAll('\\', '/')}/`)) throw new Error('Scope root escaped the configured memory home.');
   return root;
 };
 
@@ -103,9 +107,20 @@ const verifiedBindings = async (home: string): Promise<readonly IdentityBinding[
 export const trustedProjectIds = async (home: string): Promise<readonly string[]> =>
   [...new Set((await verifiedBindings(home)).map(binding => binding.projectId))].sort();
 
-export const resolveProject = async (cwd: string, home = prjctHomeFor()): Promise<{ location: string; projectId: string; checkoutId: string }> => {
+export const resolveProject = async (cwd: string, home = memoryHomeFor()): Promise<{ location: string; projectId: string; checkoutId: string }> => {
   const location = await realpath(resolve(cwd));
   const located = await locatorProjectId(location);
   const trusted = located && (await verifiedBindings(home)).some(binding => binding.location === location && binding.projectId === located);
   return { location, projectId: trusted ? located : projectIdFrom(location), checkoutId: checkoutIdFrom(location) };
+};
+
+/** Return a compatibility identity only when both legacy locator and signed index agree. */
+export const resolveLegacyProject = async (cwd: string, home = memoryHomeFor()): Promise<Readonly<{
+  location: string; projectId: string; checkoutId: string;
+}> | undefined> => {
+  const location = await realpath(resolve(cwd));
+  const located = await locatorProjectId(location);
+  if (!located) return undefined;
+  const trusted = (await verifiedBindings(home)).some(binding => binding.location === location && binding.projectId === located);
+  return trusted ? { location, projectId: located, checkoutId: checkoutIdFrom(location) } : undefined;
 };

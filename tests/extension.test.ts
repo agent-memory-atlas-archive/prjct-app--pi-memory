@@ -75,15 +75,61 @@ test('memory tool results do not stage evidence and staged excerpts are redacted
   assert.match(excerpt, /<REDACTED>/);
 });
 
+test('ordinary prompts do not initialize an unbound checkout', async t => {
+  const { mkdtemp, readdir, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-unbound-'));
+  const home = join(root, 'home');
+  const handlers = new Map<string, Handler>();
+  const pi = { on(name: string, handler: Handler) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  installMemoryHooks(pi, { home });
+  const ctx = { cwd: root, sessionManager: { getSessionId: () => 'unbound-test' }, getContextUsage: () => ({ tokens: 0 }) };
+  await handlers.get('session_start')!({}, ctx);
+  t.after(async () => { await handlers.get('session_shutdown')!({}, ctx); await rm(root, { recursive: true, force: true }); });
+  const response = await handlers.get('before_agent_start')!({ prompt: 'Prefer pnpm for this project.', systemPrompt: 'Base.' }, ctx);
+  assert.match(response.systemPrompt, /Pi-memory policy/u);
+  await handlers.get('turn_end')!({}, ctx);
+  assert.deepEqual(await readdir(home).catch(() => []), []);
+});
+
+test('initialization is single-flight and session shutdown owns a pending engine', async t => {
+  const { MemoryEngine } = await import('../src/engine.ts');
+  const handlers = new Map<string, Handler>();
+  const pi = { on(name: string, handler: Handler) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  const runtime = installMemoryHooks(pi, { home: '/tmp/pi-memory-single-flight' });
+  const ctx = { cwd: '/tmp', sessionManager: { getSessionId: () => 'single-flight' } };
+  await handlers.get('session_start')!({}, ctx);
+  const disposed = { count: 0 };
+  const fake = { dispose: async () => { disposed.count += 1; } } as any;
+  const deferred: { resolve?: (value: any) => void } = {};
+  t.mock.method(MemoryEngine, 'initializeProject', () => new Promise(resolveInit => { deferred.resolve = resolveInit; }));
+  const first = runtime.initialize();
+  const second = runtime.initialize();
+  const firstRejected = assert.rejects(first, /session changed/u);
+  const secondRejected = assert.rejects(second, /session changed/u);
+  const stopping = handlers.get('session_shutdown')!({}, ctx);
+  await Promise.resolve();
+  deferred.resolve?.({ engine: fake, binding: {
+    location: '/tmp', projectId: 'p_single', checkoutId: 'co_single', source: 'memory', createdAt: new Date().toISOString(),
+  }, created: true });
+  await Promise.all([firstRejected, secondRejected, stopping]);
+  assert.equal(disposed.count, 1);
+});
+
 test('automatic recall preserves evidence already bounded by retrieval instead of clipping it twice', async t => {
   const { mkdtemp, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { TestEmbeddingProvider } = await import('./helpers.ts');
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-auto-'));
+  const home = join(root, 'home');
+  const { MemoryEngine } = await import('../src/engine.ts');
+  const initialized = await MemoryEngine.initializeProject(root, 'automatic-setup', { home });
+  await initialized.engine.dispose();
   const handlers = new Map<string, Handler>();
   const pi = { on(name: string, handler: Handler) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
-  const runtime = installMemoryHooks(pi, { home: join(root, 'home') });
+  const runtime = installMemoryHooks(pi, { home });
   const ctx = { cwd: root, sessionManager: { getSessionId: () => 'automatic-test' } };
   await handlers.get('session_start')!({}, ctx);
   t.after(async () => { await handlers.get('session_shutdown')!({}, ctx); await rm(root, { recursive: true, force: true }); });

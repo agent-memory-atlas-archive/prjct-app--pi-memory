@@ -66,8 +66,9 @@ test('failed tools and learnable prompts persist for daemon scan without copying
   t.after(() => rm(home, { recursive: true, force: true }));
   const handlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
   const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
-  installMemoryHooks(pi, { home });
+  const runtime = installMemoryHooks(pi, { home });
   await handlers.get('session_start')!({}, ctx(cwd));
+  await runtime.initialize();
   await handlers.get('before_agent_start')!(
     { prompt: 'Always use pnpm in this repo, never npm.', systemPrompt: 'Base' }, ctx(cwd));
   await handlers.get('tool_result')!(
@@ -136,6 +137,7 @@ test('a declared correction is supported and recalled by the next session before
   const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
   const runtime = installMemoryHooks(pi, { home });
   await handlers.get('session_start')!({}, ctx(cwd, 'correction-session'));
+  await runtime.initialize();
   await handlers.get('before_agent_start')!({ prompt: 'Never use npm; use pnpm for this repository.', systemPrompt: 'Base' }, ctx(cwd, 'correction-session'));
   await handlers.get('turn_end')!({}, ctx(cwd, 'correction-session'));
   const first = await runtime.engine();
@@ -161,6 +163,7 @@ test('an explicit recuerda declaration is supported and recalled by the next ses
   const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
   const runtime = installMemoryHooks(pi, { home });
   await handlers.get('session_start')!({}, ctx(cwd, 'remember-session'));
+  await runtime.initialize();
   const declaration = 'Recuerda usar Zod para validar los límites de la API.';
   await handlers.get('before_agent_start')!({ prompt: declaration, systemPrompt: 'Base' }, ctx(cwd, 'remember-session'));
   await handlers.get('turn_end')!({}, ctx(cwd, 'remember-session'));

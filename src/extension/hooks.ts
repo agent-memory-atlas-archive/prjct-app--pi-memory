@@ -10,7 +10,8 @@ import {
   appendSessionObservations, clipSessionSummary, declaredCorrectionQuote, declaredMemoryQuote,
   sessionObservationId, sessionObservationIdentity, sessionObservationWorthy, type SessionObservation,
 } from '../sources/session-log.ts';
-import { sha256 } from '../workspace/project-identity.ts';
+import { memoryHomeFor, sha256 } from '../workspace/project-identity.ts';
+import { resolveMemoryProject } from '../workspace/memory-registry.ts';
 
 export type MemorySession = Readonly<{
   engine?: Promise<MemoryEngine>;
@@ -69,10 +70,42 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     const current = get();
     if (current.engine) return current.engine;
     if (!current.ctx) throw new Error('Memory session has not started.');
-    const pending = MemoryEngine.forProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(),
+    const opening = MemoryEngine.forInitializedProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(),
       options.home === undefined ? {} : { home: options.home });
+    const slot: { pending?: Promise<MemoryEngine> } = {};
+    const pending = opening.catch(error => {
+      if (get().engine === slot.pending) set({ engine: undefined, readable: undefined });
+      throw error;
+    });
+    slot.pending = pending;
     set({ engine: pending });
     return pending;
+  };
+
+  const initialize = async (): ReturnType<typeof MemoryEngine.initializeProject> => {
+    const current = get();
+    if (!current.ctx) throw new Error('Memory session has not started.');
+    if (current.engine) {
+      const opened = await current.engine;
+      if (get().ctx !== current.ctx) throw new Error('Memory session changed during initialization.');
+      const binding = await resolveMemoryProject(current.ctx.cwd, memoryHomeFor(options.home));
+      if (!binding) throw new Error('The open memory authority has no project binding.');
+      return { engine: opened, binding, created: false };
+    }
+    const task = MemoryEngine.initializeProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(),
+      options.home === undefined ? {} : { home: options.home });
+    const pending = task.then(initialized => initialized.engine);
+    void pending.catch(() => undefined);
+    set({ engine: pending, readable: undefined });
+    try {
+      const initialized = await task;
+      if (get().ctx !== current.ctx) throw new Error('Memory session changed during initialization.');
+      set({ engine: Promise.resolve(initialized.engine), readable: Promise.resolve([initialized.engine]) });
+      return initialized;
+    } catch (error) {
+      if (get().engine === pending) set({ engine: undefined, readable: undefined });
+      throw error;
+    }
   };
 
   /** The active project's memory only. Team/shared databases are not readable. */
@@ -247,5 +280,5 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     if (!engines.length && pending) await (await pending).dispose().catch(() => undefined);
   });
 
-  return { engine, readable, search, stagedEvidence: () => get().evidence, currentPrompt: () => get().prompt, handoff };
+  return { engine, initialize, readable, search, stagedEvidence: () => get().evidence, currentPrompt: () => get().prompt, handoff };
 };

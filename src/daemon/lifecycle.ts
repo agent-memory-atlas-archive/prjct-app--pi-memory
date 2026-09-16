@@ -93,7 +93,7 @@ export const startDaemon = async (config: DaemonConfig, argv: readonly string[] 
     ...(config.provider ? ['--provider', config.provider] : []),
     ...(config.model ? ['--model', config.model] : []),
     '--interval-ms', String(config.intervalMs),
-  ], { detached: true, stdio: ['ignore', log.fd, log.fd], env: { ...process.env, PRJCT_HOME: config.home, PI_MEMORY_DAEMON_TOKEN: token } });
+  ], { detached: true, stdio: ['ignore', log.fd, log.fd], env: { ...process.env, PI_MEMORY_HOME: config.home, PI_MEMORY_DAEMON_TOKEN: token } });
   child.unref();
   await log.close();
   const owned = async (): Promise<boolean> => (await readPid(config.home))?.token === token;
