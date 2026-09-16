@@ -88,24 +88,25 @@ analysis/answer provider, download a model, or alter publisher files. It runs th
 same workload against a supplied baseline implementation. Raw files are read
 transiently; reports include selected statements, hashes and measurements, not
 publisher bodies. A larger corpus is tracked documentation plus substantive
-`core/**/*.ts`, not repeated padding. Seven-rule selection is deliberately narrow:
-this is **not proof that all knowledge in the larger corpus is preserved**.
+`core/**/*.ts`, not repeated padding. Seven facts are ingested; oracles query six
+of them plus explicit unanswerables. Capture-gate is ingested but unqueried.
+This is **not proof that all knowledge in the larger corpus is preserved**.
 
 The oracle fixture distinguishes unanswerable O8 from answerable contrary O7.
 `scoreOracle` accepts an unanswerable case only with no items, explicit abstention,
 and an insufficient-evidence reason. Returning unrelated text that lacks a
 forbidden answer is a failure. Storage errors or empty hit arrays alone do not
 pass. Positive recall, candidate precision and reciprocal rank remain substring
-**diagnostics**, never semantic PASS. Semantic answer quality remains BLOCKED
-without authorized providers, models, credentials, private-data permission and
-budget.
+**diagnostics**, never a synthesis PASS. Generated-answer, real-embedding, and
+real-analyzer quality remain unreviewed without authorized providers, models,
+credentials, private-data permission and budget.
 
 ### Measured comparison (development evidence, not independent acceptance)
 
 Pinned project: `4a0db36713d7af7ae78d123df5a303f1d3d954cd`.
 Tiny: 5 files, **68,857 B**. Larger:
 1,031 tracked code/documentation files, **7,381,450 B**. Both implementations
-receive identical source digests and the same seven-rule workload.
+receive identical source digests and the same seven-ingested-rule workload.
 
 | Total bytes, including journal | r16 tiny | r17 tiny | r16 larger | r17 larger |
 | --- | ---: | ---: | ---: | ---: |
@@ -170,6 +171,8 @@ four required phases. The larger source is admitted to indexed mode before its
 first durable mutation and remains a storage win. The same run passed 25/25
 mechanical rows, used zero network/model downloads, returned zero false positives
 for 20 unanswerable routes, and explicitly abstained on O8 in 4/4 routes. Those
-scripted lexical/dense checks are diagnostic only. Semantic answer quality remains
-BLOCKED until a provider, model, private-data permission and budget are explicitly
-authorized.
+scripted lexical/dense checks are diagnostic only. Generated-answer and synthesis
+quality remain unreviewed until a provider, model, private-data permission and
+budget are explicitly authorized. Independent item-level retrieval review of the
+frozen R19 fixture is recorded in the R19 corrected evaluation artifacts, not in
+these historical r16–r18 tables.

@@ -10,8 +10,9 @@ import { installMemoryTools } from '../src/extension/tools.ts';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { scoreOracle, type OracleCase } from '../src/eval/oracles.ts';
 
-// Statements are the seven evidence rules from the independently pinned prjct-cli
-// workload, not a claim of general semantic quality. Other tests cover dense synonyms.
+// Statements are the seven ingested evidence rules from the independently pinned
+// prjct-cli workload. Oracles query six of them; capture-gate is ingested but
+// unqueried. This is not a claim of general semantic quality.
 test('default lookup and automatic recall retain positives/qualified evidence and abstain on unrelated attributes EN/ES', async t => {
   const root = await mkdtemp(join(tmpdir(), 'relevance-'));
   const engine = new MemoryEngine({ root, scopeId: 'p_relevance', sessionId: 'test', provider: {

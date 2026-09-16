@@ -19,7 +19,7 @@ test('oracle mechanics score recall, grounding and completeness without a model'
 });
 
 test('ranking metrics require one independently relevant item and use its actual rank', () => {
-  const kase = { name: 'O7', query: 'primary store?', kind: 'evidence-complete' as const,
+  const kase = { name: 'and-tokens', query: 'primary store?', kind: 'evidence-complete' as const,
     expectedStatements: ['SQLite', 'prjct.db'] };
   assert.deepEqual(rankOracle([{ statement: 'SQLite is used.' }, { statement: 'The store is prjct.db.' }], kase),
     { reciprocalRank: 0, ndcgAtK: 0 });

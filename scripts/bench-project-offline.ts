@@ -39,16 +39,17 @@ const measure = (root: string) => {
   const other = Math.max(0, treeBytes(root) - subtotal);
   return { ...parts, other, total: subtotal + other };
 };
-// Same exact seven evidence rules as the external r16 workload. Additional source
-// files are substantive real code/docs, not repeated padding or manufactured text.
+// Seven hand-authored evidence rules. Oracles query six of them; capture-gate is
+// ingested but unqueried. Additional source files are substantive real code/docs,
+// not repeated padding or manufactured text.
 const rules = [
   ['`prjct gauntlet`', 'gauntlet.ship', 'prjct gauntlet runs the project verify commands and records a receipt bound to git HEAD; ship refuses a red receipt.'],
   ['prjct.db', 'storage.sqlite.per-project', 'prjct stores SQLite state as one DB file per project at ~/.prjct-cli/projects/{id}/prjct.db, not as a shared multi-project database.'],
   ['pre-v1.24.1', 'storage.not-dot-prjct', 'Putting all project state in a local .prjct/ directory was the pre-v1.24.1 model and is not current; SQLite is the source of truth.'],
   ['PRJCT_CLI_HOME', 'storage.prjct-cli-home', 'PRJCT_CLI_HOME relocates the entire global store (DB + config + sync metadata).'],
   ['Linear/Jira', 'cli.no-linear-jira', 'prjct no longer exposes native Linear/Jira CLI gateway commands.'],
-  ['Living context synthesis', 'living-context.fields', 'Living context synthesis is written by the executing model and includes Context synthesis, Key data, Decision/trap, Outcome, and Next implication.'],
-  ['ALWAYS_ACCEPT', 'capture-gate.high-stakes', 'High-stakes types such as decision/learning/fact always pass the capture gate when content is not an exact hash duplicate, unless the source is auto-derived.'],
+  ['Living context synthesis', 'living-context.fields', 'Living context synthesis is written by the executing model and captures Context synthesis, Key data, What happened, Why it mattered, Who/author, Model, Token usage, Sentiment, Related files, Feature/domain, Pattern, Anti-pattern, Decision/trap, Outcome, and Next implication.'],
+  ['ALWAYS_ACCEPT', 'capture-gate.high-stakes', 'High-stakes types such as decision/learning/fact pass the capture gate when content is not an exact hash duplicate and is not refused as empty, junk, or a precision failure, unless the source is auto-derived.'],
 ] as const;
 const tiny = ['README.md', 'docs/architecture.md', 'docs/storage-and-paths.md', 'core/services/living-context-contract.ts', 'core/services/retention/capture-gate.ts'];
 const tracked = execFileSync('git', ['-C', corpus, 'ls-files', '-z']).toString().split('\0')
@@ -150,6 +151,6 @@ for (const [name, files] of [['tiny', tiny], ['large', tracked]] as const) {
     latency: { firstQueryMs: diagnostics[0]?.coldMs, warmP50Ms: timings[Math.floor(timings.length * 0.5)], warmP95Ms: timings[Math.floor(timings.length * 0.95)] }, diagnostics });
 }
 const report = { implementation, corpus, pin: execFileSync('git', ['-C', corpus, 'rev-parse', 'HEAD']).toString().trim(),
-  semantic: 'BLOCKED — deterministic selection of seven rules only; no general synthesis quality claim', reports };
+  semantic: 'SUBSTRING DIAGNOSTICS ONLY — seven ingested rules, six queried; capture-gate untested; synthesis and out-of-fixture quality unreviewed', reports };
 writeFileSync(join(workspace, 'report.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(reports.map(({ diagnostics, ...report }) => ({ ...report, oracleFailures: diagnostics.filter(row => !row.passed).map(row => `${row.name}/${row.route}`) })), null, 2));
