@@ -1,22 +1,28 @@
 import type { MemoryEngine } from '../engine.ts';
 import { prjctHomeFor } from '../workspace/project-identity.ts';
-import { piSessionSource, prjctObservationSource } from './presets.ts';
+import { piSessionSource } from './presets.ts';
+import { prjctObservationSource } from './prjct.ts';
 import type { RecordMapping } from './records.ts';
 import type { AdapterScope, EngineResolver, SourceAdapter, SourceRegistry } from './registry.ts';
 import type { SelectionRules } from './shape.ts';
 
+/** Configuration for the optional prjct compatibility adapter. */
+export type PrjctObservationOptions = Readonly<{
+  /** Override the publisher home without changing pi-memory's own home. */
+  home?: string;
+  select?: SelectionRules;
+  mapping?: Partial<RecordMapping>;
+}>;
+
 /**
- * Everything a caller might want to bend is here rather than in the adapters:
- * where the homes are, what to keep, and how to read a record. Anything left
- * unset falls back to the published directory rule and the conventional field
- * names, so the common case needs no configuration and an unusual publisher
- * needs a mapping instead of a code change.
+ * pi-session is the only first-party source. Other publishers are explicit
+ * adapters: their absence must not alter pi-memory startup or maintenance.
  */
 export type SourceInstallOptions = Readonly<{
   home?: string;
-  observations?: SelectionRules;
-  mappings?: Readonly<{ observations?: Partial<RecordMapping> }>;
-  /** Extra adapters registered alongside the discovered ones. */
+  /** Opt in to records published by prjct; omitted means its observation tree is never scanned. */
+  prjct?: PrjctObservationOptions;
+  /** Extra adapters registered alongside pi-memory's own session source. */
   extra?: readonly SourceAdapter[];
 }>;
 
@@ -24,10 +30,13 @@ export const registerKnownSources = async (registry: SourceRegistry, projectId: 
   options: SourceInstallOptions = {}): Promise<readonly string[]> => {
   const home = prjctHomeFor(options.home);
   const scope: AdapterScope = { kind: 'project', id: projectId };
-  registry.register(prjctObservationSource({ home, scope,
-    ...(options.observations ? { select: options.observations } : {}),
-    ...(options.mappings?.observations ? { mapping: options.mappings.observations } : {}) }));
   registry.register(piSessionSource({ home, scope }));
+  if (options.prjct) registry.register(prjctObservationSource({
+    home: options.prjct.home ?? home,
+    scope,
+    ...(options.prjct.select ? { select: options.prjct.select } : {}),
+    ...(options.prjct.mapping ? { mapping: options.prjct.mapping } : {}),
+  }));
   for (const adapter of options.extra ?? []) registry.register(adapter);
   return registry.list();
 };

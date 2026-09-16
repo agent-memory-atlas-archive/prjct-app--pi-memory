@@ -33,7 +33,7 @@ export const DEFAULT_SYNC_POLICY: Required<SyncPolicy> = {
   enabled: true,
 };
 
-/** Session corrections should become daemon input promptly without making large prjct scans more frequent. */
+/** Session corrections should become daemon input promptly without accelerating optional source scans. */
 export const PI_SESSION_SYNC_POLICY: Required<SyncPolicy> = {
   everyTurns: 8,
   everyTokens: 16_000,

@@ -5,7 +5,7 @@ import { installMemoryHooks } from './extension/hooks.ts';
 import type { HandoffBudget } from './handoff/select.ts';
 import { installMemoryTools } from './extension/tools.ts';
 import { runGc } from './retention/gc.ts';
-import { registerKnownSources, scopedEngines } from './sources/install.ts';
+import { registerKnownSources, scopedEngines, type SourceInstallOptions } from './sources/install.ts';
 import { SourceRegistry, type SourceSyncResult } from './sources/registry.ts';
 import { dueAdapters, PI_SESSION_SYNC_POLICY, type SyncPolicy } from './sources/schedule.ts';
 import { SESSION_ADAPTER_ID } from './sources/session-log.ts';
@@ -17,6 +17,8 @@ export type MemoryExtensionOptions = Readonly<{
   handoff?: HandoffBudget;
   /** Thresholds that make a source due; `{ enabled: false }` turns it off. */
   sync?: SyncPolicy;
+  /** Optional publisher adapters. pi-session remains the only default source. */
+  sources?: Omit<SourceInstallOptions, 'home'>;
 }>;
 
 const USAGE = 'Usage: /memory status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
@@ -48,7 +50,10 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   const sources = async (engine: MemoryEngine): Promise<SourceRegistry> => {
     if (registered.done) return registry;
     registered.done = true;
-    await registerKnownSources(registry, engine.scopeId, options);
+    await registerKnownSources(registry, engine.scopeId, {
+      ...options.sources,
+      ...(options.home === undefined ? {} : { home: options.home }),
+    });
     return registry;
   };
 

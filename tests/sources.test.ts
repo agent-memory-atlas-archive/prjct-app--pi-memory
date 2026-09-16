@@ -7,7 +7,8 @@ import { test } from 'node:test';
 import { MemoryEngine } from '../src/engine.ts';
 import { discoverTeams, teamMailboxRoot } from '../src/sources/discovery.ts';
 import { registerKnownSources, scopedEngines } from '../src/sources/install.ts';
-import { prjctObservationSource, teamArtifactSource, teamJournalSource } from '../src/sources/presets.ts';
+import { teamArtifactSource, teamJournalSource } from '../src/sources/presets.ts';
+import { prjctObservationSource } from '../src/sources/prjct.ts';
 import { JsonRecordAdapter } from '../src/sources/records.ts';
 import { SourceRegistry, type SourceAdapter } from '../src/sources/registry.ts';
 import { firstTimestamp, selects, valuesAt } from '../src/sources/shape.ts';
@@ -178,16 +179,32 @@ test('the registry refuses an adapter whose documents escape its declared scope'
   await assert.rejects(registry.sync(async () => project, 'rogue'), /outside its own scope/);
 });
 
-test('sync routes each adapter to the scope that owns it and is idempotent', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'pi-memory-sync-'));
+test('default source registration does not inspect or ingest prjct records', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-sync-default-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const mailbox = join(root, 'agent-teams');
   await writeObservations(root, 'p_test', [observation('obs_fail', { execution: { toolName: 'bash', outcome: 'failed' } })]);
-  await writeTeam(root, mailbox, 't_demo', 'demo');
 
   const project = await MemoryEngine.forScope('project', 'p_test', 's1', { home: root, provider: new TestEmbeddingProvider() });
+  t.after(() => project.dispose());
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root });
+  assert.deepEqual(registry.list(), ['pi-session']);
+
+  const engines = scopedEngines('s1', project, { home: root });
+  t.after(() => engines.dispose());
+  assert.deepEqual((await registry.syncAll(engines.resolve)).map(r => [r.adapter, r.indexed]), [['pi-session', 0]]);
+  assert.equal(project.curation.stats().fingerprints, 0);
+});
+
+test('the prjct compatibility adapter is explicit and idempotent', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-sync-prjct-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeObservations(root, 'p_test', [observation('obs_fail', { execution: { toolName: 'bash', outcome: 'failed' } })]);
+
+  const project = await MemoryEngine.forScope('project', 'p_test', 's1', { home: root, provider: new TestEmbeddingProvider() });
+  t.after(() => project.dispose());
+  const registry = new SourceRegistry();
+  await registerKnownSources(registry, 'p_test', { home: root, prjct: {} });
   assert.deepEqual(registry.list(), ['pi-session', 'prjct-observations']);
 
   const engines = scopedEngines('s1', project, { home: root });
@@ -196,7 +213,6 @@ test('sync routes each adapter to the scope that owns it and is idempotent', asy
   assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [['pi-session', 0], ['prjct-observations', 1]]);
   const second = await registry.syncAll(engines.resolve);
   assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [['pi-session', 0, 0], ['prjct-observations', 0, 1]]);
-
   assert.equal(project.projection.stats().documents, 0);
   assert.equal(project.curation.stats().fingerprints, 1);
   await assert.rejects(engines.resolve({ kind: 'team', id: 't_demo' }), /not this project's memory/);
@@ -209,7 +225,7 @@ test('an extra adapter can be registered without changing pi-memory', async t =>
     root, mapping: { namespace: 'my.source' } });
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root, extra: [custom] });
-  assert.deepEqual(registry.list(), ['my-source', 'pi-session', 'prjct-observations']);
+  assert.deepEqual(registry.list(), ['my-source', 'pi-session']);
 });
 
 test('the mailbox root follows the Pi agent directory, not PRJCT_HOME', () => {
