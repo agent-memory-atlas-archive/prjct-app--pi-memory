@@ -82,19 +82,38 @@ test('memory commands require explicit initialization and reject empty checkpoin
   const command = commands.get('memory')!.handler;
 
   await command('status', ctx);
-  assert.equal((JSON.parse(notices.at(-1) ?? '{}') as { initialized?: boolean }).initialized, false);
+  assert.match(notices.at(-1) ?? '', /initialized no/u);
+  assert.doesNotMatch(notices.at(-1) ?? '', /"initialized"/u);
   assert.deepEqual(await readdir(home).catch(() => []), []);
   await assert.rejects(() => command('unknown', ctx), /Usage: \/memory init/u);
   assert.deepEqual(await readdir(home).catch(() => []), []);
 
   await command('init', ctx);
-  assert.equal((JSON.parse(notices.at(-1) ?? '{}') as { status?: string }).status, 'initialized');
+  assert.match(notices.at(-1) ?? '', /status initialized/u);
   const entries = await readdir(home);
   const projectId = entries.find(entry => /^p_[0-9a-f]{12}$/u.test(entry));
   assert.ok(projectId);
   assert.ok((await stat(join(home, projectId, 'memory', 'memory.sqlite'))).isFile());
 
   await command('status', ctx);
-  assert.equal((JSON.parse(notices.at(-1) ?? '{}') as { facts?: number }).facts, 0);
+  assert.match(notices.at(-1) ?? '', /facts 0/u);
+
+  await command('sync', ctx);
+  assert.match(notices.at(-1) ?? '', /memory · sync/u);
+  assert.doesNotMatch(notices.at(-1) ?? '', /"discovered"/u);
+
+  const tui = {
+    ...ctx, mode: 'tui', hasUI: true,
+    ui: {
+      notify(message: string) { notices.push(message); },
+      async custom() {
+        throw Object.assign(new Error('Operation aborted'), { name: 'AbortError' });
+      },
+    },
+  };
+  await command('status', tui);
+  assert.match(notices.at(-1) ?? '', /facts 0/u);
+  assert.doesNotMatch(notices.at(-1) ?? '', /Operation aborted/u);
+
   await assert.rejects(() => command('checkpoint {}', ctx), /non-empty goal/u);
 });

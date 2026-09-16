@@ -13,6 +13,9 @@ import { dueAdapters, PI_SESSION_SYNC_POLICY, type SyncPolicy } from './sources/
 import { SESSION_ADAPTER_ID } from './sources/session-log.ts';
 import { memoryDatabasePath, memoryHomeFor, resolveLegacyProject, sha256 } from './workspace/project-identity.ts';
 import { resolveMemoryProject } from './workspace/memory-registry.ts';
+import {
+  errorModel, panelDismissed, presentMemoryPanel, resultModel, sourcesModel, statusModel, syncModel,
+} from './extension/panel.ts';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
@@ -77,6 +80,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   const registry = new SourceRegistry();
   const registered = { done: false };
   const running = { now: false };
+  const lastFault = { message: undefined as string | undefined };
 
   const sources = async (engine: MemoryEngine): Promise<SourceRegistry> => {
     if (registered.done) return registry;
@@ -104,7 +108,11 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     running.now = true;
     const engines = scopedEngines(project.journal.sessionId, project, options.home === undefined ? {} : { home: options.home });
     try {
-      for (const adapter of due) await ready.sync(engines.resolve, adapter, undefined, project.projection).catch(() => undefined);
+      for (const adapter of due) {
+        await ready.sync(engines.resolve, adapter, undefined, project.projection).catch(error => {
+          lastFault.message = error instanceof Error ? error.message : String(error);
+        });
+      }
     } finally {
       await engines.dispose().catch(() => undefined);
       running.now = false;
@@ -131,6 +139,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     description: 'Initialize, inspect or maintain pi-memory: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
     getArgumentCompletions: prefix => argumentCompletions(prefix, adapterIds),
     handler: async (args, ctx) => {
+      const show = (model: Parameters<typeof presentMemoryPanel>[1]): Promise<void> => presentMemoryPanel(ctx, model);
       try {
       const [action = 'status', target] = args.trim().split(/\s+/).filter(Boolean);
       if (!ACTIONS.has(action)) throw new Error(USAGE);
@@ -138,49 +147,58 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
       if (action === 'init') {
         if (target) throw new Error('Usage: /memory init');
         const initialized = await runtime.initialize();
-        ctx.ui.notify(JSON.stringify({
-          initialized: true, ready: true, status: initialized.created ? 'initialized' : 'already_initialized',
-          projectId: initialized.binding.projectId, checkoutId: initialized.binding.checkoutId,
-          location: initialized.binding.location, home, adoptedFrom: initialized.binding.source,
-        }, null, 2), 'info');
+        await show(resultModel('memory · init', [
+          `status ${initialized.created ? 'initialized' : 'already initialized'}`,
+          `project ${initialized.binding.projectId}`,
+          `checkout ${initialized.binding.checkoutId}`,
+          `source ${initialized.binding.source}`,
+          `location ${initialized.binding.location}`,
+        ]));
         return;
       }
       if (action === 'status') {
         const binding = await resolveMemoryProject(ctx.cwd, home);
         if (!binding) {
           const legacy = await resolveLegacyProject(ctx.cwd, home);
-          ctx.ui.notify(JSON.stringify({ initialized: false, ready: false, home,
-            legacyAvailable: Boolean(legacy), message: 'Run /memory init to create or adopt this project memory.' }, null, 2), 'info');
+          await show(resultModel('memory · status', [
+            'initialized no', 'ready no', `legacy ${legacy ? 'available' : 'none'}`, 'run /memory init',
+          ]));
           return;
         }
         if (!existsSync(memoryDatabasePath(home, binding.projectId))) {
-          ctx.ui.notify(JSON.stringify({ initialized: true, ready: false, home, projectId: binding.projectId,
-            message: 'Initialization is incomplete. Run /memory init to repair this project memory.' }, null, 2), 'info');
+          await show(resultModel('memory · status', [
+            'initialized yes', 'ready no', `project ${binding.projectId}`, 'run /memory init to repair',
+          ]));
           return;
         }
-        const engine = await runtime.engine();
-        ctx.ui.notify(JSON.stringify({ initialized: true, ready: true, projectId: binding.projectId,
-          ...engine.projection.stats(), curation: engine.curation.stats() }, null, 2), 'info');
+        const opened = await runtime.engine();
+        await show(statusModel({
+          scope: `${opened.scopeKind}/${opened.scopeId}`, stats: opened.projection.stats(), curation: opened.curation.stats(),
+          ...(lastFault.message ? { error: lastFault.message } : {}),
+        }));
         return;
       }
       const engine = await runtime.engine();
+      const scope = `${engine.scopeKind}/${engine.scopeId}`;
       if (action === 'sources') {
         const ready = await sources(engine);
-        ctx.ui.notify(JSON.stringify({
-          scope: `${engine.scopeKind}/${engine.scopeId}`,
-          activity: engine.projection.activity(),
-          curation: engine.curation.stats(),
-          adapters: dueAdapters(engine.projection, ready.list(), options.sync ?? {}).map(decision => ({
-            ...decision, last: engine.projection.syncState(decision.adapter) ?? null,
+        await show(sourcesModel({
+          scope,
+          adapters: ready.list().map(adapter => ({
+            ...dueAdapters(engine.projection, [adapter], adapter === SESSION_ADAPTER_ID
+              ? { ...PI_SESSION_SYNC_POLICY, enabled: options.sync?.enabled ?? true }
+              : options.sync ?? {})[0]!,
+            last: engine.projection.syncState(adapter) ?? null,
           })),
-        }, null, 2), 'info');
+          ...(lastFault.message ? { error: lastFault.message } : {}),
+        }));
         return;
       }
       if (action === 'sync') {
         const registryReady = await sources(engine);
         if (target && !registryReady.get(target)) throw new Error(`Unknown source adapter: ${target}. Try /memory sources.`);
         const results = await syncSources(registryReady, ctx.sessionManager.getSessionId(), engine, target, options);
-        ctx.ui.notify(JSON.stringify(results, null, 2), 'info');
+        await show(syncModel(results, lastFault.message));
         return;
       }
       if (action === 'index') {
@@ -199,11 +217,13 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
           kind: typeof row.kind === 'string' ? row.kind : 'document', ...(typeof row.title === 'string' ? { title: row.title } : {}),
           text: row.text, ...(typeof row.uri === 'string' ? { uri: row.uri } : {}), version: sha256(row.text), contentHash: sha256(row.text),
           observedAt: new Date().toISOString(), trust: 'user', metadata });
-        ctx.ui.notify(JSON.stringify(indexed, null, 2), 'info');
+        await show(resultModel('memory · index', [`chunks ${indexed.chunks}`, `dense ${String(indexed.dense)}`]));
         return;
       }
       if (action === 'migrate-curated') {
-        ctx.ui.notify(JSON.stringify(await checkpointAndEnqueueLegacy(engine), null, 2), 'info');
+        const migrated = await checkpointAndEnqueueLegacy(engine);
+        await show(resultModel('memory · migrate', Object.entries(migrated).filter(([, value]) =>
+          value === null || ['string', 'number', 'boolean'].includes(typeof value)).slice(0, 8).map(([key, value]) => `${key} ${String(value)}`)));
         return;
       }
       if (action === 'checkpoint') {
@@ -216,7 +236,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
         }
         const saved = await runtime.handoff.persist(engine, ctx.sessionManager.getSessionId(),
           parsed as Parameters<typeof runtime.handoff.persist>[2]);
-        ctx.ui.notify(JSON.stringify(saved, null, 2), 'info');
+        await show(resultModel('memory · checkpoint', [`ok ${String(Boolean(saved))}`]));
         return;
       }
       const report = action === 'replay' ? await engine.replay(false)
@@ -224,11 +244,16 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
         : action === 'gc' ? await runGc(engine)
         : action === 'checkpoint-wal' ? engine.projection.checkpointWal()
         : undefined;
-      if (!report) throw new Error(USAGE);
-      ctx.ui.notify(JSON.stringify(report, null, 2), 'info');
+      if (report === undefined) throw new Error(USAGE);
+      await show(resultModel(`memory · ${action}`, typeof report === 'object' && report
+        ? Object.entries(report).filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+          .slice(0, 8).map(([key, value]) => `${key} ${String(value)}`)
+        : [String(report)]));
       } catch (error) {
+        if (panelDismissed(error)) return;
         const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(message, 'error');
+        if (!message.startsWith('Usage:')) lastFault.message = message;
+        await presentMemoryPanel(ctx, errorModel(message)).catch(() => undefined);
         throw error;
       }
     },
