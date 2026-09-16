@@ -67,6 +67,12 @@ progress narration, secrets, or generic summaries.
 /memory migrate-curated  # checkpoint raw journal/projection and enqueue legacy documents
 ```
 
+Interactive Pi shows a framed overlay (esc/enter to close) for every `/memory`
+action. If the overlay is dismissed, the same card is notified — never a JSON
+dump, never "Operation aborted". RPC and other non-TUI hosts use notify only.
+`/memory sync` states scanned / new / queued rather than adapter payloads. The
+last durable source error stays on `/memory status` until a later command succeeds.
+
 Daemon (separate process, never started by the extension):
 
 ```sh

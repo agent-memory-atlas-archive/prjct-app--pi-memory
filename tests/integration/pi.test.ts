@@ -47,13 +47,13 @@ test('Pi keeps status read-only until explicit /memory init and then reopens the
   const status = await send('status-before', '/memory status');
   assert.equal(status.success, true);
   const before = noticesAfter(0);
-  assert.ok(before.messages.some(message => (JSON.parse(message) as { initialized?: boolean }).initialized === false));
+  assert.ok(before.messages.some(message => message.includes('initialized no')));
   assert.deepEqual(await readdir(home).catch(() => []), [], 'read-only status must not create the home or authority');
 
   const initialized = await send('init', '/memory init');
   assert.equal(initialized.success, true);
   const afterInit = noticesAfter(before.next);
-  assert.ok(afterInit.messages.some(message => (JSON.parse(message) as { status?: string }).status === 'initialized'));
+  assert.ok(afterInit.messages.some(message => message.includes('status initialized')));
   const scopes = await readdir(home);
   const projectId = scopes.find(entry => /^p_[0-9a-f]{12}$/u.test(entry));
   assert.ok(projectId);
@@ -63,7 +63,7 @@ test('Pi keeps status read-only until explicit /memory init and then reopens the
   const reopened = await send('status-after', '/memory status');
   assert.equal(reopened.success, true);
   const afterStatus = noticesAfter(afterInit.next);
-  assert.ok(afterStatus.messages.some(message => (JSON.parse(message) as { facts?: number }).facts === 0));
+  assert.ok(afterStatus.messages.some(message => message.includes('memory · status') && message.includes('facts 0')));
 
   child.stdin.end();
   const exit = await new Promise<number | null>(resolveExit => child.on('exit', resolveExit));
