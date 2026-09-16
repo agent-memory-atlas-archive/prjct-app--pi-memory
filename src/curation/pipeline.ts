@@ -253,6 +253,7 @@ export const processJob = async (engine: MemoryEngine, adapters: ReadonlyMap<str
       store.fail(job.id, owner, 'stale', 'stale', Date.now(), false, Date.now());
       return { ...empty, outcome: 'stale', modelCalls: 1, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens };
     }
+    store.renew(job.id, owner, leaseMs, Date.now());
     if (!stillHeld(store.getJob(job.id), owner, Date.now())) {
       return { ...empty, outcome: 'stale', modelCalls: 1, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens };
     }

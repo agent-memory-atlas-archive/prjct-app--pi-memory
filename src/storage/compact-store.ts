@@ -786,7 +786,7 @@ export class CompactCuration {
   renew(id: string, owner: string, leaseMs: number, now = Date.now()): boolean {
     return this.store.transaction(() => {
       const job = this.state.jobs[id];
-      if (!job || job.leaseOwner !== owner || job.status !== 'claimed' || (job.leaseUntil ?? 0) <= now) return false;
+      if (!job || job.leaseOwner !== owner || job.status !== 'claimed') return false;
       this.state.jobs[id] = { ...job, leaseUntil: now + Math.max(1, leaseMs), updatedAt: now };
       return true;
     });

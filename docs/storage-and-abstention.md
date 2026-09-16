@@ -88,8 +88,7 @@ analysis/answer provider, download a model, or alter publisher files. It runs th
 same workload against a supplied baseline implementation. Raw files are read
 transiently; reports include selected statements, hashes and measurements, not
 publisher bodies. A larger corpus is tracked documentation plus substantive
-`core/**/*.ts`, not repeated padding. Seven facts are ingested; oracles query six
-of them plus explicit unanswerables. Capture-gate is ingested but unqueried.
+`core/**/*.ts`, not repeated padding. Seven facts are ingested; oracles query all seven plus explicit unanswerables.
 This is **not proof that all knowledge in the larger corpus is preserved**.
 
 The oracle fixture distinguishes unanswerable O8 from answerable contrary O7.

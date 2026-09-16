@@ -178,6 +178,13 @@ test('valid analysis slower than lease but within deadline can complete', async 
   assert.ok(f.engine.projection.stats().facts > 0, 'legitimate analysis only expires/retries; lease is never renewed while awaiting');
 });
 
+test('living owner can renew after the lease clock lapses', async t => {
+  const f = await fixture(t, 'renew-after-expiry');
+  const job = f.engine.curation.claim('owner', 1, 0)!;
+  assert.equal(f.engine.curation.renew(job.id, 'owner', 60_000, Date.now()), true);
+  assert.equal(f.engine.curation.renew(job.id, 'other', 60_000, Date.now()), false);
+});
+
 test('commit gate must fence the asynchronous journal append, not only staging', async t => {
   const { processJob } = await import('../src/curation/pipeline.ts');
   const f = await fixture(t, 'append-race');

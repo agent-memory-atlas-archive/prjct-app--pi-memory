@@ -373,8 +373,10 @@ export class CurationStore {
 
   renew(id: string, owner: string, leaseMs: number, now = Date.now()): boolean {
     const until = now + Math.max(1, leaseMs);
-    const result = this.stmt(`UPDATE jobs SET lease_until=?, updated_at=? WHERE id=? AND lease_owner=? AND status='claimed' AND lease_until > ?`)
-      .run(until, now, id, owner, now);
+    // The living owner may refresh after the clock lapses. A delayed heartbeat
+    // must not lose the job to expiry while this worker still holds claimed.
+    const result = this.stmt(`UPDATE jobs SET lease_until=?, updated_at=? WHERE id=? AND lease_owner=? AND status='claimed'`)
+      .run(until, now, id, owner);
     return Number(result.changes) === 1;
   }
 

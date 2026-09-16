@@ -6,6 +6,7 @@
   {"name":"O5","query":"Does prjct still expose native Linear or Jira CLI gateway commands?","kind":"evidence-complete","expectedStatements":["no longer"]},
   {"name":"O6","query":"Does prjct keep all project data in a local .prjct directory?","kind":"evidence-complete","expectedStatements":["pre-v1.24.1"]},
   {"name":"O7","query":"Does prjct-cli use MongoDB as the primary store?","kind":"evidence-complete","expectedStatements":["SQLite"]},
+  {"name":"O9","query":"When do high-stakes types such as decision, learning, or fact pass the capture gate?","kind":"evidence-complete","expectedStatements":["junk","precision","auto-derived"]},
   {"name":"O8","query":"¿Cuál es el AWS account id de producción de prjct-cli?","kind":"unanswerable","expectedStatements":[]},
   {"name":"N1","query":"What is the production AWS account number for prjct-cli?","kind":"unanswerable","expectedStatements":[]},
   {"name":"N2","query":"¿Cuál es la contraseña de Kubernetes de producción?","kind":"unanswerable","expectedStatements":[]},

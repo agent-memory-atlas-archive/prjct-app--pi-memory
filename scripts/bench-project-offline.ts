@@ -39,9 +39,9 @@ const measure = (root: string) => {
   const other = Math.max(0, treeBytes(root) - subtotal);
   return { ...parts, other, total: subtotal + other };
 };
-// Seven hand-authored evidence rules. Oracles query six of them; capture-gate is
-// ingested but unqueried. Additional source files are substantive real code/docs,
-// not repeated padding or manufactured text.
+// Seven hand-authored evidence rules. Oracles query all seven plus explicit
+// unanswerables. Additional source files are substantive real code/docs, not
+// repeated padding or manufactured text.
 const rules = [
   ['`prjct gauntlet`', 'gauntlet.ship', 'prjct gauntlet runs the project verify commands and records a receipt bound to git HEAD; ship refuses a red receipt.'],
   ['prjct.db', 'storage.sqlite.per-project', 'prjct stores SQLite state as one DB file per project at ~/.prjct-cli/projects/{id}/prjct.db, not as a shared multi-project database.'],
@@ -151,6 +151,6 @@ for (const [name, files] of [['tiny', tiny], ['large', tracked]] as const) {
     latency: { firstQueryMs: diagnostics[0]?.coldMs, warmP50Ms: timings[Math.floor(timings.length * 0.5)], warmP95Ms: timings[Math.floor(timings.length * 0.95)] }, diagnostics });
 }
 const report = { implementation, corpus, pin: execFileSync('git', ['-C', corpus, 'rev-parse', 'HEAD']).toString().trim(),
-  semantic: 'SUBSTRING DIAGNOSTICS ONLY — seven ingested rules, six queried; capture-gate untested; synthesis and out-of-fixture quality unreviewed', reports };
+  semantic: 'SUBSTRING DIAGNOSTICS ONLY — seven ingested rules, seven queried; synthesis and out-of-fixture quality unreviewed', reports };
 writeFileSync(join(workspace, 'report.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(reports.map(({ diagnostics, ...report }) => ({ ...report, oracleFailures: diagnostics.filter(row => !row.passed).map(row => `${row.name}/${row.route}`) })), null, 2));
