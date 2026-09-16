@@ -29,5 +29,9 @@ test('busy_timeout is set before schema statements', async t => {
   const timeout = db.prepare('PRAGMA busy_timeout').get() as { busy_timeout?: number } | undefined;
   assert.equal(Number(timeout?.busy_timeout ?? Object.values(timeout ?? {})[0]), 5000);
   migrate(db);
+  assert.equal(Number(Object.values(db.prepare('PRAGMA page_size').get() ?? {})[0]), 4096);
+  assert.equal(Number(Object.values(db.prepare('PRAGMA auto_vacuum').get() ?? {})[0]), 2);
+  const fts = db.prepare("SELECT sql FROM sqlite_schema WHERE name='chunks_fts'").get() as { sql: string };
+  assert.match(fts.sql, /contentless_delete=1/u);
   db.close();
 });

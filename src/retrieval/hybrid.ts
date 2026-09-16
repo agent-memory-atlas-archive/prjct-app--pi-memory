@@ -153,7 +153,7 @@ export const candidatesFromScores = (
   asOf: number,
   priors = true,
 ): RankedCandidate[] => {
-  const chunks = projection.chunks([...scores.keys()]);
+  const chunks = projection.retrievalChunks([...scores.keys()]);
   return chunks.flatMap(chunk => {
     const document = chunk.document;
     if (document.scopeId !== request.scopeId) return [];
@@ -271,7 +271,7 @@ export const hybridSearch = async (projection: ProjectionPort, vector: VectorInd
   const statistics = projection.lexicalStatistics(relevanceTerms(queries));
   legs.queries.forEach((query, index) => {
     const ids = [...new Set([...legs.exact[index] ?? [], ...legs.lexical[index] ?? [], ...legs.dense[index] ?? []].map(hit => hit.chunkId))];
-    const chunks = projection.chunks(ids);
+    const chunks = projection.retrievalChunks(ids);
     const accepted = new Set(relevantKeys(query, chunks.map(chunk => ({ key: chunk.id,
       text: `${chunk.document.title ?? ''}\n${chunk.text}` })), statistics,
     new Map((legs.dense[index] ?? []).map(hit => [hit.chunkId, hit.similarity]))));

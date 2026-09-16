@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -63,8 +63,8 @@ const proseFor = (index: number): string => {
 
 const root = await mkdtemp(join(tmpdir(), 'pi-memory-bench-'));
 const provider = new BenchEmbeddingProvider();
-const engine = new MemoryEngine({ root, scopeId: 'p_bench', sessionId: 'bench', provider });
-const path = join(root, 'index.sqlite');
+const engine = new MemoryEngine({ root, scopeId: 'p_bench', sessionId: 'bench', provider, storage: 'indexed' });
+const path = join(root, 'memory.sqlite');
 try {
   const documents = Array.from({ length: count }, (_, index) => {
     const text = proseFor(index);
@@ -118,7 +118,16 @@ try {
   // Fold the WAL back into the main file first: otherwise this measures write
   // churn that has not been checkpointed yet, not the resting footprint.
   engine.projection.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-  const bytes = (await stat(path)).size + (await stat(`${path}-wal`).catch(() => ({ size: 0 }))).size;
+  const liveBytes = (await stat(path)).size + (await stat(`${path}-wal`).catch(() => ({ size: 0 }))).size
+    + (await stat(`${path}-shm`).catch(() => ({ size: 0 }))).size;
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  const measured = await Promise.all(entries.filter(entry => entry.isFile()).map(async entry => ({
+    name: entry.name, bytes: (await stat(join(entry.parentPath, entry.name))).size,
+  })));
+  const backupBytes = measured.filter(entry => /pre-v\d+.*\.sqlite$/u.test(entry.name)).reduce((sum, entry) => sum + entry.bytes, 0);
+  const temporaryBytes = measured.filter(entry => /\.tmp$/u.test(entry.name)).reduce((sum, entry) => sum + entry.bytes, 0);
+  if (liveBytes <= 0) throw new Error(`Benchmark did not create the indexed database at ${path}.`);
+  const bytes = liveBytes;
   const bytesPerChunk = bytes / Math.max(1, chunkTotal);
   const knnP95 = percentile(knn, 0.95);
   const report = {
@@ -130,7 +139,7 @@ try {
     knn: { p50Ms: Number(percentile(knn, 0.5).toFixed(2)), p95Ms: Number(knnP95.toFixed(2)) },
     endToEnd: { samples: endToEnd.length, p50Ms: Number(percentile(endToEnd, 0.5).toFixed(2)),
       p95Ms: Number(percentile(endToEnd, 0.95).toFixed(2)) },
-    bytes, bytesPerChunk: Number(bytesPerChunk.toFixed(1)),
+    bytes, storage: { liveBytes, backupBytes, temporaryBytes }, bytesPerChunk: Number(bytesPerChunk.toFixed(1)),
     // Calibrated on this corpus at 5k documents / 10k chunks: ~7.2 KB per chunk
     // resting (the FTS vocabulary of a realistic long tail is most of it), KNN
     // p95 ~0.6 ms, whole query ~14 ms. endToEnd is dominated by FTS5 bm25

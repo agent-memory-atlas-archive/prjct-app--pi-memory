@@ -209,8 +209,12 @@ const replaceChunks = (state: State, key: string, document: SourceDocument): voi
 };
 const upsertDocument = (state: State, document: SourceDocument): void => {
   const key = documentKey(document);
+  const generated = document.text.trim() ? chunkDocument(document) : [];
+  const current = Object.values(state.chunks).filter(chunk => chunk.documentKey === key).sort((left, right) => left.ordinal - right.ordinal);
+  const sameChunks = current.length === generated.length && current.every((chunk, index) => chunk.id === generated[index]?.id
+    && JSON.stringify(chunk.metadata) === JSON.stringify(generated[index]?.metadata ?? {}));
   state.documents[key] = { document, deletedAt: null };
-  replaceChunks(state, key, document);
+  if (!sameChunks) replaceChunks(state, key, document);
 };
 const deleteDocumentKey = (state: State, key: string, at: string): void => {
   for (const id of Object.keys(state.chunks)) if (state.chunks[id]!.documentKey === key) dropChunk(state, id);
@@ -328,6 +332,8 @@ export class CompactProjection {
     };
   }
 
+  getFacts(ids: readonly string[]): StoredFact[] { return ids.flatMap(id => this.getFact(id) ?? []); }
+
   activeFacts(scopeId: string, limit = 1_000): StoredFact[] {
     return Object.values(this.state.facts)
       .filter(fact => fact.scopeId === scopeId && ['supported', 'needs_review', 'candidate'].includes(fact.standing))
@@ -381,9 +387,22 @@ export class CompactProjection {
     });
   }
 
-  chunkCount(document: Pick<SourceDocument, 'namespace' | 'externalId'>): number {
+  chunksMatch(document: Pick<SourceDocument, 'namespace' | 'externalId'>, chunks: readonly DocumentChunk[], title?: string): boolean {
+    const current = Object.values(this.state.chunks).filter(chunk => chunk.documentKey === documentKey(document))
+      .sort((left, right) => left.ordinal - right.ordinal);
+    const storedTitle = this.state.documents[documentKey(document)]?.document.title;
+    return storedTitle === title && current.length === chunks.length && current.every((chunk, index) => chunk.id === chunks[index]?.id
+      && JSON.stringify(chunk.metadata) === JSON.stringify(chunks[index]?.metadata ?? {}));
+  }
+
+  chunkIds(document: Pick<SourceDocument, 'namespace' | 'externalId'>): string[] {
     const key = documentKey(document);
-    return Object.values(this.state.chunks).filter(chunk => chunk.documentKey === key).length;
+    return Object.values(this.state.chunks).filter(chunk => chunk.documentKey === key)
+      .sort((left, right) => left.ordinal - right.ordinal).map(chunk => chunk.id);
+  }
+
+  chunkCount(document: Pick<SourceDocument, 'namespace' | 'externalId'>): number {
+    return this.chunkIds(document).length;
   }
 
   chunks(ids: readonly string[]): Array<DocumentChunk & { document: SourceDocument }> {
@@ -395,12 +414,18 @@ export class CompactProjection {
     });
   }
 
+  retrievalChunks(ids: readonly string[]): Array<DocumentChunk & { document: SourceDocument }> {
+    return this.chunks(ids).map(chunk => ({ ...chunk, document: { ...chunk.document, text: '' } }));
+  }
+
   *eachDocumentHash(batch = 1_000): Generator<{ documentKey: string; contentHash: string; adapter?: string; revision?: string }> {
     for (const document of this.eachActiveDocument(batch)) {
       yield { documentKey: documentKey(document), contentHash: document.contentHash,
         ...(document.sync?.adapter ? { adapter: document.sync.adapter, revision: document.sync.revision } : {}) };
     }
   }
+
+  hasVector(chunkId: string, model: string): boolean { return this.state.vectors[chunkId]?.model === model; }
 
   /** Derived, never authority: vectors follow their chunk's lifetime. */
   storeVectors(rows: readonly { chunkId: string; vector: readonly number[] }[], model: string): void {

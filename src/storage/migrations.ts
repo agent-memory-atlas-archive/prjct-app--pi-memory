@@ -1,9 +1,9 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const prepareConnection = (db: DatabaseSync): void => {
-  db.exec('PRAGMA busy_timeout=5000');
+  db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=8388608');
 };
 
 export const schemaIsCurrent = (db: DatabaseSync): boolean => {
@@ -21,8 +21,10 @@ export const schemaIsCurrent = (db: DatabaseSync): boolean => {
 };
 
 const readVersion = (db: DatabaseSync): number => {
-  db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
-  const row = db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value?: unknown } | undefined;
+  const row = (() => {
+    try { return db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value?: unknown } | undefined; }
+    catch { return undefined; }
+  })();
   const version = Number(row?.value ?? 0);
   if (!Number.isSafeInteger(version) || version < 0 || version > SCHEMA_VERSION) throw new Error(`Unsupported memory projection schema: ${row?.value}`);
   return version;
@@ -57,18 +59,16 @@ export const migrate = (db: DatabaseSync, options: { preserveCompactPragmas?: bo
     db.exec('PRAGMA foreign_keys=ON');
     return;
   }
-  readVersion(db);
+  const version = readVersion(db);
+  if (version === 0 && !options.preserveCompactPragmas) db.exec('PRAGMA page_size=4096; PRAGMA auto_vacuum=INCREMENTAL');
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
+  db.exec('BEGIN IMMEDIATE');
+  try {
   db.exec(`
-    PRAGMA journal_mode=WAL;
-    PRAGMA synchronous=FULL;
     CREATE TABLE IF NOT EXISTS memory_owner (
       project_id TEXT NOT NULL UNIQUE,
       claimed_at INTEGER NOT NULL
     );
-    PRAGMA foreign_keys=ON;
-    PRAGMA busy_timeout=5000;
-    ${options.preserveCompactPragmas ? '' : 'PRAGMA auto_vacuum=INCREMENTAL;'}
-
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS applied_events (
       id TEXT PRIMARY KEY,
@@ -116,7 +116,7 @@ export const migrate = (db: DatabaseSync, options: { preserveCompactPragmas?: bo
     CREATE INDEX IF NOT EXISTS ix_chunks_document ON chunks(document_key, ordinal);
     CREATE INDEX IF NOT EXISTS ix_chunks_namespace ON chunks(namespace);
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-      chunk_id UNINDEXED, title, text, metadata,
+      title, text, metadata, content='', contentless_delete=1,
       tokenize='unicode61 remove_diacritics 2', prefix='2 3 4'
     );
     -- Per-term document frequency, read straight off the existing FTS index.
@@ -260,11 +260,29 @@ export const migrate = (db: DatabaseSync, options: { preserveCompactPragmas?: bo
       detail TEXT
     );
   `);
-  db.exec('BEGIN IMMEDIATE');
-  try {
     const documentColumns = db.prepare('PRAGMA table_info(documents)').all();
     if (!documentColumns.some(column => column.name === 'source_adapter')) db.exec('ALTER TABLE documents ADD COLUMN source_adapter TEXT;');
     if (!documentColumns.some(column => column.name === 'source_revision')) db.exec('ALTER TABLE documents ADD COLUMN source_revision TEXT;');
+    if (version > 0 && version < 5) {
+      db.exec(`
+        DROP TABLE IF EXISTS chunks_fts_vocab;
+        DROP TABLE IF EXISTS chunks_fts;
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+          title, text, metadata, content='', contentless_delete=1,
+          tokenize='unicode61 remove_diacritics 2', prefix='2 3 4'
+        );
+        INSERT INTO chunks_fts(rowid,title,text,metadata)
+          SELECT c.rowid,coalesce(c.title,''),c.text,
+            coalesce((SELECT group_concat(value,' ') FROM json_each(c.metadata)),'') FROM chunks c;
+        CREATE VIRTUAL TABLE chunks_fts_vocab USING fts5vocab(chunks_fts, 'row');
+      `);
+    }
+    db.exec(`
+      DROP INDEX IF EXISTS ix_chunks_document;
+      CREATE INDEX IF NOT EXISTS ix_fact_entities_entity ON fact_entities(entity_id, fact_id);
+      CREATE INDEX IF NOT EXISTS ix_documents_source_adapter ON documents(source_adapter) WHERE deleted_at IS NULL;
+    `);
+    db.prepare("INSERT INTO meta(key,value) VALUES ('lexical_generation','0') ON CONFLICT(key) DO NOTHING").run();
     db.prepare("INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(SCHEMA_VERSION));
     db.exec('COMMIT');
   } catch (error) {

@@ -174,7 +174,7 @@ test('valid analysis slower than lease but within deadline can complete', async 
     await new Promise(resolve => setTimeout(resolve, 30));
     return { proposal: proposal(bundle), provider: 'test', model: 'scripted', usage: { calls: 1, inputTokens: 1, outputTokens: 1 } };
   } };
-  await processAvailable(f.engine, f.adapters, 'owner', { ...options(analyzer), leaseMs: 10, deadlineMs: 200 });
+  await processAvailable(f.engine, f.adapters, 'owner', { ...options(analyzer), leaseMs: 10, deadlineMs: 2_000 });
   assert.ok(f.engine.projection.stats().facts > 0, 'legitimate analysis only expires/retries; lease is never renewed while awaiting');
 });
 

@@ -50,14 +50,18 @@ export class SqliteVectorIndex implements VectorIndex {
     const existing = this.projection.documentByKey(document);
     if (!existing || !isDeepStrictEqual(existing, document)) this.projection.upsertDocument(document);
     const chunks = chunkDocument(document, this.chunkOptions);
-    // The lexical index is committed before optional model work. If the local
-    // model cannot be downloaded or a remote provider is unavailable, recall
-    // remains useful and a later backfill can complete the dense leg.
-    this.projection.replaceChunks(documentKey(document), chunks, document.title);
-    const vectors = await this.provider.embed(chunks.map(chunk => chunk.text), { signal, inputType: 'passage' })
+    // Preserve lexical rows and vectors when deterministic chunks and their
+    // indexed metadata are unchanged. This avoids write amplification on
+    // repeated source scans while still backfilling a previously failed model.
+    if (!this.projection.chunksMatch(document, chunks, document.title)) {
+      this.projection.replaceChunks(documentKey(document), chunks, document.title);
+    }
+    const missing = chunks.filter(chunk => !this.projection.hasVector(chunk.id, this.provider.model));
+    if (!missing.length) return { chunks: chunks.length, embedded: 0 };
+    const vectors = await this.provider.embed(missing.map(chunk => chunk.text), { signal, inputType: 'passage' })
       .catch(error => { throw new EmbeddingUnavailableError(error); });
-    if (vectors.length !== chunks.length) throw new EmbeddingUnavailableError('Provider returned an incomplete batch.');
-    this.projection.storeVectors(chunks.map((chunk, index) => ({ chunkId: chunk.id, vector: vectors[index]! })), this.provider.model);
+    if (vectors.length !== missing.length) throw new EmbeddingUnavailableError('Provider returned an incomplete batch.');
+    this.projection.storeVectors(missing.map((chunk, index) => ({ chunkId: chunk.id, vector: vectors[index]! })), this.provider.model);
     return { chunks: chunks.length, embedded: vectors.length };
   }
 
@@ -74,10 +78,16 @@ export class SqliteVectorIndex implements VectorIndex {
         if (!existing || !isDeepStrictEqual(existing, document)) this.projection.upsertDocument(document);
       }
     });
-    const chunks = documents.flatMap(document => chunkDocument(document, this.chunkOptions));
+    const chunkLists = documents.map(document => chunkDocument(document, this.chunkOptions));
+    const chunks = chunkLists.flat();
+    const changed = chunkLists.filter((list, index) => {
+      const document = documents[index]!;
+      return !this.projection.chunksMatch(document, list, document.title);
+    }).flat();
     const titles = new Map(documents.flatMap(document => document.title ? [[documentKey(document), document.title] as const] : []));
-    this.projection.replaceChunksBatch(chunks, titles);
-    const batches = Array.from({ length: Math.ceil(chunks.length / 64) }, (_, index) => chunks.slice(index * 64, (index + 1) * 64));
+    if (changed.length) this.projection.replaceChunksBatch(changed, titles);
+    const missing = chunks.filter(chunk => !this.projection.hasVector(chunk.id, this.provider.model));
+    const batches = Array.from({ length: Math.ceil(missing.length / 64) }, (_, index) => missing.slice(index * 64, (index + 1) * 64));
     const progress = { embedded: 0 };
     for (const batch of batches) {
       signal?.throwIfAborted();
@@ -99,7 +109,7 @@ export class SqliteVectorIndex implements VectorIndex {
     const [vector] = await this.provider.embed([query.text], { signal: query.signal, inputType: 'query' });
     if (!vector) return [];
     const hits = this.projection.vectorSearch(this.provider.model, vector.length, vector, limit);
-    const chunks = new Map(this.projection.chunks(hits.map(hit => hit.chunkId)).map(chunk => [chunk.id, chunk]));
+    const chunks = new Map(this.projection.retrievalChunks(hits.map(hit => hit.chunkId)).map(chunk => [chunk.id, chunk]));
     return hits.flatMap(hit => {
       const chunk = chunks.get(hit.chunkId);
       return chunk ? [{ ...hit, text: chunk.text, namespace: chunk.namespace, source: chunk.document.source,

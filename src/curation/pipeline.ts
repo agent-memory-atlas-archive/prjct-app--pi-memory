@@ -74,41 +74,45 @@ export const enqueueSnapshot = (engine: MemoryEngine, adapter: SourceAdapter, sn
     throw new Error(`Source adapter ${adapter.id} is not owned by project ${engine.scopeId}.`);
   }
   const store = engine.curation;
-  return store.transaction(() => {
-    const known = new Map(store.adapterFingerprints(adapter.id).map(item => [item.documentKey, item]));
-    const seen = new Set<string>();
-    const totals = { changed: 0, unchanged: 0, queued: 0 };
-    for (const document of prepared) {
-      const identity = identityFromDocument(adapter.id, document);
-      seen.add(identity.documentKey);
-      const previous = known.get(identity.documentKey);
-      if (previous?.revision === identity.revision && previous.contentHash === identity.contentHash) {
-        totals.unchanged += 1;
-        continue;
-      }
-      store.upsertFingerprint(identity);
-      store.discardOpenJobs(identity.documentKey, identity.revision);
-      totals.changed += 1;
-      const topic = store.topic(topicIdFor(engine.scopeId, topicSemanticKey(identity)));
-      if (previous && previous.revision !== identity.revision) {
+  const known = new Map(store.adapterFingerprints(adapter.id).map(item => [item.documentKey, item]));
+  const identities = prepared.map(document => identityFromDocument(adapter.id, document));
+  const seen = new Set(identities.map(identity => identity.documentKey));
+  const changed = identities.filter(identity => {
+    const previous = known.get(identity.documentKey);
+    return previous?.revision !== identity.revision || previous.contentHash !== identity.contentHash;
+  });
+  const totals = { queued: 0 };
+  const slices = Array.from({ length: Math.ceil(changed.length / 128) }, (_value, index) => changed.slice(index * 128, (index + 1) * 128));
+  for (const [index, slice] of slices.entries()) {
+    store.transaction(() => {
+      for (const identity of slice) {
+        const previous = known.get(identity.documentKey);
+        store.upsertFingerprint(identity);
+        store.discardOpenJobs(identity.documentKey, identity.revision);
+        const topic = store.topic(topicIdFor(engine.scopeId, topicSemanticKey(identity)));
+        if (previous && previous.revision !== identity.revision) {
+          store.enqueue({
+            id: jobIdFor(engine.scopeId, 'review', identity.documentKey, previous.revision),
+            scopeId: engine.scopeId, adapter: adapter.id, documentKey: identity.documentKey,
+            action: 'review', inputRevision: previous.revision, contentHash: previous.contentHash,
+          });
+          totals.queued += 1;
+        }
         store.enqueue({
-          id: jobIdFor(engine.scopeId, 'review', identity.documentKey, previous.revision),
+          id: jobIdFor(engine.scopeId, 'analyze', identity.documentKey, identity.revision),
           scopeId: engine.scopeId, adapter: adapter.id, documentKey: identity.documentKey,
-          action: 'review', inputRevision: previous.revision, contentHash: previous.contentHash,
+          action: 'analyze', inputRevision: identity.revision, contentHash: identity.contentHash,
+          ...(topic ? { topicRevision: String(topic.revision) } : {}),
         });
         totals.queued += 1;
       }
-      store.enqueue({
-        id: jobIdFor(engine.scopeId, 'analyze', identity.documentKey, identity.revision),
-        scopeId: engine.scopeId, adapter: adapter.id, documentKey: identity.documentKey,
-        action: 'analyze', inputRevision: identity.revision, contentHash: identity.contentHash,
-        ...(topic ? { topicRevision: String(topic.revision) } : {}),
-      });
-      totals.queued += 1;
-    }
-    const withdrawn = snapshot.complete
-      ? [...known.values()].filter(item => !seen.has(item.documentKey))
-      : [];
+    });
+    if (index < slices.length - 1) engine.authority.checkpoint();
+  }
+  // Retire unseen records only after every changed slice committed. A failed
+  // partial run is resumable and cannot turn a transient ingest fault into data loss.
+  const withdrawn = snapshot.complete ? [...known.values()].filter(item => !seen.has(item.documentKey)) : [];
+  store.transaction(() => {
     for (const item of withdrawn) {
       store.markWithdrawn(item.documentKey);
       store.discardOpenJobs(item.documentKey, item.revision);
@@ -119,9 +123,9 @@ export const enqueueSnapshot = (engine: MemoryEngine, adapter: SourceAdapter, sn
       });
       totals.queued += 1;
     }
-    return { discovered: prepared.length, changed: totals.changed, unchanged: totals.unchanged,
-      queued: totals.queued, withdrawn: withdrawn.length, gaps: snapshot.gaps };
   });
+  return { discovered: prepared.length, changed: changed.length, unchanged: prepared.length - changed.length,
+    queued: totals.queued, withdrawn: withdrawn.length, gaps: snapshot.gaps };
 };
 
 const documentFor = async (adapter: SourceAdapter | undefined, identity: SourceIdentity, engine: MemoryEngine,
@@ -270,8 +274,7 @@ export const processJob = async (engine: MemoryEngine, adapters: ReadonlyMap<str
     store.recordSpend({ embeddingCalls: published.embeddings }, Date.now());
     const totals = { modelCalls: 1, embeddings: published.embeddings, in: result.usage.inputTokens, out: result.usage.outputTokens };
     if (!bundle.truncated && priorDrafts.length > 0) {
-      const draftFacts = [...priorDrafts.flatMap(draft => draft.factIds), ...published.factIds]
-        .flatMap(id => engine.projection.getFact(id) ?? []);
+      const draftFacts = engine.projection.getFacts([...priorDrafts.flatMap(draft => draft.factIds), ...published.factIds]);
       const winners = new Map<string, typeof draftFacts[number]>();
       for (const fact of draftFacts) {
         const key = fact.tags.semanticKey ?? fact.id;

@@ -31,11 +31,6 @@ const tagsFor = (fact: ProposedFact, identity: SourceIdentity, result: AnalysisR
   analyzerModel: result.model,
 });
 
-const existingByKey = (engine: MemoryEngine, semanticKey: string, identity: SourceIdentity) =>
-  engine.projection.activeFacts(engine.scopeId, 1000).find(fact =>
-    fact.tags.semanticKey === semanticKey && fact.tags.sourceAdapter === identity.adapter
-    && fact.tags.sourceDocumentKey === identity.documentKey);
-
 export const topicSemanticKey = (identity: SourceIdentity, topic?: { id?: string; title?: string }): string =>
   (topic?.id ?? topic?.title ?? identity.kind).trim().toLowerCase() || 'topic';
 
@@ -99,13 +94,14 @@ export const publishProposal = async (engine: MemoryEngine, store: CurationPort,
   const expected = job.topicRevision !== undefined ? expectedTopicRevision : liveTopic;
   if (liveTopic !== expected) return { status: 'stale', factIds: [], embeddings: 0 };
   const allowed = new Set(store.dependents(identity.documentKey));
-  const bundle: EvidenceBundle = { identity, text: sourceText, truncated: false, currentFacts: engine.projection.activeFacts(engine.scopeId, 64)
-    .filter(fact => fact.tags.sourceDocumentKey === identity.documentKey || allowed.has(fact.id)) };
+  const active = engine.projection.activeFacts(engine.scopeId, 1000);
+  const bundle: EvidenceBundle = { identity, text: sourceText, truncated: false, currentFacts: active
+    .filter(fact => fact.tags.sourceDocumentKey === identity.documentKey || allowed.has(fact.id)).slice(0, 64) };
   assertPublishable(result.proposal, bundle, allowed);
   if (result.proposal.noChange && !result.proposal.facts.some(fact => fact.action !== 'keep' && fact.action !== 'discard')) {
     return { status: 'no_change', factIds: [], embeddings: 0 };
   }
-  const collected = await engine.collectPublication(async () => prepareBatch(engine, identity, result.proposal, result, allowed));
+  const collected = await engine.collectPublication(async () => prepareBatch(engine, identity, result.proposal, result, allowed, active));
   const prepared: PreparedBatch = {
     facts: collected.bag.facts.length ? collected.bag.facts : collected.result.facts,
     documents: collected.bag.documents.length ? collected.bag.documents : collected.result.documents,
@@ -130,30 +126,32 @@ export const publishProposal = async (engine: MemoryEngine, store: CurationPort,
 };
 
 const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
-  proposal: AnalysisProposal, result: AnalysisResult, allowed: ReadonlySet<string>): Promise<PreparedBatch> => {
+  proposal: AnalysisProposal, result: AnalysisResult, allowed: ReadonlySet<string>, active: readonly TemporalFact[]): Promise<PreparedBatch> => {
   const factIds: string[] = [];
   const facts: TemporalFact[] = [];
   const resolves: string[] = [];
   const topicKey = topicSemanticKey(identity, proposal.topic);
   const topicId = topicIdFor(engine.scopeId, topicKey);
+  const activeById = new Map(active.map(fact => [fact.id, fact]));
   for (const fact of proposal.facts.filter(item => item.action !== 'keep')) {
     if (fact.action === 'discard' && fact.id) {
-      if (allowed.has(fact.id) && engine.projection.getFact(fact.id)) resolves.push(fact.id);
+      if (allowed.has(fact.id) && activeById.has(fact.id)) resolves.push(fact.id);
       continue;
     }
-    const duplicate = existingByKey(engine, fact.semanticKey, identity);
+    const duplicate = active.find(item => item.tags.semanticKey === fact.semanticKey && item.tags.sourceAdapter === identity.adapter
+      && item.tags.sourceDocumentKey === identity.documentKey);
     if (duplicate && duplicate.statement === fact.statement && duplicate.tags.sourceRevision === identity.revision) {
       factIds.push(duplicate.id);
       continue;
     }
     const admission = admitCapture({
       statement: fact.statement, kind: fact.kind,
-      existing: engine.projection.activeFacts(engine.scopeId, 200).map(item => ({ statement: item.statement, kind: item.kind })),
+      existing: [...active, ...facts].map(item => ({ statement: item.statement, kind: item.kind })),
     });
     if (!admission.accept) continue;
     const standing = fact.standing === 'supported' ? 'needs_review' : fact.standing;
     const explicit = (fact.supersedes ?? []).filter(id => allowed.has(id) || (fact.id && id === fact.id));
-    const revise = fact.action === 'revise' && fact.id && allowed.has(fact.id) && engine.projection.getFact(fact.id) ? [fact.id] : [];
+    const revise = fact.action === 'revise' && fact.id && allowed.has(fact.id) && activeById.has(fact.id) ? [fact.id] : [];
     const implicit = duplicate && duplicate.tags.sourceDocumentKey === identity.documentKey
       && Date.parse(duplicate.recordedAt) <= Date.parse(identity.observedAt) ? [duplicate.id] : [];
     const supersedes = [...new Set([...explicit, ...revise, ...implicit])].filter(id => id !== curatedFactId(engine.scopeId, fact.semanticKey, identity.revision));
@@ -173,7 +171,7 @@ const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
     factIds.push(recorded.fact.id);
   }
   const kept = proposal.facts.filter(fact => fact.action === 'keep' && fact.id).map(fact => fact.id!);
-  const peers = engine.projection.activeFacts(engine.scopeId, 1000).filter(item => item.tags.topicId === topicId);
+  const peers = active.filter(item => item.tags.topicId === topicId);
   const linked = [...new Set([...factIds, ...kept, ...peers.map(item => item.id)])];
   const priorTopic = engine.projection.documentByKey({ namespace: 'memory.topic', externalId: topicId });
   const sources = [...new Set([
