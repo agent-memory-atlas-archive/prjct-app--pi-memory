@@ -17,7 +17,7 @@
 - [ ] `npm run check`
 - [ ] `npm test`
 - [ ] `npm run test:integration`
-- [ ] `npm run eval -- --suite tests/fixtures/retrieval-gold.jsonl`
+- [ ] `npm run eval -- --suite tests/fixtures/retrieval-gold.jsonl` (diagnostic; MiniLM gate remains blocked)
 - [ ] `npm pack --dry-run --ignore-scripts`
 
 ## Daemon verification (when affected)
