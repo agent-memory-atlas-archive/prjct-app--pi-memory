@@ -4,6 +4,7 @@ import type { MemoryEngine } from '../engine.ts';
 import { sourceRevisionOf, withSourceIdentity } from '../sources/identity.ts';
 import type { SourceAdapter, SourceSnapshot } from '../sources/registry.ts';
 import { sha256 } from '../workspace/project-identity.ts';
+import { redactSecrets } from '../security/redact.ts';
 import { identityFromDocument, jobIdFor, publicationHold, stillHeld } from './store.ts';
 import type { CurationPort } from '../storage/ports.ts';
 import { invalidateDependents, liveFence, materializeSealedBatches, publishProposal, replayAccepted, topicIdFor, topicSemanticKey } from './publish.ts';
@@ -17,12 +18,19 @@ export type ProcessResult = Readonly<{
   jobId: string; outcome: string; modelCalls: number; embeddingCalls: number; inputTokens: number; outputTokens: number;
 }>;
 
+export type SharedBudgetGate = Readonly<{
+  reserve(limits: { maxCallsPerDay: number; maxTokensPerDay: number }, estimate: { inputTokens: number; outputTokens: number }, at?: number):
+    Readonly<{ day: string; estimatedInput: number; estimatedOutput: number }> | undefined;
+  reconcile(ticket: Readonly<{ day: string; estimatedInput: number; estimatedOutput: number }>, actual: { inputTokens: number; outputTokens: number }): void;
+}>;
+
 export type ProcessOptions = Readonly<{
   analyzer?: Analyzer;
   block?: CurationBlockError;
   maxAttempts: number;
   maxInputChars: number;
   budget: { maxCallsPerDay: number; maxTokensPerDay: number };
+  globalBudget?: SharedBudgetGate;
   leaseMs?: number;
   deadlineMs?: number;
   now?: number;
@@ -37,23 +45,28 @@ const isTokenChar = (ch: string | undefined): boolean => Boolean(ch && /[A-Za-zÃ
 
 export const windowBounds = (text: string, offset: number, maxChars: number): { start: number; end: number; truncated: boolean } => {
   const total = text.length;
-  const skipToken = (index: number): number => index < total && isTokenChar(text[index]) ? skipToken(index + 1) : index;
-  const skipSpace = (index: number): number => index < total && (text[index] === ' ' || text[index] === '\t') ? skipSpace(index + 1) : index;
+  const scanForward = (from: number, predicate: (char: string | undefined) => boolean): number => {
+    const state = { index: from };
+    while (state.index < total && predicate(text[state.index])) state.index += 1;
+    return state.index;
+  };
+  const scanBackward = (from: number, floor: number): number => {
+    const state = { index: from };
+    while (state.index > floor && isTokenChar(text[state.index]) && isTokenChar(text[state.index - 1])) state.index -= 1;
+    return state.index;
+  };
   const raw = Math.min(Math.max(0, offset), total);
   const start = raw > 0 && raw < total && isTokenChar(text[raw]) && isTokenChar(text[raw - 1])
-    ? skipSpace(skipToken(raw)) : raw;
+    ? scanForward(scanForward(raw, isTokenChar), char => char === ' ' || char === '\t') : raw;
   const budgetEnd = Math.min(total, start + Math.max(1, maxChars));
-  const retract = (index: number): number =>
-    index > start && isTokenChar(text[index]) && isTokenChar(text[index - 1]) ? retract(index - 1) : index;
-  const tokenEnd = budgetEnd < total && budgetEnd > 0 && isTokenChar(text[budgetEnd]) ? retract(budgetEnd) : budgetEnd;
+  const tokenEnd = budgetEnd < total && budgetEnd > 0 && isTokenChar(text[budgetEnd]) ? scanBackward(budgetEnd, start) : budgetEnd;
   const closed = /[.!?]/.test(text.slice(start, tokenEnd));
   const stop = text.indexOf('. ', tokenEnd);
   const nl = text.indexOf('\n', tokenEnd);
   const sentenceEnd = tokenEnd < total && !closed
     ? Math.min(stop < 0 ? total : stop + 2, nl < 0 ? total : nl + 1)
-    : skipSpace(tokenEnd);
-  const end = sentenceEnd;
-  return { start, end, truncated: end < total };
+    : scanForward(tokenEnd, char => char === ' ' || char === '\t');
+  return { start, end: sentenceEnd, truncated: sentenceEnd < total };
 };
 
 export const enqueueSnapshot = (engine: MemoryEngine, adapter: SourceAdapter, snapshot: SourceSnapshot, prepared: readonly SourceDocument[]): EnqueueResult => {
@@ -133,14 +146,15 @@ export const readBundle = async (adapter: SourceAdapter | undefined, identity: S
   if (hash !== identity.contentHash || document.contentHash !== identity.contentHash || revision !== identity.revision) {
     throw new CurationBlockError('stale', 'Reread evidence does not match the claimed revision.');
   }
+  const redacted = redactSecrets(document.text);
   const prior = engine.curation.coverage(identity.documentKey)?.offset ?? 0;
-  const bounds = windowBounds(document.text, prior, maxChars);
-  const text = document.text.slice(bounds.start, bounds.end);
+  const bounds = windowBounds(redacted, prior, maxChars);
+  const text = redacted.slice(bounds.start, bounds.end);
   const live = identityFromDocument(identity.adapter, prepared);
   const topic = engine.curation.topic(topicIdFor(engine.scopeId, topicSemanticKey(identity)));
   return {
     identity: live, text, truncated: bounds.truncated,
-    window: { offset: bounds.start, end: bounds.end, total: document.text.length },
+    window: { offset: bounds.start, end: bounds.end, total: redacted.length },
     currentFacts: engine.projection.activeFacts(engine.scopeId, 1000)
       .filter(fact => fact.tags.sourceDocumentKey === identity.documentKey || (topic && fact.tags.topicId === topic.id)),
     ...(topic ? { currentTopic: { id: topic.id, revision: topic.revision, summary: topic.summary } } : {}),
@@ -217,11 +231,18 @@ export const processJob = async (engine: MemoryEngine, adapters: ReadonlyMap<str
     }
     const estimateIn = Math.ceil(bundle.text.length / 4);
     const estimateOut = Math.ceil(options.maxInputChars / 8);
-    if (!store.reserveCall({ maxCallsPerDay: options.budget.maxCallsPerDay, maxTokensPerDay: options.budget.maxTokensPerDay }, Date.now(), estimateIn + estimateOut)) {
+    const reservedAt = Date.now();
+    const globalTicket = options.globalBudget?.reserve(options.budget, { inputTokens: estimateIn, outputTokens: estimateOut }, reservedAt);
+    const reserved = options.globalBudget
+      ? globalTicket !== undefined
+      : store.reserveCall(options.budget, reservedAt, estimateIn + estimateOut);
+    if (!reserved) {
       store.fail(job.id, owner, 'budget_exhausted', 'budget_exhausted', Date.now() + backoffMs(job.attempts), true, Date.now());
       return { ...empty, outcome: 'budget_exhausted' };
     }
+    if (options.globalBudget) store.recordSpend({ calls: 1, inputTokens: estimateIn + estimateOut }, reservedAt);
     const result = await options.analyzer.analyze(bundle, combined);
+    if (globalTicket) options.globalBudget?.reconcile(globalTicket, result.usage);
     store.recordSpend({ inputTokens: Math.max(0, result.usage.inputTokens - estimateIn), outputTokens: result.usage.outputTokens }, Date.now());
     const fresh = await readBundle(adapter, identity, engine, Number.MAX_SAFE_INTEGER, new Map(), combined).catch(() => undefined);
     if (!fresh || fresh.identity.revision !== job.inputRevision || fresh.identity.contentHash !== job.contentHash) {

@@ -1,9 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, mkdirSync, statSync } from 'node:fs';
+import { copyFileSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { brotliCompressSync, brotliDecompressSync, constants } from 'node:zlib';
 import { assertProjectId } from '../workspace/project-identity.ts';
+import { privateDatabaseFiles, privateDirectorySync } from './private-files.ts';
 
 export type CompactValue = null | boolean | number | string | readonly CompactValue[] | { readonly [key: string]: CompactValue };
 export type CompactState = Readonly<Record<string, CompactValue>>;
@@ -48,7 +49,7 @@ export class CompactAuthority {
 
   constructor(readonly path: string, projectId: string) {
     this.owner = assertProjectId(projectId);
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    privateDirectorySync(dirname(path));
     this.db = new DatabaseSync(path, { allowExtension: true });
     try {
       // Connection-local settings only. Opening a populated compact authority
@@ -63,6 +64,8 @@ export class CompactAuthority {
         if (Object.values(this.db.prepare(`PRAGMA ${name}`).get()!)[0] !== expected) throw new CompactFormatError(`Invalid compact ${name}.`);
       }
       this.read();
+      this.db.enableLoadExtension(false);
+      privateDatabaseFiles(path);
     } catch (error) { this.db.close(); throw error; }
   }
 

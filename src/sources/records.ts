@@ -1,4 +1,6 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { readdir, readFile, lstat } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
 import { extname, join } from 'node:path';
 import type { SourceDocument } from '../contracts/documents.ts';
 import { sha256 } from '../workspace/project-identity.ts';
@@ -63,6 +65,8 @@ export type RecordSourceOptions = Readonly<{
 
 const DEFAULT_MAX_CHARS = 8_000;
 const DEFAULT_BLOB_BYTES = 512_000;
+const MAX_RECORD_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_JSONL_LINE_CHARS = 1024 * 1024;
 
 const walk = async (root: string, depth: number, gaps: string[]): Promise<string[]> => {
   const entries = await readdir(root, { withFileTypes: true }).catch(error => {
@@ -73,32 +77,57 @@ const walk = async (root: string, depth: number, gaps: string[]): Promise<string
   const here = entries.filter(entry => entry.isFile() && ['.json', '.jsonl'].includes(extname(entry.name)))
     .map(entry => join(root, entry.name));
   if (depth <= 0) return here.sort();
-  const nested = await Promise.all(entries.filter(entry => entry.isDirectory())
-    .map(entry => walk(join(root, entry.name), depth - 1, gaps)));
-  return [...here, ...nested.flat()].sort();
+  const nested: string[] = [];
+  for (const entry of entries.filter(item => item.isDirectory())) nested.push(...await walk(join(root, entry.name), depth - 1, gaps));
+  return [...here, ...nested].sort();
 };
 
-const recordsIn = async (path: string, container?: FieldPath): Promise<JsonRecord[]> => {
-  const raw = await readFile(path, 'utf8');
-  if (!raw.trim()) {
-    if (extname(path) === '.jsonl') return [];
-    throw new Error('Source JSON file is empty.');
+const recordsIn = async (path: string, container: FieldPath | undefined, gaps: string[]): Promise<JsonRecord[]> => {
+  const info = await lstat(path).catch(() => undefined);
+  if (!info?.isFile() || info.isSymbolicLink() || info.size > MAX_RECORD_FILE_BYTES) {
+    gaps.push('Source record file is unavailable, unsafe, or oversized; retained index may be stale.');
+    return [];
   }
   if (extname(path) === '.jsonl') {
-    return raw.split('\n').flatMap(line => {
-      if (!line.trim()) return [];
-      const parsed: unknown = JSON.parse(line);
-      if (!isRecord(parsed)) throw new Error('Source JSONL records must be objects.');
-      return [parsed];
-    });
+    const rows: JsonRecord[] = [];
+    const lines = createInterface({ input: createReadStream(path, { encoding: 'utf8' }), crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        if (line.length > MAX_JSONL_LINE_CHARS) {
+          gaps.push('Source JSONL line is oversized; retained index may be stale.');
+          continue;
+        }
+        try {
+          const parsed: unknown = JSON.parse(line);
+          if (isRecord(parsed)) rows.push(parsed);
+          else gaps.push('Source JSONL record is not an object; retained index may be stale.');
+        } catch {
+          gaps.push('Source JSONL record is malformed; retained index may be stale.');
+        }
+      }
+    } finally {
+      lines.close();
+    }
+    return rows;
   }
-  const parsed: unknown = JSON.parse(raw);
-  const found = container ? valuesAt(parsed, container) : [parsed];
-  if (!found.length) throw new Error('Source record container is missing.');
-  if (found.some(value => Array.isArray(value) ? value.some(row => !isRecord(row)) : !isRecord(value))) {
-    throw new Error('Source record container must contain objects.');
+  try {
+    const raw = await readFile(path, 'utf8');
+    if (!raw.trim()) {
+      gaps.push('Source JSON file is empty; retained index may be stale.');
+      return [];
+    }
+    const parsed: unknown = JSON.parse(raw);
+    const found = container ? valuesAt(parsed, container) : [parsed];
+    if (!found.length || found.some(value => Array.isArray(value) ? value.some(row => !isRecord(row)) : !isRecord(value))) {
+      gaps.push('Source record container is missing or invalid; retained index may be stale.');
+      return [];
+    }
+    return found.flatMap(value => Array.isArray(value) ? value.filter(isRecord) : isRecord(value) ? [value] : []);
+  } catch {
+    gaps.push('Source JSON file is malformed; retained index may be stale.');
+    return [];
   }
-  return found.flatMap(value => Array.isArray(value) ? value.filter(isRecord) : isRecord(value) ? [value] : []);
 };
 
 const observedAtOf = (record: JsonRecord, mapping: RecordMapping): string => {
@@ -175,8 +204,8 @@ export class JsonRecordAdapter implements SourceAdapter {
       const name = firstText(record, [blob.field]);
       if (!name || /[/\\]/.test(name)) return undefined;
       const file = join(blob.dir, name);
-      const info = await stat(file).catch(() => undefined);
-      if (!info?.isFile() || info.size > (blob.maxBytes ?? DEFAULT_BLOB_BYTES)) return undefined;
+      const info = await lstat(file).catch(() => undefined);
+      if (!info?.isFile() || info.isSymbolicLink() || info.size > (blob.maxBytes ?? DEFAULT_BLOB_BYTES)) return undefined;
       return readFile(file, 'utf8').catch(() => undefined);
     })() : textOf(record, this.mapping);
     if (!body?.trim()) {
@@ -216,8 +245,8 @@ export class JsonRecordAdapter implements SourceAdapter {
     signal?.throwIfAborted();
     const gaps: string[] = [];
     const files = await walk(this.root, this.depth, gaps);
-    const rows = (await Promise.all(files.map(async path =>
-      (await recordsIn(path, this.mapping.container)).map(record => ({ record, path }))))).flat();
+    const rows: { record: JsonRecord; path: string }[] = [];
+    for (const path of files) rows.push(...(await recordsIn(path, this.mapping.container, gaps)).map(record => ({ record, path })));
     // Choose the latest raw revision BEFORE selection/materialization. Otherwise
     // a newer withdrawn or unavailable revision resurrects an older answer.
     const newest = this.mapping.latestPerId ? [...rows.reduce<Map<string, typeof rows[number]>>((map, row) => {
@@ -231,8 +260,9 @@ export class JsonRecordAdapter implements SourceAdapter {
       if (!prior || time(prior.record) <= time(row.record)) map.set(id, row);
       return map;
     }, new Map()).values()] : rows;
-    const documents = (await Promise.all(newest.map(row => this.documentFor(row.record, row.path, gaps, signal))))
-      .filter((document): document is SourceDocument => document !== undefined);
+    const materialized: Array<SourceDocument | undefined> = [];
+    for (const row of newest) materialized.push(await this.documentFor(row.record, row.path, gaps, signal));
+    const documents = materialized.filter((document): document is SourceDocument => document !== undefined);
     signal?.throwIfAborted();
     return { documents, complete: !gaps.length, gaps: [...new Set(gaps)] };
   }

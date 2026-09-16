@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, readdir, readFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MemoryEvent, MemoryEventPayload, UnsignedMemoryEvent } from '../contracts/events.ts';
@@ -17,12 +17,15 @@ const isTimestamp = (value: unknown): boolean =>
 const dayKey = (date: Date): string =>
   `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}${String(date.getUTCDate()).padStart(2, '0')}`;
 
-const privateDirectory = async (path: string): Promise<void> => {
+export const privateDirectory = async (path: string): Promise<void> => {
   await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())) {
+  const before = await lstat(path);
+  if (!before.isDirectory() || before.isSymbolicLink() || (process.getuid && before.uid !== process.getuid())) {
     throw new Error(`Unsafe memory directory: ${path}`);
   }
+  await chmod(path, 0o700);
+  const after = await lstat(path);
+  if ((after.mode & 0o077) !== 0) throw new Error(`Memory directory is not private: ${path}`);
 };
 
 export const validateEvent = (event: MemoryEvent, previous?: MemoryEvent, scopeId?: string): MemoryEvent => {

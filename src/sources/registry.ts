@@ -68,7 +68,7 @@ export class SourceRegistry {
       book?.recordSync(id, { discovered: result.discovered, indexed: result.indexed, ok: !result.gaps.length, ...(result.gaps.length ? { detail: result.gaps.join('; ') } : {}) });
       return result;
     } catch (error) {
-      book?.recordSync(id, { discovered: 0, indexed: 0, ok: false, detail: error instanceof Error ? error.message : String(error) });
+      book?.recordSync(id, { discovered: 0, indexed: 0, ok: false, detail: 'Source sync failed; retained index may be stale.' });
       throw error;
     }
   }

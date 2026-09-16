@@ -1,4 +1,3 @@
-import { readdir } from 'node:fs/promises';
 import { tryCreateSdkAnalyzer } from '../curation/analyzer.ts';
 import { processAvailable } from '../curation/pipeline.ts';
 import { jobIdFor } from '../curation/store.ts';
@@ -6,7 +5,9 @@ import { CurationBlockError, type Analyzer } from '../curation/types.ts';
 import { MemoryEngine } from '../engine.ts';
 import { registerKnownSources } from '../sources/install.ts';
 import { SourceRegistry, type SourceAdapter } from '../sources/registry.ts';
+import { trustedProjectIds } from '../workspace/project-identity.ts';
 import type { DaemonConfig } from './config.ts';
+import { GlobalBudgetLedger } from './budget.ts';
 
 export type CycleReport = Readonly<{
   scopes: number;
@@ -17,6 +18,7 @@ export type CycleReport = Readonly<{
   inputTokens: number;
   outputTokens: number;
   blocked?: string;
+  failedScopes?: number;
 }>;
 
 export type CycleOptions = Readonly<{
@@ -29,10 +31,7 @@ export type CycleOptions = Readonly<{
   signal?: AbortSignal;
 }>;
 
-export const discoverProjectIds = async (home: string): Promise<string[]> => {
-  const entries = await readdir(home, { withFileTypes: true }).catch(() => []);
-  return entries.filter(entry => entry.isDirectory() && /^p_[A-Za-z0-9_-]+$/.test(entry.name)).map(entry => entry.name);
-};
+export const discoverProjectIds = async (home: string): Promise<string[]> => [...await trustedProjectIds(home)];
 
 export const registryFor = async (engine: MemoryEngine, home: string): Promise<SourceRegistry> => {
   const registry = new SourceRegistry();
@@ -63,7 +62,7 @@ const enqueueDueReviews = (engine: MemoryEngine, adapterId: string, now: number,
 
 const processProject = async (engine: MemoryEngine, options: CycleOptions, totals: {
   queued: number; processed: number; modelCalls: number; embeddingCalls: number; inputTokens: number; outputTokens: number;
-}): Promise<void> => {
+}, globalBudget: GlobalBudgetLedger): Promise<void> => {
   if (engine.scopeKind !== 'project') throw new Error('Memory opens only a project-owned database.');
   options.signal?.throwIfAborted();
   const registry = await registryFor(engine, options.config.home);
@@ -87,6 +86,7 @@ const processProject = async (engine: MemoryEngine, options: CycleOptions, total
     maxAttempts: options.config.maxAttempts,
     maxInputChars: options.config.maxInputChars,
     budget: { maxCallsPerDay: options.config.maxCallsPerDay, maxTokensPerDay: options.config.maxTokensPerDay },
+    globalBudget,
     leaseMs: options.config.leaseMs,
     deadlineMs: options.config.jobDeadlineMs,
   }, options.signal);
@@ -101,27 +101,34 @@ const processProject = async (engine: MemoryEngine, options: CycleOptions, total
 
 export const runCycle = async (options: CycleOptions): Promise<CycleReport> => {
   const totals = { queued: 0, processed: 0, modelCalls: 0, embeddingCalls: 0, inputTokens: 0, outputTokens: 0 };
-  const scoped = { n: 0 };
-  if (options.engines) {
-    for (const engine of options.engines) {
-      await processProject(engine, options, totals);
+  const scoped = { n: 0, failed: 0 };
+  const globalBudget = new GlobalBudgetLedger(options.config.home);
+  const processOne = async (engine: MemoryEngine): Promise<void> => {
+    try {
+      await processProject(engine, options, totals, globalBudget);
       scoped.n += 1;
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      scoped.failed += 1;
     }
-  } else {
-    for (const id of await discoverProjectIds(options.config.home)) {
-      const engine = await MemoryEngine.forScope('project', id, options.owner, { home: options.config.home });
-      try {
-        await processProject(engine, options, totals);
-        scoped.n += 1;
-      } finally {
-        await engine.dispose().catch(() => undefined);
+  };
+  try {
+    if (options.engines) {
+      for (const engine of options.engines) await processOne(engine);
+    } else {
+      for (const id of await discoverProjectIds(options.config.home)) {
+        const engine = await MemoryEngine.forScope('project', id, options.owner, { home: options.config.home }).catch(() => undefined);
+        if (!engine) { scoped.failed += 1; continue; }
+        try { await processOne(engine); } finally { await engine.dispose().catch(() => undefined); }
       }
     }
+  } finally {
+    globalBudget.close();
   }
   return {
     scopes: scoped.n, queued: totals.queued, processed: totals.processed, modelCalls: totals.modelCalls,
     embeddingCalls: totals.embeddingCalls, inputTokens: totals.inputTokens, outputTokens: totals.outputTokens,
-    ...(options.block ? { blocked: options.block.code } : {}),
+    ...(scoped.failed ? { failedScopes: scoped.failed } : {}), ...(options.block ? { blocked: options.block.code } : {}),
   };
 };
 

@@ -22,6 +22,14 @@ type HandoffGate = Readonly<{
 const keyOf = (projectId: string, sessionId: string): string => `${projectId}\u0000${sessionId}`;
 const gateKeyOf = (workspace: string, sessionId: string): string => `${workspace}\u0000${sessionId}`;
 const modelKeyOf = (model: Readonly<{ provider: string; id: string }>): string => `${model.provider}\u0000${model.id}`;
+const currentRecallOnly = (messages: readonly HandoffMessage[]): HandoffMessage[] => {
+  const latest = messages.map((_message, index) => index)
+    .filter(index => (messages[index] as HandoffMessage & { customType?: string }).customType === 'pi-memory-recall').at(-1) ?? -1;
+  return messages.filter((message, index) => {
+    const customType = (message as HandoffMessage & { customType?: string }).customType;
+    return customType !== 'pi-memory-recall' || index === latest;
+  });
+};
 
 const SAFE: HandoffMessage = {
   role: 'user',
@@ -76,9 +84,10 @@ export const createHandoffController = (options: {
   };
 
   const boundContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<{ messages: HandoffMessage[] }> => {
+    const current = currentRecallOnly(messages);
     const sessionId = ctx.sessionManager.getSessionId();
     const gate = getGate(ctx.cwd, sessionId);
-    if (!gate) return { messages: [...messages] };
+    if (!gate) return { messages: current };
     if (gate.failure) throw new Error(gate.failure);
     const engine = await options.engine();
     if (engine.scopeId !== gate.projectId) throw new Error('Handoff project changed before context selection.');
@@ -86,7 +95,7 @@ export const createHandoffController = (options: {
     if (!state?.active || state.workspace !== ctx.cwd) throw new Error('Handoff activation state is unavailable.');
     const checkpoint = readCheckpoint(engine, sessionId);
     const systemPrompt = ctx.getSystemPrompt();
-    const selected = selectHandoffMessages(messages, checkpoint, budget, {
+    const selected = selectHandoffMessages(current, checkpoint, budget, {
       systemTokens: estimateHandoffTokens({ role: 'user', content: systemPrompt }),
       systemBytes: Buffer.byteLength(systemPrompt, 'utf8'),
     });

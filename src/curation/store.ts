@@ -1,10 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
 import { documentKey } from '../contracts/documents.ts';
 import { redactSecrets } from '../security/redact.ts';
 import { sha256 } from '../workspace/project-identity.ts';
+import { privateDatabaseFiles, privateDirectorySync } from '../storage/private-files.ts';
 import { CurationBlockError, type CurationJob, type CurationStats, type JobAction, type JobStatus, type SourceIdentity, type Spend } from './types.ts';
 
 type Row = Record<string, SQLInputValue>;
@@ -78,7 +78,7 @@ export class CurationStore {
     if (typeof pathOrDb === 'string') {
       this.path = pathOrDb;
       this.ownsConnection = true;
-      mkdirSync(dirname(pathOrDb), { recursive: true, mode: 0o700 });
+      privateDirectorySync(dirname(pathOrDb));
       this.db = new DatabaseSync(pathOrDb);
     } else {
       this.path = attachedPath ?? '';
@@ -89,7 +89,10 @@ export class CurationStore {
       this.db.exec('PRAGMA busy_timeout=5000');
       this.db.exec('PRAGMA foreign_keys=ON');
       const migrated = Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").get());
-      if (migrated) return;
+      if (migrated) {
+        if (this.ownsConnection) privateDatabaseFiles(this.path);
+        return;
+      }
       this.db.exec(`
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=FULL;
@@ -196,6 +199,7 @@ export class CurationStore {
           PRIMARY KEY(document_key, revision, window_offset)
         );
       `);
+      if (this.ownsConnection) privateDatabaseFiles(this.path);
     } catch (error) {
       if (this.ownsConnection) this.db.close();
       throw error;

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { scriptedAnalyzer } from '../src/curation/analyzer.ts';
 import { loadDaemonConfig } from '../src/daemon/config.ts';
+import { GlobalBudgetLedger } from '../src/daemon/budget.ts';
 import { executeDaemonCommand } from '../src/daemon/cli.ts';
 import { daemonStatus, startDaemon, stopDaemon } from '../src/daemon/lifecycle.ts';
 import { runCycle } from '../src/daemon/worker.ts';
@@ -12,6 +13,18 @@ import { MemoryEngine } from '../src/engine.ts';
 import { JsonRecordAdapter } from '../src/sources/records.ts';
 import { SourceRegistry } from '../src/sources/registry.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
+
+test('the shared budget permits only one claimant for the last call', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-memory-budget-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const first = new GlobalBudgetLedger(home);
+  const second = new GlobalBudgetLedger(home);
+  t.after(() => { first.close(); second.close(); });
+  const limits = { maxCallsPerDay: 1, maxTokensPerDay: 100 };
+  const claims = [first, second].map(ledger => ledger.reserve(limits, { inputTokens: 10, outputTokens: 10 }));
+  assert.equal(claims.filter(Boolean).length, 1);
+  assert.equal(first.usage().calls, 1);
+});
 
 test('once/start/stop/status are explicit and Pi-closed cycles publish curated knowledge', async t => {
   const home = await mkdtemp(join(tmpdir(), 'pi-memory-daemon-home-'));

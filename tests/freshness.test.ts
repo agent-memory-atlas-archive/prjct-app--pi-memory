@@ -43,7 +43,9 @@ test('complete source scans queue withdrawals, but broken or unavailable sources
   const live = () => engine.curation.adapterFingerprints('policies');
   assert.equal(live().length, 1);
   await writeFile(path, '{"id":');
-  await assert.rejects(registry.sync(async () => engine, 'policies'));
+  const malformed = await registry.sync(async () => engine, 'policies');
+  assert.ok(malformed.gaps.some(gap => /malformed/iu.test(gap)));
+  assert.equal(malformed.removed, 0);
   assert.equal(live().length, 1);
   await rm(source, { recursive: true });
   const missingRoot = await registry.sync(async () => engine, 'policies');
@@ -219,7 +221,9 @@ test('empty asOf and malformed publication times are rejected rather than interp
     mapping: { namespace: 'policies', latestPerId: true } });
   await assert.rejects(adapter.scan(), /observation timestamp/);
   await writeFile(join(source, 'policy.jsonl'), '[1,2]');
-  await assert.rejects(adapter.scan(), /objects/);
+  const malformed = await adapter.snapshot();
+  assert.equal(malformed.complete, false);
+  assert.ok(malformed.gaps.some(gap => /not an object/iu.test(gap)));
 });
 
 

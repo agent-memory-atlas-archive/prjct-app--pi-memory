@@ -112,7 +112,7 @@ test('syncDue runs only what is due, records both outcomes, and one failure does
   assert.deepEqual(first.skipped, []);
   assert.equal(engine.projection.syncState('good')?.ok, true);
   assert.equal(engine.projection.syncState('bad')?.ok, false);
-  assert.match(engine.projection.syncState('bad')!.detail!, /source is unreachable/);
+  assert.match(engine.projection.syncState('bad')!.detail!, /Source sync failed/);
 
   // Immediately after, nothing is due: the watermark is doing its job.
   const second = await registry.syncDue(async () => engine, engine.projection);

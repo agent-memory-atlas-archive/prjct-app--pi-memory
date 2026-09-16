@@ -40,7 +40,9 @@ export const assertExclusiveMemoryPath = (home: string, projectId: string, candi
   if (existsSync(live)) {
     const real = realpathSync(live).replaceAll('\\', '/');
     const realProject = (existsSync(projectRoot) ? realpathSync(projectRoot) : projectRoot).replaceAll('\\', '/');
+    const realHome = (existsSync(home) ? realpathSync(home) : resolve(home)).replaceAll('\\', '/');
     if (real !== realProject && !real.startsWith(`${realProject}/`)) throw new Error('Memory path resolves to another project.');
+    if (real !== realHome && !real.startsWith(`${realHome}/`)) throw new Error('Memory path resolves outside PRJCT_HOME.');
   }
   return expected;
 };
@@ -59,15 +61,51 @@ export const componentPath = (home: string, kind: ScopeKind, id: string, compone
   return join(scopeRoot(home, kind, id), component);
 };
 
+type IdentityBinding = Readonly<{ location: string; projectId: string }>;
+
 const locatorProjectId = async (location: string): Promise<string | undefined> => {
   const raw = await readFile(join(location, '.prjct', 'prjct.config.json'), 'utf8').catch(() => undefined);
   if (!raw) return undefined;
-  const parsed = JSON.parse(raw) as { projectId?: unknown };
-  return typeof parsed?.projectId === 'string' && /^p_[A-Za-z0-9_-]+$/.test(parsed.projectId) ? parsed.projectId : undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const projectId = (parsed as { projectId?: unknown }).projectId;
+    return typeof projectId === 'string' && /^p_[A-Za-z0-9_-]+$/.test(projectId) ? projectId : undefined;
+  } catch {
+    return undefined;
+  }
 };
 
-export const resolveProject = async (cwd: string): Promise<{ location: string; projectId: string; checkoutId: string }> => {
+const verifiedBindings = async (home: string): Promise<readonly IdentityBinding[]> => {
+  const raw = await readFile(join(home, 'identity', 'index.json'), 'utf8').catch(() => undefined);
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    const envelope = parsed as { schemaVersion?: unknown; revision?: unknown; contentHash?: unknown; payload?: unknown };
+    if (envelope.schemaVersion !== 1 || !Number.isSafeInteger(envelope.revision) || Number(envelope.revision) < 1
+      || typeof envelope.contentHash !== 'string' || sha256(JSON.stringify(envelope.payload)) !== envelope.contentHash
+      || !envelope.payload || typeof envelope.payload !== 'object' || Array.isArray(envelope.payload)) return [];
+    const bindings = (envelope.payload as { bindings?: unknown }).bindings;
+    if (!Array.isArray(bindings)) return [];
+    return bindings.flatMap(binding => {
+      if (!binding || typeof binding !== 'object' || Array.isArray(binding)) return [];
+      const row = binding as { location?: unknown; projectId?: unknown };
+      return typeof row.location === 'string' && typeof row.projectId === 'string' && /^p_[A-Za-z0-9_-]+$/.test(row.projectId)
+        ? [{ location: resolve(row.location), projectId: row.projectId }]
+        : [];
+    });
+  } catch {
+    return [];
+  }
+};
+
+export const trustedProjectIds = async (home: string): Promise<readonly string[]> =>
+  [...new Set((await verifiedBindings(home)).map(binding => binding.projectId))].sort();
+
+export const resolveProject = async (cwd: string, home = prjctHomeFor()): Promise<{ location: string; projectId: string; checkoutId: string }> => {
   const location = await realpath(resolve(cwd));
   const located = await locatorProjectId(location);
-  return { location, projectId: located ?? projectIdFrom(location), checkoutId: checkoutIdFrom(location) };
+  const trusted = located && (await verifiedBindings(home)).some(binding => binding.location === location && binding.projectId === located);
+  return { location, projectId: trusted ? located : projectIdFrom(location), checkoutId: checkoutIdFrom(location) };
 };

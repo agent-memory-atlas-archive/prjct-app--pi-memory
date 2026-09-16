@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -31,6 +31,10 @@ test('each project owns a separate memory.sqlite and cannot open another project
   await assert.rejects(MemoryEngine.forTeam('t_demo', 's1', { home }), /project-owned/);
   await assert.rejects(MemoryEngine.forShared('s1', { home }), /project-owned/);
   await assert.rejects(federatedSearch([a, b], { queries: ['vault'], dense: false }), /Mixed-project/);
+  for (const path of [a.root, a.projection.path, `${a.projection.path}-wal`, `${a.projection.path}-shm`]) {
+    const info = await lstat(path).catch(() => undefined);
+    if (info) assert.equal(info.mode & 0o077, 0, `${path} must be owner-only`);
+  }
 });
 
 test('ownership is claimed in sqlite and a colliding id cannot bind the other database', async t => {

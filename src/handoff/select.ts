@@ -86,6 +86,8 @@ const checkpointMessage = (checkpoint: OperationalCheckpoint): HandoffMessage =>
 // checkpoint wins so stale summaries cannot displace current operator intent.
 const isPiSummary = (message: HandoffMessage): boolean =>
   message.role === 'compactionSummary' || message.role === 'branchSummary';
+const isRegenerableRecall = (message: HandoffMessage): boolean =>
+  (message as HandoffMessage & { customType?: string }).customType === 'pi-memory-recall';
 
 const continuityPrefix = (
   messages: readonly HandoffMessage[], checkpoint: OperationalCheckpoint | undefined,
@@ -113,9 +115,10 @@ export const selectHandoffMessages = (
   overhead: HandoffOverhead = NO_OVERHEAD,
 ): HandoffResult => {
   assertBudget(budget, overhead);
-  const pre = packCost(messages, budget, overhead);
-  const prefix = continuityPrefix(messages, checkpoint);
-  const turns = groupTurns(messages.filter(message => !isPiSummary(message)));
+  const retained = messages.filter(message => !isRegenerableRecall(message));
+  const pre = packCost(retained, budget, overhead);
+  const prefix = continuityPrefix(retained, checkpoint);
+  const turns = groupTurns(retained.filter(message => !isPiSummary(message)));
   const diagnostic = `Estimated tokens: system ${overhead.systemTokens} + tool-schema reserve ${budget.toolSchemaReserveTokens} + messages ${pre.messageTokens} = ${pre.tokens}. Bytes: system ${overhead.systemBytes} + messages ${pre.bytes - overhead.systemBytes} = ${pre.bytes}.`;
   const current = turns.at(-1);
   if (current && !turnIsComplete(current)) {

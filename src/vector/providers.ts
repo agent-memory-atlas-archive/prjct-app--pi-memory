@@ -30,6 +30,8 @@ const loaded = new Map<string, SharedPipeline>();
 const loads = { count: 0 };
 const modelLoads: { tail: Promise<void> } = { tail: Promise.resolve() };
 
+const offline = (): boolean => process.env.PI_MEMORY_OFFLINE === '1' || process.env.HF_HUB_OFFLINE === '1';
+
 const loadPipeline = async (model: string, cacheDir: string | undefined): Promise<FeaturePipeline> => {
   loads.count += 1;
   // transformers.env.cacheDir is process-global. Serialize the entire model
@@ -38,7 +40,8 @@ const loadPipeline = async (model: string, cacheDir: string | undefined): Promis
   const load = modelLoads.tail.then(async () => {
     const transformers = await import('@huggingface/transformers');
     if (cacheDir) transformers.env.cacheDir = cacheDir;
-    transformers.env.allowRemoteModels = true;
+    transformers.env.allowRemoteModels = !offline();
+    transformers.env.allowLocalModels = true;
     return await transformers.pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as FeaturePipeline;
   });
   modelLoads.tail = load.then(() => undefined, () => undefined);
@@ -117,19 +120,43 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
 
   constructor(config: Required<Pick<EmbeddingConfig, 'model' | 'baseUrl'>> & Pick<EmbeddingConfig, 'apiKey' | 'dimensions'>) {
     this.model = config.model;
-    this.baseUrl = config.baseUrl.replace(/\/$/, '');
+    const endpoint = new URL(config.baseUrl);
+    const loopback = endpoint.hostname === '[::1]' || endpoint.hostname === '::1' || /^127(?:\.[0-9]{1,3}){3}$/u.test(endpoint.hostname);
+    if (endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && loopback)) {
+      throw new Error('Remote embedding endpoints require HTTPS; HTTP is allowed only for literal loopback addresses.');
+    }
+    this.baseUrl = endpoint.toString().replace(/\/$/, '');
     this.apiKey = config.apiKey;
     this.dimensions = config.dimensions;
   }
 
   async embed(texts: readonly string[], options: { signal?: AbortSignal } = {}): Promise<number[][]> {
+    if (offline()) throw new Error('Remote embeddings are disabled in offline mode.');
     const response = await fetch(`${this.baseUrl}/embeddings`, {
       method: 'POST', signal: options.signal,
       headers: { 'content-type': 'application/json', ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}) },
       body: JSON.stringify({ input: texts, model: this.model, ...(this.dimensions ? { dimensions: this.dimensions } : {}) }),
     });
     if (!response.ok) throw new Error(`Embedding provider returned HTTP ${response.status}.`);
-    const body = await response.json() as { data?: Array<{ index: number; embedding: number[] }> };
+    if (!(response.headers.get('content-type') ?? '').toLocaleLowerCase().includes('application/json')) {
+      throw new Error('Embedding provider returned a non-JSON response.');
+    }
+    if (!response.body) throw new Error('Embedding provider returned an empty response.');
+    const reader = response.body.getReader();
+    const state = { bytes: 0, chunks: [] as Uint8Array[] };
+    const read = async (): Promise<void> => {
+      const part = await reader.read();
+      if (part.done) return;
+      state.bytes += part.value.byteLength;
+      if (state.bytes > 2 * 1024 * 1024) {
+        await reader.cancel();
+        throw new Error('Embedding provider response exceeded 2 MiB.');
+      }
+      state.chunks.push(part.value);
+      return read();
+    };
+    await read();
+    const body = JSON.parse(Buffer.concat(state.chunks.map(chunk => Buffer.from(chunk))).toString('utf8')) as { data?: Array<{ index: number; embedding: number[] }> };
     const data = [...(body.data ?? [])].sort((a, b) => a.index - b.index);
     if (data.length !== texts.length || data.some(row => !Array.isArray(row.embedding) || row.embedding.length < 8)) throw new Error('Embedding provider returned an invalid batch.');
     return data.map(row => row.embedding);

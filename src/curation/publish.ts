@@ -153,7 +153,7 @@ const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
     if (!admission.accept) continue;
     const standing = fact.standing === 'supported' ? 'needs_review' : fact.standing;
     const explicit = (fact.supersedes ?? []).filter(id => allowed.has(id) || (fact.id && id === fact.id));
-    const revise = fact.action === 'revise' && fact.id && engine.projection.getFact(fact.id) ? [fact.id] : [];
+    const revise = fact.action === 'revise' && fact.id && allowed.has(fact.id) && engine.projection.getFact(fact.id) ? [fact.id] : [];
     const implicit = duplicate && duplicate.tags.sourceDocumentKey === identity.documentKey
       && Date.parse(duplicate.recordedAt) <= Date.parse(identity.observedAt) ? [duplicate.id] : [];
     const supersedes = [...new Set([...explicit, ...revise, ...implicit])].filter(id => id !== curatedFactId(engine.scopeId, fact.semanticKey, identity.revision));

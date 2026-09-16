@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { encoderLoads, residentModels, TransformerEmbeddingProvider } from '../src/vector/providers.ts';
+import { encoderLoads, OpenAICompatibleEmbeddingProvider, residentModels, TransformerEmbeddingProvider } from '../src/vector/providers.ts';
 
 /**
  * Concurrent project-local components may build providers for the same model.
@@ -27,6 +27,18 @@ test('providers on the same model share one loaded encoder and release it once',
   for (const provider of providers) await provider.dispose();
   await providers[0]!.dispose();
   assert.equal(residentModels(), before);
+});
+
+test('remote providers require encrypted transport except on literal loopback', async () => {
+  assert.throws(() => new OpenAICompatibleEmbeddingProvider({ model: 'm', baseUrl: 'http://example.test' }), /HTTPS/);
+  const provider = new OpenAICompatibleEmbeddingProvider({ model: 'm', baseUrl: 'http://127.0.0.1:1234' });
+  const prior = process.env.PI_MEMORY_OFFLINE;
+  process.env.PI_MEMORY_OFFLINE = '1';
+  try { await assert.rejects(provider.embed(['text']), /offline mode/); }
+  finally {
+    if (prior === undefined) delete process.env.PI_MEMORY_OFFLINE;
+    else process.env.PI_MEMORY_OFFLINE = prior;
+  }
 });
 
 test('a provider that never embeds holds nothing', async () => {

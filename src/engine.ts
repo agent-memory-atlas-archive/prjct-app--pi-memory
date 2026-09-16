@@ -5,13 +5,13 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ScopeKind, SourceDocument } from './contracts/documents.ts';
-import { assertSourceDocument } from './contracts/documents.ts';
+import { assertSourceDocument, documentKey } from './contracts/documents.ts';
 import { assertEvidence, evidenceStanding, type EvidenceRef } from './contracts/evidence.ts';
 import type { MemoryEventPayload } from './contracts/events.ts';
 import { assertTemporalFact, type Episode, type MemoryStanding, type TemporalFact } from './contracts/memory.ts';
 import { collectLegs, hybridSearch, type HybridSearchResult, type MemoryQuery, type SearchLegs } from './retrieval/hybrid.ts';
 import { redactSecrets } from './security/redact.ts';
-import { CurationBlockError } from './curation/types.ts';
+import { CurationBlockError, isCuratedNamespace } from './curation/types.ts';
 import { assertPublicationHold, jobIdFor, type CurationStore } from './curation/store.ts';
 import { MemoryJournal } from './storage/journal.ts';
 import { CompactJournal } from './storage/compact-journal.ts';
@@ -250,6 +250,10 @@ export class MemoryEngine {
   }
 
   async index(document: SourceDocument, signal?: AbortSignal): Promise<{ chunks: number; embedded: number; dense: boolean }> {
+    const internalPublication = publication.getStore() !== undefined;
+    if (isCuratedNamespace(document.namespace) && !internalPublication) throw new Error('Curated namespaces are writable only by the curation publisher.');
+    const owner = this.curation.fingerprintOwner(documentKey(document));
+    if (owner !== undefined && !internalPublication) throw new Error(`Document is owned by source adapter ${owner}.`);
     const sanitized = this.sanitizeDocument(document);
     if (this.compact && JSON.stringify(sanitized).length > 12_000) this.promoteForCapacity();
     const bag = publication.getStore();
@@ -306,12 +310,16 @@ export class MemoryEngine {
 
   async remove(namespace: string, externalId: string, reason: string): Promise<void> {
     assertPublicationHold();
-    await this.commit({ type: 'document.deleted', namespace, externalId, reason });
+    await this.commit({ type: 'document.deleted', namespace, externalId, reason: redactSecrets(reason) });
   }
 
   async recordEpisode(episode: Episode): Promise<void> {
     episode.evidence.forEach(assertEvidence);
-    await this.commit({ type: 'episode.recorded', episode });
+    const sanitized = { ...episode, summary: redactSecrets(episode.summary), evidence: episode.evidence.map(evidence => {
+      const excerpt = redactSecrets(evidence.excerpt);
+      return excerpt === evidence.excerpt ? evidence : { ...evidence, excerpt, contentHash: sha256(excerpt) };
+    }) };
+    await this.commit({ type: 'episode.recorded', episode: sanitized });
   }
 
   async recordFact(input: RecordFactInput, signal?: AbortSignal): Promise<{ fact: TemporalFact; dense: boolean }> {
@@ -354,7 +362,7 @@ export class MemoryEngine {
       throw new Error('A closed interval cannot be reopened without losing history; record a new fact instead.');
     }
     if (replacementId && (replacementId === factId || !this.projection.getFact(replacementId))) throw new Error('Replacement must be another existing memory.');
-    await this.commit({ type: 'fact.resolved', factId, standing, rationale, ...(replacementId ? { replacementId } : {}) });
+    await this.commit({ type: 'fact.resolved', factId, standing, rationale: redactSecrets(rationale), ...(replacementId ? { replacementId } : {}) });
   }
 
   async feedback(factId: string, signal: 'used' | 'helpful' | 'wrong' | 'stale', query: string): Promise<void> {
@@ -446,7 +454,7 @@ export class MemoryEngine {
 
   static async forProject(cwd: string, sessionId: string,
     options: { home?: string; provider?: EmbeddingProvider; storage?: 'auto' | 'compact' | 'indexed' } = {}): Promise<MemoryEngine> {
-    const project = await resolveProject(cwd);
+    const project = await resolveProject(cwd, prjctHomeFor(options.home));
     return MemoryEngine.forScope('project', project.projectId, sessionId, options);
   }
 

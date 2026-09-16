@@ -8,6 +8,7 @@ import { runGc } from './retention/gc.ts';
 import { registerKnownSources, scopedEngines } from './sources/install.ts';
 import { SourceRegistry, type SourceSyncResult } from './sources/registry.ts';
 import { dueAdapters, type SyncPolicy } from './sources/schedule.ts';
+import { sha256 } from './workspace/project-identity.ts';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
@@ -17,7 +18,7 @@ export type MemoryExtensionOptions = Readonly<{
   sync?: SyncPolicy;
 }>;
 
-const USAGE = 'Usage: /memory status | sources | sync [adapter] | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
+const USAGE = 'Usage: /memory status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
 
 /**
  * Scans publisher sources, records fingerprints and enqueues analysis jobs.
@@ -81,7 +82,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   installMemoryTools(pi, runtime);
 
   pi.registerCommand('memory', {
-    description: 'Inspect or maintain pi-memory: /memory status | sources | sync [adapter] | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
+    description: 'Inspect or maintain pi-memory: /memory status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
     handler: async (args, ctx) => {
       try {
       const engine = await runtime.engine();
@@ -103,6 +104,25 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
         if (target && !registryReady.get(target)) throw new Error(`Unknown source adapter: ${target}. Try /memory sources.`);
         const results = await syncSources(registryReady, ctx.sessionManager.getSessionId(), engine, target, options);
         ctx.ui.notify(JSON.stringify(results, null, 2), 'info');
+        return;
+      }
+      if (action === 'index') {
+        const raw = args.trim().slice('index'.length).trim();
+        if (!raw) throw new Error('Usage: /memory index {"namespace":"project.docs","externalId":"id","text":"..."}');
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('/memory index requires a JSON object.');
+        const row = parsed as { namespace?: unknown; externalId?: unknown; text?: unknown; title?: unknown; uri?: unknown; source?: unknown; kind?: unknown; metadata?: unknown };
+        if (typeof row.namespace !== 'string' || typeof row.externalId !== 'string' || typeof row.text !== 'string' || !row.text.trim()) {
+          throw new Error('/memory index requires namespace, externalId, and non-empty text strings.');
+        }
+        const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+          ? Object.fromEntries(Object.entries(row.metadata).flatMap(([key, value]) => typeof value === 'string' ? [[key, value]] : [])) : {};
+        const indexed = await engine.index({ namespace: row.namespace, externalId: row.externalId, scopeId: engine.scopeId,
+          scopeKind: engine.scopeKind, source: typeof row.source === 'string' ? row.source : 'operator-indexed',
+          kind: typeof row.kind === 'string' ? row.kind : 'document', ...(typeof row.title === 'string' ? { title: row.title } : {}),
+          text: row.text, ...(typeof row.uri === 'string' ? { uri: row.uri } : {}), version: sha256(row.text), contentHash: sha256(row.text),
+          observedAt: new Date().toISOString(), trust: 'user', metadata });
+        ctx.ui.notify(JSON.stringify(indexed, null, 2), 'info');
         return;
       }
       if (action === 'migrate-curated') {

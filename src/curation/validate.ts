@@ -116,6 +116,9 @@ export const assertPublishable = (proposal: AnalysisProposal, bundle: EvidenceBu
     if (fact.action === 'discard' && fact.id && !allowedFactIds.has(fact.id) && !bundle.currentFacts.some(item => item.id === fact.id)) {
       throw new Error('Discard target is not authorized for this source.');
     }
+    if (fact.action === 'revise' && fact.id && !allowedFactIds.has(fact.id) && !bundle.currentFacts.some(item => item.id === fact.id)) {
+      throw new Error('Revise target is not authorized for this source.');
+    }
   }
   assertNotRawCopy(proposal, bundle.text);
   return proposal;

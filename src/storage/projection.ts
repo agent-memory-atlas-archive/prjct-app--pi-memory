@@ -1,5 +1,5 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
-import { mkdirSync, readdirSync, rmSync, renameSync, statSync } from 'node:fs';
+import { readdirSync, rmSync, renameSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import * as sqliteVec from 'sqlite-vec';
 import type { DocumentChunk, SourceDocument } from '../contracts/documents.ts';
@@ -11,6 +11,7 @@ import type { Entity, Episode, MemoryStanding, TemporalFact } from '../contracts
 import { claimMemoryOwner, migrate } from './migrations.ts';
 import { CurationStore } from '../curation/store.ts';
 import { sha256 } from '../workspace/project-identity.ts';
+import { privateDatabaseFiles, privateDirectorySync } from './private-files.ts';
 
 export const MAX_QUIESCENT_WAL_BYTES = 8 * 1024 * 1024;
 export type LexicalHit = Readonly<{ chunkId: string; documentKey: string; score: number }>;
@@ -60,6 +61,11 @@ const millis = (value?: string): number | null => value ? Date.parse(value) : nu
 const iso = (value: unknown): string | undefined => typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined;
 const vectorBlob = (vector: readonly number[]): Uint8Array => new Uint8Array(Float32Array.from(vector).buffer);
 const tableNameFor = (model: string, dims: number): string => `vec_${sha256(`${model}\u0000${dims}`).slice(0, 16)}`;
+const vectorTableName = (value: unknown): string => {
+  const table = String(value);
+  if (!/^vec_[0-9a-f]{16}$/u.test(table)) throw new Error('Invalid vector collection table name.');
+  return table;
+};
 
 const syncRunFromRow = (row: Row): SyncRun => ({
   adapter: String(row.adapter), lastAt: new Date(Number(row.last_at)).toISOString(),
@@ -95,7 +101,7 @@ export class Projection {
     if (typeof pathOrDb === 'string') {
       this.path = pathOrDb;
       this.ownsConnection = true;
-      mkdirSync(dirname(pathOrDb), { recursive: true, mode: 0o700 });
+      privateDirectorySync(dirname(pathOrDb));
       this.db = new DatabaseSync(pathOrDb, { allowExtension: true });
     } else {
       this.path = attachedPath ?? '';
@@ -109,8 +115,10 @@ export class Projection {
       if (compact?.mode === 0 && !options.allowCompactPromotion) {
         throw new Error('Compact memory must be opened through the compact authority.');
       }
-      sqliteVec.load(this.db);
+      this.db.enableLoadExtension(true);
+      try { sqliteVec.load(this.db); } finally { this.db.enableLoadExtension(false); }
       migrate(this.db, compact?.mode === 0 ? { preserveCompactPragmas: true } : {});
+      if (this.ownsConnection) privateDatabaseFiles(this.path);
     } catch (error) {
       // Opening leaves an fd and a file lock held; migrate() rejects a schema
       // from a newer build, and that rejection must not leak the handle.
@@ -420,7 +428,7 @@ export class Projection {
   private deleteVectorForChunk(chunkId: string): void {
     const rows = this.stmt(`SELECT vm.rowid, vc.table_name FROM vector_map vm
       JOIN vector_collections vc ON vc.model_key=vm.model_key WHERE vm.chunk_id=? LIMIT ?`).all(chunkId, RELATION_LIMIT) as Row[];
-    for (const row of rows) this.stmt(`DELETE FROM ${String(row.table_name)} WHERE rowid = ?`).run(row.rowid!);
+    for (const row of rows) this.stmt(`DELETE FROM ${vectorTableName(row.table_name)} WHERE rowid = ?`).run(row.rowid!);
     this.stmt('DELETE FROM vector_map WHERE chunk_id = ?').run(chunkId);
   }
 
@@ -800,7 +808,7 @@ export class Projection {
       if (activeModel) {
         const stale = this.stmt('SELECT model_key, table_name FROM vector_collections WHERE model<>? LIMIT ?').all(activeModel, RELATION_LIMIT) as Row[];
         for (const collection of stale) {
-          this.db.exec(`DROP TABLE IF EXISTS ${String(collection.table_name)}`);
+          this.db.exec(`DROP TABLE IF EXISTS ${vectorTableName(collection.table_name)}`);
           this.stmt('DELETE FROM vector_map WHERE model_key=?').run(collection.model_key!);
           this.stmt('DELETE FROM vector_collections WHERE model_key=?').run(collection.model_key!);
         }

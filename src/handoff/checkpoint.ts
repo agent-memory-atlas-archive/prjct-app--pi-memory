@@ -1,4 +1,5 @@
 import type { MemoryEngine } from '../engine.ts';
+import { redactSecrets } from '../security/redact.ts';
 
 export const CHECKPOINT_MAX_BYTES = 4_000;
 
@@ -19,7 +20,7 @@ export type OperationalCheckpoint = Readonly<{
 export const assertCheckpoint = (value: unknown): OperationalCheckpoint => {
   if (!value || typeof value !== 'object') throw new Error('Checkpoint must be an object.');
   const row = value as Record<string, unknown>;
-  const text = (input: unknown): string => typeof input === 'string' ? input.trim() : '';
+  const text = (input: unknown): string => typeof input === 'string' ? redactSecrets(input.trim()) : '';
   const list = (input: unknown): string[] => Array.isArray(input) ? input.map(text).filter(Boolean).slice(0, 16) : [];
   const checkpoint: OperationalCheckpoint = {
     projectId: text(row.projectId),
