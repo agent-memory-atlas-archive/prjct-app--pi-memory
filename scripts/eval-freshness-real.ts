@@ -45,10 +45,10 @@ const body = await readFile(join(blobs, original.sha), 'utf8');
 const recordPath = join(records, 'artifact.jsonl');
 const publish = (values: readonly Artifact[]) => writeFile(recordPath, values.map(row => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
 await publish([original]);
-process.env.PRJCT_HOME = join(root, 'indexes');
+process.env.PI_MEMORY_HOME = join(root, 'indexes');
 const scope = { kind: 'team' as const, id: item.scopeId };
 const engine = await MemoryEngine.forScope(scope.kind, scope.id, 'freshness-real', {
-  home: process.env.PRJCT_HOME, provider: new TransformerEmbeddingProvider(DEFAULT_LOCAL_MODEL, join(root, 'models')),
+  home: process.env.PI_MEMORY_HOME, provider: new TransformerEmbeddingProvider(DEFAULT_LOCAL_MODEL, join(root, 'models')),
 });
 const registry = new SourceRegistry();
 registry.register(new JsonRecordAdapter({ id: 'real-artifact', scope, source: 'pi-team', root: records, mapping: teamArtifactMapping(blobs) }));

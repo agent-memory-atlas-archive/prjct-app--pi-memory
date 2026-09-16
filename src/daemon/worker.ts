@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { tryCreateSdkAnalyzer } from '../curation/analyzer.ts';
 import { processAvailable } from '../curation/pipeline.ts';
 import { jobIdFor } from '../curation/store.ts';
@@ -5,7 +6,8 @@ import { CurationBlockError, type Analyzer } from '../curation/types.ts';
 import { MemoryEngine } from '../engine.ts';
 import { registerKnownSources } from '../sources/install.ts';
 import { SourceRegistry, type SourceAdapter } from '../sources/registry.ts';
-import { trustedProjectIds } from '../workspace/project-identity.ts';
+import { memoryDatabasePath, trustedProjectIds } from '../workspace/project-identity.ts';
+import { registeredMemoryProjectIds } from '../workspace/memory-registry.ts';
 import type { DaemonConfig } from './config.ts';
 import { GlobalBudgetLedger } from './budget.ts';
 
@@ -31,7 +33,9 @@ export type CycleOptions = Readonly<{
   signal?: AbortSignal;
 }>;
 
-export const discoverProjectIds = async (home: string): Promise<string[]> => [...await trustedProjectIds(home)];
+export const discoverProjectIds = async (home: string): Promise<string[]> =>
+  [...new Set([...await registeredMemoryProjectIds(home), ...await trustedProjectIds(home)])]
+    .filter(projectId => existsSync(memoryDatabasePath(home, projectId))).sort();
 
 export const registryFor = async (engine: MemoryEngine, home: string): Promise<SourceRegistry> => {
   const registry = new SourceRegistry();

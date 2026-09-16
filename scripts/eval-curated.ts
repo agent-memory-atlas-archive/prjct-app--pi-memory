@@ -7,7 +7,7 @@ import { loadDaemonConfig } from '../src/daemon/config.ts';
 import { runCycle } from '../src/daemon/worker.ts';
 import { MemoryEngine } from '../src/engine.ts';
 import { federatedSearch } from '../src/retrieval/federated.ts';
-import { prjctHomeFor } from '../src/workspace/project-identity.ts';
+import { memoryHomeFor } from '../src/workspace/project-identity.ts';
 
 type Case = { name: string; projectId: string; query: string; contains?: string; citation?: string; abstain?: boolean };
 const arg = (name: string): string | undefined => {
@@ -36,7 +36,7 @@ const sourceHome = join(workspace, 'source');
 const indexes = join(workspace, 'indexes');
 const models = join(workspace, 'models');
 if (!process.argv.includes('--reuse')) {
-  const source = resolve(arg('--home') ?? prjctHomeFor());
+  const source = resolve(arg('--home') ?? memoryHomeFor());
   await mkdir(sourceHome, { mode: 0o700 });
   for (const projectId of [...new Set(cases.map(item => item.projectId))]) {
     await copy(join(source, projectId), join(sourceHome, projectId));
@@ -51,7 +51,7 @@ for (const path of [sourceHome, indexes]) {
   const rel = relative(canonical, await realpath(path));
   if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('Curated eval paths must stay inside the workspace.');
 }
-process.env.PRJCT_HOME = indexes;
+process.env.PI_MEMORY_HOME = indexes;
 const config = await loadDaemonConfig({
   home: indexes, intervalMs: 1_000, maxAttempts: 3, maxCallsPerDay: 10_000, maxTokensPerDay: 2_000_000,
   ...(process.env.PI_MEMORY_ANALYSIS_PROVIDER ? { provider: process.env.PI_MEMORY_ANALYSIS_PROVIDER } : {}),

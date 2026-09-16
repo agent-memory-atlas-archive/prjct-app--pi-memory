@@ -18,9 +18,18 @@ Requires Pi, Node.js 22.19 or later, macOS or Linux.
 pi install npm:@prjct.app/pi-memory
 ```
 
-The first dense operation downloads the default local multilingual encoder into
-the active project's `memory/models` directory. Until it is available, writes
-and lexical search continue to work and report that dense indexing is pending.
+Initialize each checkout explicitly before using memory:
+
+```text
+/memory init
+```
+
+`/memory status` and extension startup are read-only while a checkout is
+uninitialized. Initialization writes a checksummed binding to pi-memory's own
+registry and creates exactly one owner-bound project database. The first dense
+operation then downloads the default local multilingual encoder into the active
+project's `memory/models` directory. Until it is available, writes and lexical
+search continue to work and report that dense indexing is pending.
 
 ## Agent tools
 
@@ -48,7 +57,8 @@ progress narration, secrets, or generic summaries.
 ## Commands
 
 ```text
-/memory status
+/memory init            # explicitly bind this checkout and create/adopt its authority
+/memory status          # read-only when this checkout has not been initialized
 /memory sources          # counters, last run per adapter, queued jobs, and what is due
 /memory sync [adapter]   # scan and enqueue now; does not copy raw source bodies
 /memory replay
@@ -61,8 +71,8 @@ Daemon (separate process, never started by the extension):
 
 ```sh
 npm run daemon -- status
-npm run daemon -- once --home "$PRJCT_HOME" --provider anthropic --model claude-sonnet-4-5
-npm run daemon -- start --home "$PRJCT_HOME" --provider anthropic --model claude-sonnet-4-5
+npm run daemon -- once --home "$PI_MEMORY_HOME" --provider anthropic --model claude-sonnet-4-5
+npm run daemon -- start --home "$PI_MEMORY_HOME" --provider anthropic --model claude-sonnet-4-5
 npm run daemon -- stop
 ```
 
@@ -141,10 +151,11 @@ export default pi => installMemory(pi, {
 ```
 
 Use `sources: { prjct: { home: '/path/to/publisher/home' } }` when the publisher
-root differs from memory's current compatibility home. Uninstalling the prjct
-package or omitting this option does not affect pi-memory's first-party session
-learning and retrieval. Identity and storage still use the legacy shared-home
-contract in this migration stage; they are separated in subsequent changes.
+root differs from memory's home. Uninstalling the prjct package or omitting this
+option does not affect pi-memory's first-party session learning and retrieval.
+During explicit initialization only, a legacy `.prjct/prjct.config.json` locator
+may be adopted when the legacy checksummed identity index confirms the exact
+canonical checkout binding. A locator alone is untrusted.
 
 ### Connecting anything else
 
@@ -206,10 +217,19 @@ review `npm audit --omit=dev` before publishing or deploying.
 
 ## Storage
 
-Each project owns exactly one database at
-`$PRJCT_HOME/<projectId>/memory/memory.sqlite` (default `~/.prjct`). The engine
-refuses team/shared authorities and foreign owners; there is no shared database
-or cross-project fallback.
+Each initialized project owns exactly one database at
+`<memory-home>/<projectId>/memory/memory.sqlite`. Home resolution is: explicit
+`installMemory({ home })`, then `PI_MEMORY_HOME`, then the temporary compatibility
+fallbacks `PRJCT_HOME` and `~/.prjct`. Selecting a new home never moves live data
+implicitly.
+
+The memory-owned project registry is
+`<memory-home>/pi-memory/projects.json`. It is checksummed, updated atomically
+under an exclusive lock, and contains canonical checkout bindings only. A
+missing or corrupt registry never causes path inference during status, recall,
+or daemon discovery. `/memory init` is the sole interactive creation path. The
+engine refuses team/shared authorities and foreign owners; there is no shared
+database or cross-project fallback.
 
 New small projects use a compact authority: hash-chained history, domain state,
 chunks and packed vectors commit together in one bounded SQLite snapshot, with
@@ -235,11 +255,8 @@ npm run eval -- --suite tests/fixtures/retrieval-gold.jsonl
 npm run bench -- --documents 5000 --queries 1000
 npm pack --dry-run --ignore-scripts
 
-# Real Pi load smoke test. /memory status is a slash command, so no provider is
-# called; note the "id" field, which the RPC response is matched on.
-PRJCT_HOME=$(mktemp -d) pi --mode rpc --no-session --no-extensions -e ./index.ts <<'EOF'
-{"id":"memory","type":"prompt","message":"/memory status"}
-EOF
+# Real Pi RPC load, read-only status, explicit init, and reopen checks.
+npm run test:integration
 ```
 
 The MiniLM run is a diagnostic promotion gate, not evidence that hybrid retrieval

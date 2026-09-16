@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { checkpointAndEnqueueLegacy } from './curation/migrate.ts';
 import type { MemoryEngine } from './engine.ts';
@@ -9,7 +10,8 @@ import { registerKnownSources, scopedEngines, type SourceInstallOptions } from '
 import { SourceRegistry, type SourceSyncResult } from './sources/registry.ts';
 import { dueAdapters, PI_SESSION_SYNC_POLICY, type SyncPolicy } from './sources/schedule.ts';
 import { SESSION_ADAPTER_ID } from './sources/session-log.ts';
-import { sha256 } from './workspace/project-identity.ts';
+import { memoryDatabasePath, memoryHomeFor, resolveLegacyProject, sha256 } from './workspace/project-identity.ts';
+import { resolveMemoryProject } from './workspace/memory-registry.ts';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
@@ -21,7 +23,8 @@ export type MemoryExtensionOptions = Readonly<{
   sources?: Omit<SourceInstallOptions, 'home'>;
 }>;
 
-const USAGE = 'Usage: /memory status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
+const USAGE = 'Usage: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
+const ACTIONS = new Set(['init', 'status', 'sources', 'sync', 'index', 'replay', 'rebuild', 'gc', 'checkpoint-wal', 'migrate-curated', 'checkpoint']);
 
 /**
  * Scans publisher sources, records fingerprints and enqueues analysis jobs.
@@ -91,11 +94,41 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   installMemoryTools(pi, runtime);
 
   pi.registerCommand('memory', {
-    description: 'Inspect or maintain pi-memory: /memory status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
+    description: 'Initialize, inspect or maintain pi-memory: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
     handler: async (args, ctx) => {
       try {
-      const engine = await runtime.engine();
       const [action = 'status', target] = args.trim().split(/\s+/).filter(Boolean);
+      if (!ACTIONS.has(action)) throw new Error(USAGE);
+      const home = memoryHomeFor(options.home);
+      if (action === 'init') {
+        if (target) throw new Error('Usage: /memory init');
+        const initialized = await runtime.initialize();
+        ctx.ui.notify(JSON.stringify({
+          initialized: true, ready: true, status: initialized.created ? 'initialized' : 'already_initialized',
+          projectId: initialized.binding.projectId, checkoutId: initialized.binding.checkoutId,
+          location: initialized.binding.location, home, adoptedFrom: initialized.binding.source,
+        }, null, 2), 'info');
+        return;
+      }
+      if (action === 'status') {
+        const binding = await resolveMemoryProject(ctx.cwd, home);
+        if (!binding) {
+          const legacy = await resolveLegacyProject(ctx.cwd, home);
+          ctx.ui.notify(JSON.stringify({ initialized: false, ready: false, home,
+            legacyAvailable: Boolean(legacy), message: 'Run /memory init to create or adopt this project memory.' }, null, 2), 'info');
+          return;
+        }
+        if (!existsSync(memoryDatabasePath(home, binding.projectId))) {
+          ctx.ui.notify(JSON.stringify({ initialized: true, ready: false, home, projectId: binding.projectId,
+            message: 'Initialization is incomplete. Run /memory init to repair this project memory.' }, null, 2), 'info');
+          return;
+        }
+        const engine = await runtime.engine();
+        ctx.ui.notify(JSON.stringify({ initialized: true, ready: true, projectId: binding.projectId,
+          ...engine.projection.stats(), curation: engine.curation.stats() }, null, 2), 'info');
+        return;
+      }
+      const engine = await runtime.engine();
       if (action === 'sources') {
         const ready = await sources(engine);
         ctx.ui.notify(JSON.stringify({
@@ -141,12 +174,17 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
       if (action === 'checkpoint') {
         const raw = args.trim().slice('checkpoint'.length).trim();
         if (!raw) throw new Error('Usage: /memory checkpoint {"goal":"...","constraints":[],"done":[],"inProgress":[],"blocked":[],"decisions":[],"evidenceRefs":[],"nextSteps":[]}');
-        const saved = await runtime.handoff.persist(engine, ctx.sessionManager.getSessionId(), JSON.parse(raw));
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+          || typeof (parsed as { goal?: unknown }).goal !== 'string' || !(parsed as { goal: string }).goal.trim()) {
+          throw new Error('/memory checkpoint requires a non-empty goal.');
+        }
+        const saved = await runtime.handoff.persist(engine, ctx.sessionManager.getSessionId(),
+          parsed as Parameters<typeof runtime.handoff.persist>[2]);
         ctx.ui.notify(JSON.stringify(saved, null, 2), 'info');
         return;
       }
-      const report = action === 'status' ? { ...engine.projection.stats(), curation: engine.curation.stats() }
-        : action === 'replay' ? await engine.replay(false)
+      const report = action === 'replay' ? await engine.replay(false)
         : action === 'rebuild' ? await engine.rebuild()
         : action === 'gc' ? await runGc(engine)
         : action === 'checkpoint-wal' ? engine.projection.checkpointWal()

@@ -34,7 +34,8 @@ current implementation follows that design.
 npm run eval:real -- --cases /private/cases.json
 ```
 
-The command snapshots `PRJCT_HOME` (default `~/.prjct`), the Pi team mailbox,
+The command snapshots the configured memory/source home (`PI_MEMORY_HOME`, with
+`PRJCT_HOME` and `~/.prjct` retained as compatibility fallbacks), the Pi team mailbox,
 and the cached local encoder into a new private temporary workspace. It excludes
 old memory/vector indexes, backups and symlinks. It then ingests through the real
 source registry into new workspace indexes. Original configuration cannot select

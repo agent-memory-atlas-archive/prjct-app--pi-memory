@@ -8,7 +8,7 @@ import { DEFAULT_RECALL_THRESHOLD } from '../src/extension/hooks.ts';
 import { registerKnownSources } from '../src/sources/install.ts';
 import { SourceRegistry } from '../src/sources/registry.ts';
 import { DEFAULT_LOCAL_MODEL, TransformerEmbeddingProvider } from '../src/vector/providers.ts';
-import { prjctHomeFor } from '../src/workspace/project-identity.ts';
+import { memoryHomeFor } from '../src/workspace/project-identity.ts';
 
 type Case = { name: string; projectId: string; query: string; relevantIds?: string[]; contains?: string; maxRank?: number; abstain?: boolean };
 type Snapshot = { version: 2; source: string; models: string; indexes: string; createdAt: string };
@@ -40,7 +40,7 @@ const snapshot: Snapshot = process.argv.includes('--reuse')
     if (arg('--workspace')) await mkdir(workspace, { mode: 0o700 });
     const paths: Snapshot = { version: 2, source: join(workspace, 'source'),
       models: join(workspace, 'models'), indexes: join(workspace, 'indexes'), createdAt: new Date().toISOString() };
-    const source = resolve(arg('--home') ?? prjctHomeFor());
+    const source = resolve(arg('--home') ?? memoryHomeFor());
     const modelCache = resolve(arg('--model-cache') ?? join(source, cases[0]!.projectId, 'memory', 'models'));
     await mkdir(paths.source, { mode: 0o700 });
     for (const projectId of [...new Set(cases.map(item => item.projectId))]) {
@@ -59,7 +59,7 @@ for (const path of [snapshot.source, snapshot.models, snapshot.indexes]) {
 }
 // Force all provider/cache and engine writes into the snapshot. Never open an
 // original memory SQLite file or honor an original remote-provider config.
-process.env.PRJCT_HOME = snapshot.indexes;
+process.env.PI_MEMORY_HOME = snapshot.indexes;
 const engines = new Map<string, MemoryEngine>();
 const engineFor = async (projectId: string): Promise<MemoryEngine> => {
   if (!engines.has(projectId)) {

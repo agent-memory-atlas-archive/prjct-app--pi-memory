@@ -22,6 +22,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createHandoffController, installHandoffHooks } from '../../src/handoff/hooks.ts';
+import { MemoryEngine } from '../../src/engine.ts';
 import { installMemory } from '../../src/index.ts';
 
 const usage = () => ({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
@@ -113,6 +114,9 @@ test('public Pi SDK sends bounded provider contexts across A→B→A and a multi
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-handoff-sdk-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const captures: ProviderCapture[] = [];
+  const home = join(root, 'home');
+  const initialized = await MemoryEngine.initializeProject(root, 'handoff-setup', { home });
+  await initialized.engine.dispose();
   const { modelRuntime, modelA, modelB } = await createOfflineRuntime(root, captures);
   const tool = (name: 'offline_one' | 'offline_two', result: string) => defineTool({
     name, label: name, description: `Return ${result}`, parameters: Type.Object({}),
@@ -121,7 +125,7 @@ test('public Pi SDK sends bounded provider contexts across A→B→A and a multi
   const resourceLoader = new DefaultResourceLoader({
     cwd: root, agentDir: join(root, 'agent'), systemPromptOverride: () => 'SDK_SYSTEM_POLICY',
     extensionFactories: [pi => installMemory(pi, {
-      home: join(root, 'home'),
+      home,
       handoff: { maxTokens: 12_000, maxBytes: 65_536, maxMessages: 6, toolSchemaReserveTokens: 1_000 },
     })],
   });

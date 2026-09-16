@@ -8,12 +8,25 @@ import { loadDaemonConfig } from '../src/daemon/config.ts';
 import { GlobalBudgetLedger } from '../src/daemon/budget.ts';
 import { executeDaemonCommand } from '../src/daemon/cli.ts';
 import { daemonStatus, startDaemon, stopDaemon } from '../src/daemon/lifecycle.ts';
-import { runCycle } from '../src/daemon/worker.ts';
+import { discoverProjectIds, runCycle } from '../src/daemon/worker.ts';
 import { MemoryEngine } from '../src/engine.ts';
 import { JsonRecordAdapter } from '../src/sources/records.ts';
 import { SourceRegistry } from '../src/sources/registry.ts';
 import { appendSessionObservations } from '../src/sources/session-log.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
+
+test('daemon discovery includes standalone registry bindings without a legacy identity index', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-daemon-discovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const checkout = join(root, 'checkout');
+  await mkdir(checkout);
+  const initialized = await MemoryEngine.initializeProject(checkout, 'daemon-discovery', {
+    home, provider: new TestEmbeddingProvider(),
+  });
+  await initialized.engine.dispose();
+  assert.deepEqual(await discoverProjectIds(home), [initialized.binding.projectId]);
+});
 
 test('the shared budget permits only one claimant for the last call', async t => {
   const home = await mkdtemp(join(tmpdir(), 'pi-memory-budget-'));
