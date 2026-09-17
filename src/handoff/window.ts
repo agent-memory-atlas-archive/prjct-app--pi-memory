@@ -36,7 +36,8 @@ export const createContextWindow = () => {
     if (!selected.ok) return selected;
     // Prune in batches, leaving growth room instead of shifting the cache prefix
     // on every next turn. The mandatory current turn always uses the hard limits.
-    const compact = selected.omittedTurns > 0 ? selectHandoffMessages(candidates, checkpoint, {
+    // A truncated pack is already at the hard limit; shrinking toward 75% would only cut more evidence.
+    const compact = selected.omittedTurns > 0 && selected.truncatedFields === 0 ? selectHandoffMessages(candidates, checkpoint, {
       ...budget,
       maxTokens: Math.max(1, Math.floor(budget.maxTokens * 0.75)),
       maxBytes: Math.max(1, Math.floor(budget.maxBytes * 0.75)),

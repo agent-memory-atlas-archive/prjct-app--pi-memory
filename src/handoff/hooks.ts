@@ -157,7 +157,7 @@ export const createHandoffController = (options: {
     slot.windows.set(windowKey, window);
     const selected = window(current, checkpoint, budget, overheadFor(ctx));
     if (!selected.ok) return refuse(ctx, selected.instruction);
-    if (selected.omittedTurns > 0) {
+    if (selected.omittedTurns > 0 || selected.truncatedFields > 0) {
       try { ctx.ui.notify(
         `Handoff ${selected.preTokens}→${selected.postTokens} tokens, ${selected.preBytes}→${selected.postBytes} bytes. ${selected.reason}`,
         'info',

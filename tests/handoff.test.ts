@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai';
-import { readCheckpoint, writeCheckpoint } from '../src/handoff/checkpoint.ts';
+import { assertCheckpoint, readCheckpoint, writeCheckpoint } from '../src/handoff/checkpoint.ts';
 import { createHandoffController } from '../src/handoff/hooks.ts';
 import { DEFAULT_HANDOFF_BUDGET, selectHandoffMessages } from '../src/handoff/select.ts';
 import { groupTurns, type HandoffMessage } from '../src/handoff/turns.ts';
@@ -110,7 +110,57 @@ test('a growing current turn drops older complete tool rounds instead of abortin
   }
 });
 
-test('the newest tool round remains atomic and refuses when it cannot fit', () => {
+test('an oversized newest tool result is truncated in place instead of aborting', () => {
+  const overhead = { systemTokens: 3_402, systemBytes: 13_610, toolSchemaTokens: 3_401, toolSchemaBytes: 13_604 };
+  const request = user('continue the refactor');
+  const messages = [
+    request,
+    assistant('read', ['big']), tool('big', `HEAD-MARK ${'y'.repeat(100_000)} TAIL-MARK`),
+  ];
+  const selected = selectHandoffMessages(messages, assertCheckpoint({ projectId: 'p', sessionId: 's', goal: 'finish the refactor' }), DEFAULT_HANDOFF_BUDGET, overhead);
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.ok(selected.postTokens <= DEFAULT_HANDOFF_BUDGET.maxTokens);
+    assert.ok(selected.postBytes <= DEFAULT_HANDOFF_BUDGET.maxBytes);
+    assert.equal(selected.truncatedFields, 1);
+    assert.equal(selected.messages.length, 4);
+    assert.equal(selected.messages[1], request);
+    const result = selected.messages[3]!;
+    assert.equal(result.role, 'toolResult');
+    assert.equal(result.toolCallId, 'big');
+    const text = (result.content as { text: string }[])[0]!.text;
+    assert.match(text, /^HEAD-MARK/);
+    assert.match(text, /TAIL-MARK$/);
+    assert.match(text, /chars omitted to fit the context budget/);
+    // Truncation should use the available room, not collapse to the minimum.
+    assert.ok(selected.postTokens > DEFAULT_HANDOFF_BUDGET.maxTokens * 0.9);
+  }
+});
+
+test('truncation drops oversized images and caps large tool-call arguments before touching the request', () => {
+  const request = user('write the generated file');
+  const call = {
+    role: 'assistant',
+    content: [{ type: 'toolCall', id: 'w', name: 'write', arguments: { path: 'out.ts', content: 'z'.repeat(80_000) } }],
+  } as HandoffMessage;
+  const shot = { role: 'toolResult', toolCallId: 'w',
+    content: [{ type: 'image', data: 'i'.repeat(200_000), mimeType: 'image/png' }, { type: 'text', text: 'written' }] } as HandoffMessage;
+  const selected = selectHandoffMessages([request, call, shot], undefined, DEFAULT_HANDOFF_BUDGET,
+    { systemTokens: 3_402, systemBytes: 13_610, toolSchemaTokens: 3_401, toolSchemaBytes: 13_604 });
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.equal(selected.messages[0], request);
+    const [, keptCall, keptShot] = selected.messages;
+    const args = (keptCall!.content as { arguments: { path: string; content: string } }[])[0]!.arguments;
+    assert.equal(args.path, 'out.ts');
+    assert.ok(args.content.length < 80_000);
+    assert.deepEqual((keptShot!.content as { type: string }[]).map(block => block.type), ['text', 'text']);
+    assert.ok(selected.postBytes <= DEFAULT_HANDOFF_BUDGET.maxBytes);
+    assert.ok(selected.postTokens <= DEFAULT_HANDOFF_BUDGET.maxTokens);
+  }
+});
+
+test('the newest tool round remains atomic and refuses when even truncation cannot fit', () => {
   const messages = [user('keep the request'), assistant('latest call', ['latest']), tool('latest', 'x'.repeat(20_000))];
   const selected = selectHandoffMessages(messages, undefined,
     { maxTokens: 100, maxBytes: 500, maxMessages: 3, toolSchemaReserveTokens: 20 });
