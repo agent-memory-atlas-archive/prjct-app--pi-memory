@@ -94,11 +94,46 @@ test('unmatched tool pair is refused', () => {
   assert.equal(selected.ok, false);
 });
 
+test('a growing current turn drops older complete tool rounds instead of aborting', () => {
+  const messages = [
+    user('keep the operator request'),
+    assistant('first call', ['old-1']), tool('old-1', 'large old result '.repeat(200)),
+    assistant('second call', ['old-2']), tool('old-2', 'another old result '.repeat(200)),
+    assistant('latest call', ['latest']), tool('latest', 'latest evidence'),
+  ];
+  const selected = selectHandoffMessages(messages, undefined,
+    { maxTokens: 8_000, maxBytes: 32_768, maxMessages: 3, toolSchemaReserveTokens: 0 });
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.deepEqual(selected.messages, [user('keep the operator request'), assistant('latest call', ['latest']), tool('latest', 'latest evidence')]);
+    assert.match(selected.reason, /2 older tool round/);
+  }
+});
+
+test('the newest tool round remains atomic and refuses when it cannot fit', () => {
+  const messages = [user('keep the request'), assistant('latest call', ['latest']), tool('latest', 'x'.repeat(20_000))];
+  const selected = selectHandoffMessages(messages, undefined,
+    { maxTokens: 100, maxBytes: 500, maxMessages: 3, toolSchemaReserveTokens: 20 });
+  assert.equal(selected.ok, false);
+  if (!selected.ok) {
+    assert.match(selected.instruction, /newest complete tool round/i);
+    assert.doesNotMatch(selected.instruction, /messages 20_000/);
+  }
+});
+
+test('serialized message bytes include JSON array framing', () => {
+  const messages = [user('one'), assistant('two')];
+  const selected = selectHandoffMessages(messages, undefined,
+    { maxTokens: 8_000, maxBytes: 32_768, maxMessages: 4, toolSchemaReserveTokens: 0 });
+  assert.equal(selected.ok, true);
+  if (selected.ok) assert.equal(selected.postBytes, Buffer.byteLength(JSON.stringify(selected.messages), 'utf8'));
+});
+
 test('no checkpoint and oversized current turn fails closed', () => {
   const huge = user('x'.repeat(20_000));
   const selected = selectHandoffMessages([huge], undefined, { maxTokens: 50, maxBytes: 100, maxMessages: 4, toolSchemaReserveTokens: 20 });
   assert.equal(selected.ok, false);
-  if (!selected.ok) assert.match(selected.instruction, /no (?:continuity )?checkpoint/i);
+  if (!selected.ok) assert.match(selected.instruction, /current request/i);
 });
 
 test('checkpoints are private project/session rows excluded from recall and semantic stats', async t => {
