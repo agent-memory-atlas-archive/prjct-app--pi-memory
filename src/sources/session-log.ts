@@ -11,8 +11,9 @@ const MAX_TURN_OBSERVATIONS = 64;
 const REMEMBER = /(?:\bremember(?:\s+(?:that|to))?\b|\brecuerda(?:\s+que)?\b|\bacuérdate(?:\s+de)?\b)/iu;
 const LEARNABLE = /(?:\b(always|never|don't|do not|prefer|instead|wrong|incorrect|use \S+ not|nunca|no uses?|en vez de|incorrect[oa]|prefier[eo])\b|\bremember(?:\s+(?:that|to))?\b|\brecuerda(?:\s+que)?\b|\bacuérdate(?:\s+de)?\b)/iu;
 const CORRECTION = /\b(never|don't|do not|instead|wrong|incorrect|use \S+ not|prefer|nunca|no uses?|en vez de|incorrect[oa]|prefier[eo])\b/iu;
-const ROUTINE_FAILURE = /(?:missing script|module not found|cannot find module|command not found|no such file|unknown command|exited? (?:with )?(?:code )?\d+|process failed)\b/iu;
+const ROUTINE_FAILURE = /(?:missing script|module not found|cannot find module|command not found|no such file|unknown command|process failed)\b/iu;
 const REUSABLE_FAILURE = /\b(?:because|caused by|race|deadlock|stale|invalidat|overflow|leak|corrupt|timeout|permission|auth|lock|cache key|regression)\b/iu;
+const DIAGNOSTIC_FAILURE = /(?:error TS\d+|TypeError|AssertionError|not ok\b|EACCES|EPERM|ENOENT|SQLITE_|FAIL:)/u;
 
 export type SessionObservation = Readonly<{
   id: string;
@@ -66,8 +67,16 @@ export const sessionObservationWorthy = (input: Readonly<{
   if (input.kind === 'correction') return LEARNABLE.test(summary);
   if (input.kind === 'instruction') return input.tool === 'user_input' && LEARNABLE.test(summary);
   if (input.outcome !== 'failed' && input.kind !== 'failure') return false;
-  if (ROUTINE_FAILURE.test(summary) && !REUSABLE_FAILURE.test(summary)) return false;
-  return summary.length >= 40 && contentWords(summary).length >= 6 && REUSABLE_FAILURE.test(summary);
+  const diagnostic = DIAGNOSTIC_FAILURE.test(summary) || REUSABLE_FAILURE.test(summary);
+  if (ROUTINE_FAILURE.test(summary) && !diagnostic) return false;
+  return summary.length >= 40 && contentWords(summary).length >= 6 && diagnostic;
+};
+
+/** Strip the host wrapper so capture/recall see the diagnosis, not "bash failed". */
+export const sessionFailureStatement = (summary: string): string => {
+  const clipped = clipSessionSummary(summary);
+  const stripped = clipped.replace(/^\S+\s+failed(?:\s+|>\s*)/iu, '').trim();
+  return stripped.length >= 12 ? stripped : clipped;
 };
 
 const normalizedMeaning = (summary: string): string => clipSessionSummary(summary).toLocaleLowerCase()

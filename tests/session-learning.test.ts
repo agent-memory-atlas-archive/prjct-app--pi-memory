@@ -25,6 +25,11 @@ test('session log keeps failures and corrections, not routine successes or secre
   assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed', summary: 'bash failed: missing module' }), false);
   assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed',
     summary: 'bash failed because the cache key omitted inode and size, leaving stale generated output' }), true);
+  assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed',
+    summary: 'bash failed error TS2688: Cannot find type definition file for node. Command exited with code 2' }), true,
+    'compiler errors remain learnable even when the host appends an exit code');
+  assert.equal(sessionObservationWorthy({ kind: 'failure', tool: 'bash', outcome: 'failed',
+    summary: 'bash failed Command exited with code 1' }), false);
   assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated', summary: 'Always use pnpm in this repo, never npm.' }), true);
   assert.equal(sessionObservationWorthy({ kind: 'instruction', tool: 'user_input', outcome: 'stated',
     summary: 'Recuerda usar Zod para validar los límites de la API.' }), true);
@@ -180,6 +185,37 @@ test('an explicit recuerda declaration is supported and recalled by the next ses
   }, ctx(cwd, 'new-session'));
   assert.match(recalled.message?.content ?? '', /Recuerda usar Zod/);
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
+});
+
+test('a compiler failure is a supported fact and is recalled without a daemon', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-compiler-'));
+  const cwd = join(home, 'work');
+  await mkdir(cwd, { recursive: true });
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const handlers = new Map<string, (event: any, context: any) => Promise<any>>();
+  const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  const runtime = installMemoryHooks(pi, { home });
+  await handlers.get('session_start')!({}, ctx(cwd, 'fail-session'));
+  await runtime.initialize();
+  await handlers.get('tool_result')!({
+    toolName: 'bash', toolCallId: 'tsc1', isError: true,
+    content: [{ type: 'text', text: 'error TS2688: Cannot find type definition file for node. Command exited with code 2' }],
+  }, ctx(cwd, 'fail-session'));
+  await handlers.get('turn_end')!({}, ctx(cwd, 'fail-session'));
+  const first = await runtime.engine();
+  const failure = first.projection.activeFacts(first.scopeId, 20).find(fact => fact.kind === 'failure');
+  assert.equal(failure?.standing, 'supported');
+  assert.equal(failure?.evidence[0]?.provenance, 'native_observation');
+  assert.match(failure?.statement ?? '', /error TS2688/);
+  assert.doesNotMatch(failure?.statement ?? '', /^bash failed/u);
+  assert.equal(first.projection.stats().vectors, 0);
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'fail-session'));
+  await handlers.get('session_start')!({}, ctx(cwd, 'next-session'));
+  const recalled = await handlers.get('before_agent_start')!({
+    prompt: 'error TS2688 Cannot find type definition file for node', systemPrompt: 'Base',
+  }, ctx(cwd, 'next-session'));
+  assert.match(recalled.message?.content ?? '', /error TS2688/);
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'next-session'));
 });
 
 test('pi-session provenance is host-owned and its source cannot be symlinked to another project', async t => {

@@ -5,10 +5,12 @@ import { hostEvidence, MemoryEngine } from '../engine.ts';
 import { createHandoffController, installHandoffHooks } from '../handoff/hooks.ts';
 import type { HandoffBudget } from '../handoff/select.ts';
 import { federatedSearch } from '../retrieval/federated.ts';
+import { admitCapture } from '../retention/capture-gate.ts';
 import { redactSecrets } from '../security/redact.ts';
 import {
   appendSessionObservations, clipSessionSummary, declaredCorrectionQuote, declaredMemoryQuote,
-  sessionObservationId, sessionObservationIdentity, sessionObservationWorthy, type SessionObservation,
+  sessionFailureStatement, sessionObservationId, sessionObservationIdentity, sessionObservationWorthy,
+  type SessionObservation,
 } from '../sources/session-log.ts';
 import { memoryHomeFor, sha256 } from '../workspace/project-identity.ts';
 import { resolveMemoryProject } from '../workspace/memory-registry.ts';
@@ -145,6 +147,33 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     }
   };
 
+  const promoteSessionFailures = async (project: MemoryEngine, observations: readonly SessionObservation[]): Promise<void> => {
+    const existing = project.projection.activeFacts(project.scopeId, 200).map(item => ({ statement: item.statement, kind: item.kind }));
+    for (const record of observations) {
+      if (record.kind !== 'failure' || !sessionObservationWorthy(record)) continue;
+      const statement = sessionFailureStatement(record.summary);
+      const admission = admitCapture({ statement, kind: 'failure', existing });
+      if (!admission.accept) continue;
+      const identity = sessionObservationIdentity('failure', record.tool, record.summary);
+      const id = `mem_${sha256(`failure:${project.scopeId}:${identity.semanticKey}:${identity.summaryHash}`).slice(0, 32)}`;
+      if (project.projection.getFact(id)) continue;
+      await project.recordFact({
+        id, kind: 'failure', statement, confidence: 0.8, standing: 'supported',
+        entities: [], episodeIds: [], validAt: record.observedAt,
+        evidence: [{
+          id: `ev_${sha256(`failure:${project.scopeId}:${identity.summaryHash}`).slice(0, 24)}`,
+          origin: 'host_observation', provenance: 'native_observation', contentHash: sha256(statement),
+          excerpt: statement, observedAt: record.observedAt,
+          actorId: record.sessionId, sessionId: record.sessionId,
+        }],
+        tags: { semanticKey: identity.semanticKey, summaryHash: identity.summaryHash, source: 'pi-session', capture: 'auto-derived' },
+      }, undefined, { dense: false }).catch(error => {
+        if (!(error instanceof Error) || !/already exists/u.test(error.message)) throw error;
+      });
+      existing.push({ statement, kind: 'failure' });
+    }
+  };
+
   const flushSessionObservations = async (): Promise<void> => {
     const pending = get();
     if (!pending.observations.length && !pending.declarations.length) return;
@@ -154,6 +183,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
       await appendSessionObservations({ projectId: project.scopeId, records: pending.observations,
         ...(options.home === undefined ? {} : { home: options.home }) });
       await promoteDeclaredFacts(project, pending.declarations);
+      await promoteSessionFailures(project, pending.observations);
     } catch (error) {
       set({ observations: [...pending.observations, ...get().observations].slice(-64),
         declarations: [...pending.declarations, ...get().declarations].slice(-16) });

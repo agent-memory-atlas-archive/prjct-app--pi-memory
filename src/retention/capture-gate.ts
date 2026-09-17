@@ -1,7 +1,7 @@
 /** Shared admission for agent capture and daemon publication; never a fail-open volume gate. */
 
 const ROUTINE = /^(ok|okay|done|lgtm|wip|todo|n\/a|thanks|thx)\.?$/iu;
-const TOOL_DUMP = /^(bash|npm|git|pi)\s+(succeeded|failed)\b/iu;
+const TOOL_DUMP = /^(bash|npm|git|pi)\s+(succeeded|failed)\.?$/iu;
 
 export type CaptureAdmission = Readonly<{ accept: boolean; reason: string }>;
 
