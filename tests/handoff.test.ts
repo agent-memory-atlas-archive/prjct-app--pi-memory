@@ -129,6 +129,21 @@ test('serialized message bytes include JSON array framing', () => {
   if (selected.ok) assert.equal(selected.postBytes, Buffer.byteLength(JSON.stringify(selected.messages), 'utf8'));
 });
 
+test('the default byte ceiling admits signed reasoning payloads that fit the token ceiling', () => {
+  const signed = {
+    ...assistant('latest signed call', ['signed']),
+    content: [{ type: 'thinking', thinking: 'brief', thinkingSignature: 's'.repeat(150_000) }],
+  } as HandoffMessage;
+  const selected = selectHandoffMessages([user('continue'), signed, tool('signed', 'ok')], undefined,
+    DEFAULT_HANDOFF_BUDGET, { systemTokens: 3_402, systemBytes: 13_610, toolSchemaTokens: 3_401, toolSchemaBytes: 13_604 });
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.ok(selected.postTokens <= DEFAULT_HANDOFF_BUDGET.maxTokens);
+    assert.ok(selected.postBytes > 170_000);
+    assert.ok(selected.postBytes <= DEFAULT_HANDOFF_BUDGET.maxBytes);
+  }
+});
+
 test('no checkpoint and oversized current turn fails closed', () => {
   const huge = user('x'.repeat(20_000));
   const selected = selectHandoffMessages([huge], undefined, { maxTokens: 50, maxBytes: 100, maxMessages: 4, toolSchemaReserveTokens: 20 });
