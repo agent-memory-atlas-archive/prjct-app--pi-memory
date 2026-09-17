@@ -24,7 +24,7 @@ If the continuity prefix, current request, newest complete tool round, and provi
 
 ## Budgets
 
-The default ceiling is 16,000 estimated tokens, 65,536 bytes, and 48 messages, including measured system/tool overhead. `MemoryExtensionOptions.handoff` configures:
+The default ceiling is 16,000 estimated tokens, 262,144 bytes, and 48 messages, including measured system/tool overhead. `MemoryExtensionOptions.handoff` configures:
 
 - `maxTokens`: system prompt + explicit tool-schema reserve + selected messages
 - `maxBytes`: measured system prompt + active tool definitions + serialized selected messages

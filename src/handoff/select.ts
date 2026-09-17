@@ -20,7 +20,7 @@ export type HandoffOverhead = Readonly<{
 
 export const DEFAULT_HANDOFF_BUDGET: HandoffBudget = {
   maxTokens: 16_000,
-  maxBytes: 65_536,
+  maxBytes: 262_144,
   maxMessages: 48,
   toolSchemaReserveTokens: 1_500,
 };
