@@ -65,7 +65,9 @@ export const stopDaemon = async (home: string, timeoutMs = 10_000): Promise<{ st
   return { stopped: true, pid: recorded.pid };
 };
 
-const cliPath = (): string => fileURLToPath(new URL('../../scripts/memory-daemon.ts', import.meta.url));
+// The compiled local build (scripts/build-pi.mjs) ships memory-daemon.js; source runs keep the .ts entry.
+const cliPath = (): string => fileURLToPath(new URL(
+  import.meta.url.endsWith('.ts') ? '../../scripts/memory-daemon.ts' : '../../scripts/memory-daemon.js', import.meta.url));
 
 const waitAlive = async (home: string, token: string, pid: number, timeoutMs = 8_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;

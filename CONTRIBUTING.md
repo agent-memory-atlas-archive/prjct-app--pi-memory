@@ -13,4 +13,5 @@
 - Host observations may only receive native provenance from extension event handlers.
 - Keep runtime dependencies in `dependencies`; list Pi-provided packages in `peerDependencies`.
 - Run `npm run check`, `npm test`, `npm run test:integration`, and `npm pack --dry-run` before review.
+- Build the compiled local copy Pi loads with `npm run build:pi`. It writes `~/.pi/agent/builds/<package>` outside the repository, because compiled code inside it would load the repository's development copy of Pi instead of the host's.
 - Never push, open or merge a pull request, publish, or deploy without explicit authorization.
