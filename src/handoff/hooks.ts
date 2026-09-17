@@ -4,6 +4,7 @@ import { budgetForModel, DEFAULT_HANDOFF_BUDGET, estimateHandoffTokens, selectHa
 import { assertCheckpoint, readCheckpoint, writeCheckpoint, type OperationalCheckpoint } from './checkpoint.ts';
 import type { HandoffMessage } from './turns.ts';
 import { createContextWindow } from './window.ts';
+import { DEFAULT_OBSERVATION_POLICY, type ObservationPolicy } from './observations.ts';
 
 export type HandoffState = Readonly<{
   projectId: string;
@@ -35,7 +36,10 @@ export const createHandoffController = (options: {
   /** Explicit ceiling. Omitted means derived per request from the active model's context window. */
   budget?: HandoffBudget;
   toolOverhead?: () => { toolSchemaTokens?: number; toolSchemaBytes?: number };
+  /** Stale tool-output masking; defaults to DEFAULT_OBSERVATION_POLICY. */
+  observations?: Partial<ObservationPolicy>;
 } ) => {
+  const observations: ObservationPolicy = { ...DEFAULT_OBSERVATION_POLICY, ...options.observations };
   const budget = options.budget ?? DEFAULT_HANDOFF_BUDGET;
   const budgetFor = (ctx: ExtensionContext): HandoffBudget => options.budget ?? budgetForModel(ctx.model);
   const slot: {
@@ -155,10 +159,16 @@ export const createHandoffController = (options: {
     if (engine && !gate.projectId) activate(engine.scopeId, ctx.cwd, sessionId, 'Durable checkpoint authority available');
     const checkpoint = engine ? readCheckpoint(engine, sessionId) : undefined;
     const windowKey = gateKeyOf(ctx.cwd, sessionId);
-    const window = slot.windows.get(windowKey) ?? createContextWindow();
+    const window = slot.windows.get(windowKey) ?? createContextWindow(observations);
     slot.windows.set(windowKey, window);
     const selected = window(current, checkpoint, budgetFor(ctx), overheadFor(ctx));
     if (!selected.ok) return refuse(ctx, selected.instruction);
+    if (selected.observations?.masked) {
+      try { ctx.ui.notify(
+        `Context: elided ${selected.observations.masked} stale tool output(s), ~${selected.observations.maskedTokens} tokens. Recent rounds are intact; re-run a tool to see an elided output.`,
+        'info',
+      ); } catch { /* UI failure must not discard the valid bounded context. */ }
+    }
     if (selected.omittedTurns > 0 || selected.truncatedFields > 0) {
       try { ctx.ui.notify(
         `Handoff ${selected.preTokens}→${selected.postTokens} tokens, ${selected.preBytes}→${selected.postBytes} bytes. ${selected.reason}`,

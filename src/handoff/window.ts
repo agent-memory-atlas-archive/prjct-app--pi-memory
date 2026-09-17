@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { OperationalCheckpoint } from './checkpoint.ts';
 import { selectHandoffMessages, type HandoffBudget, type HandoffOverhead, type HandoffResult } from './select.ts';
+import {
+  DEFAULT_OBSERVATION_POLICY, maskObservations, nextObservationFrontier, type ObservationPolicy,
+} from './observations.ts';
 import type { HandoffMessage } from './turns.ts';
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -19,18 +22,31 @@ const uniqueRecall = (messages: readonly HandoffMessage[]): readonly HandoffMess
   });
 };
 
+export type WindowResult = HandoffResult & Readonly<{
+  /** Present when this call advanced the observation-masking frontier. */
+  observations?: Readonly<{ masked: number; maskedTokens: number }>;
+}>;
+
 /** Session-local watermark, not a provider cache. No transcript or state is written to disk. */
-export const createContextWindow = () => {
-  const state = { floor: 0, prefix: '' };
+export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVATION_POLICY) => {
+  const state = { floor: 0, prefix: '', frontier: 0, frontierPrefix: '' };
   return (messages: readonly HandoffMessage[], checkpoint: OperationalCheckpoint | undefined,
-    budget: HandoffBudget, overhead: HandoffOverhead): HandoffResult => {
+    budget: HandoffBudget, overhead: HandoffOverhead): WindowResult => {
     // Compaction/tree edits replace the source history; only append-only histories
     // may reuse the watermark. Hashes work with Pi's deep-copied context events.
     const floor = state.floor < messages.length
       && state.prefix === digest(messages.slice(0, state.floor + 1)) ? state.floor : 0;
-    const summary = messages.filter(isSummary).at(-1);
+    const priorFrontier = state.frontier <= messages.length
+      && state.frontierPrefix === digest(messages.slice(0, state.frontier)) ? state.frontier : 0;
+    const frontier = nextObservationFrontier(messages, priorFrontier, policy);
+    state.frontier = frontier;
+    state.frontierPrefix = digest(messages.slice(0, frontier));
+    // The masked view has the same indexes as the host history.
+    const masking = maskObservations(messages, frontier, policy);
+    const view = masking.messages;
+    const summary = view.filter(isSummary).at(-1);
     const candidates = uniqueRecall([
-      ...(summary ? [summary] : []), ...messages.slice(floor).filter(message => !isSummary(message)),
+      ...(summary ? [summary] : []), ...view.slice(floor).filter(message => !isSummary(message)),
     ]);
     const selected = selectHandoffMessages(candidates, checkpoint, budget, overhead);
     if (!selected.ok) return selected;
@@ -44,10 +60,12 @@ export const createContextWindow = () => {
       maxMessages: Math.max(1, Math.floor(budget.maxMessages * 0.75)),
     }, overhead) : selected;
     const result = compact.ok ? compact : selected;
-    const first = result.messages.find(message => !isSummary(message) && messages.includes(message));
-    const nextFloor = first ? messages.indexOf(first) : floor;
+    const first = result.messages.find(message => !isSummary(message) && view.includes(message));
+    const nextFloor = first ? view.indexOf(first) : floor;
     state.floor = Math.max(floor, nextFloor);
     state.prefix = digest(messages.slice(0, state.floor + 1));
-    return result;
+    return frontier > priorFrontier
+      ? { ...result, observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } }
+      : result;
   };
 };
