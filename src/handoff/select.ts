@@ -1,6 +1,7 @@
 import { estimateTokens } from '@earendil-works/pi-coding-agent';
 import type { OperationalCheckpoint } from './checkpoint.ts';
 import { renderCheckpoint } from './checkpoint.ts';
+import { shrinkToFit } from './shrink.ts';
 import { groupTurns, toolCallIds, turnIsComplete, type HandoffMessage, type Turn } from './turns.ts';
 
 export type HandoffBudget = Readonly<{
@@ -41,6 +42,8 @@ export type HandoffResult = Readonly<{
   postBytes: number;
   systemBytes: number;
   omittedTurns: number;
+  /** Oversized strings capped because the mandatory pack could not otherwise fit. */
+  truncatedFields: number;
   reason: string;
 }> | Readonly<{
   ok: false;
@@ -180,7 +183,29 @@ export const selectHandoffMessages = (
   }
   const currentFit = current ? fitCurrentTurn(current, prefix, budget, overhead) : undefined;
   const minimum = currentFit?.ok === false ? [...prefix, ...currentFit.minimum] : prefix;
+  const continuityOf = (selected: readonly HandoffMessage[]): string =>
+    selected[0]?.role === 'compactionSummary' || selected[0]?.role === 'branchSummary'
+      ? 'latest Pi summary' : prefix.length ? 'explicit checkpoint' : 'no checkpoint';
   if (currentFit?.ok === false || (!current && !fits(minimum, budget, overhead))) {
+    // Degrade before refusing: aborting a healthy agent loop because one tool
+    // result is large is worse than showing the model a truncated copy of it.
+    const shrunk = minimum.length <= budget.maxMessages
+      ? shrinkToFit(minimum, pack => fits(pack, budget, overhead)) : undefined;
+    if (shrunk) {
+      const post = packCost(shrunk.messages, budget, overhead);
+      const keptTurns = current ? 1 : 0;
+      const omittedTurns = Math.max(0, turns.length - keptTurns);
+      const rounds = (items: readonly HandoffMessage[]): number => items.filter(message => toolCallIds(message).length).length;
+      const omittedToolRounds = current ? rounds(current.messages) - rounds(minimum) : 0;
+      return {
+        ok: true, messages: shrunk.messages, preTokens: pre.tokens, postTokens: post.tokens,
+        preMessageTokens: pre.messageTokens, postMessageTokens: post.messageTokens,
+        systemTokens: overhead.systemTokens, toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
+        preBytes: pre.bytes, postBytes: post.bytes, systemBytes: overhead.systemBytes,
+        omittedTurns, truncatedFields: shrunk.truncatedFields,
+        reason: `Kept ${continuityOf(shrunk.messages)} and ${keptTurns} complete turn(s); omitted ${omittedTurns} older turn(s) and ${omittedToolRounds} older tool round(s) from the current turn; truncated ${shrunk.truncatedFields} oversized field(s) to ${shrunk.keep} chars to fit the budget. Tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${post.messageTokens} = ${post.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${post.bytes - overhead.systemBytes - toolBytes} = ${post.bytes}.`,
+      };
+    }
     const required = packCost(minimum, budget, overhead);
     const requiredDiagnostic = `Required tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${required.messageTokens} = ${required.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${required.bytes - overhead.systemBytes - toolBytes} = ${required.bytes}.`;
     return {
@@ -203,14 +228,13 @@ export const selectHandoffMessages = (
   }
   const selected = [...prefix, ...kept.turns.flatMap(turn => turn.messages)];
   const post = packCost(selected, budget, overhead);
-  const continuity = prefix[0]?.role === 'compactionSummary' || prefix[0]?.role === 'branchSummary'
-    ? 'latest Pi summary' : prefix.length ? 'explicit checkpoint' : 'no checkpoint';
+  const continuity = continuityOf(prefix);
   return {
     ok: true, messages: selected, preTokens: pre.tokens, postTokens: post.tokens,
     preMessageTokens: pre.messageTokens, postMessageTokens: post.messageTokens,
     systemTokens: overhead.systemTokens, toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     preBytes: pre.bytes, postBytes: post.bytes, systemBytes: overhead.systemBytes,
-    omittedTurns: Math.max(0, turns.length - kept.turns.length),
+    omittedTurns: Math.max(0, turns.length - kept.turns.length), truncatedFields: 0,
     reason: `Kept ${continuity} and ${kept.turns.length} complete turn(s); omitted ${Math.max(0, turns.length - kept.turns.length)} older turn(s) and ${omittedToolRounds} older tool round(s) from the current turn. Tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${post.messageTokens} = ${post.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${post.bytes - overhead.systemBytes - toolBytes} = ${post.bytes}.`,
   };
 };
