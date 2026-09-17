@@ -24,6 +24,7 @@ import { createEmbeddingProvider, type EmbeddingConfig, type EmbeddingProvider }
 import { createVectorIndex, EmbeddingUnavailableError, type VectorIndex } from './vector/vector-index.ts';
 import { MEMORY_DATABASE, assertExclusiveMemoryPath, assertProjectId, assertProjectLocalPath, componentPath, memoryDatabasePath, memoryHomeFor, resolveProject, sha256 } from './workspace/project-identity.ts';
 import {
+  MEMORY_REGISTRY_DIRECTORY,
   initializeMemoryProjectWith, resolveMemoryProject, type MemoryProjectBinding,
 } from './workspace/memory-registry.ts';
 
@@ -34,6 +35,11 @@ export type MemoryEngineOptions = Readonly<{
   scopeKind?: ScopeKind;
   provider?: EmbeddingProvider;
   embedding?: EmbeddingConfig;
+  /**
+   * Where the default local encoder is cached. Shared across projects by
+   * forScope(): per-project copies cost 130MB each for the same model.
+   */
+  modelCacheDir?: string;
   /** Auto keeps existing indexed stores unchanged and starts new stores compact. */
   storage?: 'auto' | 'compact' | 'indexed';
 }>;
@@ -85,9 +91,11 @@ export class MemoryEngine {
     this.root = options.root;
     this.scopeId = assertProjectId(options.scopeId);
     this.scopeKind = 'project';
+    // A configured cacheDir must stay inside the project; the default is the shared cache.
+    const defaultCache = (): string => options.modelCacheDir ?? assertProjectLocalPath(options.root, join(options.root, 'models'));
     const embedding = options.provider ? undefined : options.embedding
-      ? { ...options.embedding, cacheDir: assertProjectLocalPath(options.root, options.embedding.cacheDir ?? join(options.root, 'models')) }
-      : { cacheDir: assertProjectLocalPath(options.root, join(options.root, 'models')) };
+      ? { ...options.embedding, cacheDir: options.embedding.cacheDir ? assertProjectLocalPath(options.root, options.embedding.cacheDir) : defaultCache() }
+      : { cacheDir: defaultCache() };
     const database = join(options.root, MEMORY_DATABASE);
     this.storageMode = resolveStorageMode(database, options.storage ?? 'auto');
     if (this.storageMode === 'compact') {
@@ -398,6 +406,21 @@ export class MemoryEngine {
     return collectLegs(this.projection, this.vector, { ...request, scopeId: this.scopeId });
   }
 
+  /** Loads the encoder with one tiny query; false when it is unavailable. */
+  async warmEncoder(): Promise<boolean> {
+    try { await this.provider.embed(['warm'], { inputType: 'query' }); return true; }
+    catch { return false; }
+  }
+
+  /** Embeds chunks written without vectors. Returns 0 when no encoder is available. */
+  async backfillVectors(signal?: AbortSignal): Promise<number> {
+    try { return await this.vector.backfill(signal); }
+    catch (error) {
+      if (error instanceof EmbeddingUnavailableError) return 0;
+      throw error;
+    }
+  }
+
   async replay(reindex = false, signal?: AbortSignal): Promise<{ events: number; documents: number }> {
     const events = await this.journal.readAll();
     const unapplied = events.filter(event => !this.projection.hasEvent(event.id));
@@ -454,7 +477,8 @@ export class MemoryEngine {
     await mkdir(root, { recursive: true, mode: 0o700 });
     assertExclusiveMemoryPath(home, scopeId, join(root, MEMORY_DATABASE));
     const config = await readConfig(root);
-    return new MemoryEngine({ root, scopeId, scopeKind: 'project', sessionId, ...(options.provider ? { provider: options.provider } : {}),
+    return new MemoryEngine({ root, scopeId, scopeKind: 'project', sessionId, modelCacheDir: join(home, MEMORY_REGISTRY_DIRECTORY, 'models'),
+      ...(options.provider ? { provider: options.provider } : {}),
       ...(options.storage ? { storage: options.storage } : {}), embedding: config });
   }
 
@@ -541,7 +565,7 @@ const readConfig = async (root: string): Promise<EmbeddingConfig> => {
     // Deliberately NOT `?? parsed.apiKey`: a credential is read from the
     // environment only, so config.json can never become a place secrets live.
     apiKey: process.env.PI_MEMORY_EMBEDDINGS_API_KEY,
-    cacheDir: assertProjectLocalPath(root, parsed.cacheDir ? resolve(root, parsed.cacheDir) : join(root, 'models')) };
+    ...(parsed.cacheDir ? { cacheDir: assertProjectLocalPath(root, resolve(root, parsed.cacheDir)) } : {}) };
 };
 
 const STALE_LOCK_MS = 10 * 60_000;

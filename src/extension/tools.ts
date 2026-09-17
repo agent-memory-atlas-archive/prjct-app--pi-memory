@@ -12,8 +12,12 @@ import { sha256 } from '../workspace/project-identity.ts';
 import { renderMemoryCall, renderMemoryResult } from './renderers.ts';
 
 export type ExtensionMemoryRuntime = Readonly<{
-  /** The project scope: what memory_record writes to. */
+  /** The project scope, when this checkout already has memory. */
   engine(): Promise<MemoryEngine>;
+  /** The project scope for a write; initializes a git repository's memory on first use. */
+  writableEngine(): Promise<MemoryEngine>;
+  /** Embeds new memories in the background so a record never waits on the encoder. */
+  scheduleBackfill?(engine: MemoryEngine): void;
   /** Engines belonging to the active project; production currently returns one. */
   readable(): Promise<readonly MemoryEngine[]>;
   /** Project-local lookup across eligible ranking legs. */
@@ -112,7 +116,14 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
     description: 'Search or inspect bounded project memory; consolidate exact candidates or record positive retrieval feedback.',
     parameters: contextParameters,
     async execute(_toolCallId, params, signal) {
-      const engine = await runtime.engine();
+      // Nothing recorded yet is an empty memory, not a failure the agent must work around.
+      const engine = await runtime.engine().catch(error => {
+        if (error instanceof Error && /not initialized/iu.test(error.message)) return undefined;
+        throw error;
+      });
+      if (!engine) {
+        return result({ status: 'abstained', items: [], gaps: ['No memory has been recorded for this project yet.'] });
+      }
       if (params.action === 'lookup') {
         return result(await runtime.search({ queries: params.queries ?? [],
           ...(params.asOf ? { asOf: params.asOf } : {}), namespaces: params.namespaces ?? ['memory', 'memory.topic'],
@@ -175,7 +186,7 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
     description: 'Record selective durable knowledge or resolve memory using current-session evidence handles or an exact user quote.',
     parameters: recordParameters,
     async execute(_toolCallId, params, signal) {
-      const engine = await runtime.engine();
+      const engine = await runtime.writableEngine();
       if (params.action === 'resolve') {
         const factId = required(params.factId, 'factId');
         const fact = engine.projection.getFact(factId);
@@ -218,9 +229,12 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
         ...(params.object ? { object: params.object } : {}), entities, evidence: allEvidence, episodeIds: [],
         confidence: params.confidence ?? (allEvidence.length ? 0.85 : 0.5), ...(params.validAt ? { validAt: params.validAt } : {}),
         ...(params.invalidAt ? { invalidAt: params.invalidAt } : {}), ...(params.supersedes ? { supersedes: params.supersedes } : {}),
-        ...(!evidenceRelated && !quote ? { standing: 'needs_review' as const } : {}), tags: safeTags(params.tags) }, signal);
-      return result({ status: recorded.dense ? 'ok' : 'partial', id: recorded.fact.id, standing: recorded.fact.standing,
-        dense: recorded.dense, gaps: recorded.dense ? [] : ['Dense indexing deferred; memory and lexical index committed.'] });
+        ...(!evidenceRelated && !quote ? { standing: 'needs_review' as const } : {}), tags: safeTags(params.tags) }, signal,
+        runtime.scheduleBackfill ? { dense: false } : {});
+      runtime.scheduleBackfill?.(engine);
+      return result({ status: 'ok', id: recorded.fact.id, standing: recorded.fact.standing,
+        dense: recorded.dense || Boolean(runtime.scheduleBackfill),
+        gaps: recorded.dense || runtime.scheduleBackfill ? [] : ['Dense indexing deferred; memory and lexical index committed.'] });
     },
     renderCall(args, theme) { return renderMemoryCall(theme.fg('accent', 'memory record'), args); },
     renderResult(output, options) { return renderMemoryResult('memory record', output.details, options.expanded); },

@@ -19,7 +19,7 @@ test('model-facing writes require meaningful provenance and cannot forge curatio
   const tools: Array<{ name: string; execute(id: string, params: any, signal?: AbortSignal): Promise<any> }> = [];
   const prompt = 'The durable project database uses SQLite for local storage.';
   installMemoryTools({ registerTool(tool: any) { tools.push(tool); } } as ExtensionAPI, {
-    engine: async () => engine, readable: async () => [engine], search: request => federatedSearch([engine], request),
+    engine: async () => engine, writableEngine: async () => engine, readable: async () => [engine], search: request => federatedSearch([engine], request),
     stagedEvidence: () => new Map<string, EvidenceRef>(), currentPrompt: () => prompt,
   });
   const record = tools.find(tool => tool.name === 'memory_record')!;

@@ -72,11 +72,28 @@ export const sessionObservationWorthy = (input: Readonly<{
   return summary.length >= 40 && contentWords(summary).length >= 6 && diagnostic;
 };
 
-/** Strip the host wrapper so capture/recall see the diagnosis, not "bash failed". */
+const NOISE_LINE = /^(?:ok \d+\b|# (?:subtest|pass|fail|tests|suites|duration|cancelled|skipped|todo)\b|---$|\.\.\.$|duration_ms:|type: '|TAP version|at |stack: |location: |\[pi-memory evidence)/iu;
+const DIAGNOSTIC_LINE = /(?:error|fail(?:ed|ure)?\b|exception|cannot|can't|denied|refused|not found|no such|invalid|unexpected|timed? ?out|EACCES|EPERM|ENOENT|EADDRINUSE|ECONNREFUSED|SQLITE_|panic|fatal)/iu;
+const TEST_ASSERTION = /(?:AssertionError|ERR_ASSERTION|^\s*not ok \d+|testCodeFailure)/imu;
+const MAX_FAILURE_STATEMENT = 320;
+
+/**
+ * The diagnosis of a failed tool call: up to three distinct error lines, with
+ * the host wrapper, test-runner framing and stack frames removed. A red test
+ * during development is not durable knowledge and yields no statement; nor
+ * does output without an error-shaped line. Storing raw runner output made
+ * memory recall TAP transcripts instead of lessons.
+ */
 export const sessionFailureStatement = (summary: string): string => {
-  const clipped = clipSessionSummary(summary);
-  const stripped = clipped.replace(/^\S+\s+failed(?:\s+|>\s*)/iu, '').trim();
-  return stripped.length >= 12 ? stripped : clipped;
+  const redacted = redactSecrets(summary);
+  if (TEST_ASSERTION.test(redacted)) return '';
+  const lines = redacted.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  const tool = lines[0]?.match(/^(\S+)\s+failed$/u)?.[1];
+  const diagnostic = [...new Set(lines.slice(tool ? 1 : 0).filter(line => !NOISE_LINE.test(line) && DIAGNOSTIC_LINE.test(line)))]
+    .slice(0, 3).map(line => line.length > 160 ? `${line.slice(0, 159)}…` : line);
+  if (!diagnostic.length) return '';
+  const statement = clipSessionSummary(`${tool ? `${tool}: ` : ''}${diagnostic.join(' · ')}`);
+  return statement.length > MAX_FAILURE_STATEMENT ? `${statement.slice(0, MAX_FAILURE_STATEMENT - 1)}…` : statement;
 };
 
 const normalizedMeaning = (summary: string): string => clipSessionSummary(summary).toLocaleLowerCase()

@@ -96,9 +96,12 @@ test('embedding caches cannot escape or symlink outside the project authority', 
   await writeFile(join(configured, 'config.json'), JSON.stringify({ cacheDir: outside }));
   await assert.rejects(MemoryEngine.forScope('project', 'p_configured', 's1', { home }), /escaped the project authority/);
 
+  // The default encoder cache is shared under the memory home; only a
+  // configured project cache is subject to the project boundary.
   const linked = join(home, 'p_linked', 'memory');
   await mkdir(linked, { recursive: true });
   await symlink(outside, join(linked, 'models'), 'dir');
+  await writeFile(join(linked, 'config.json'), JSON.stringify({ cacheDir: 'models' }));
   await assert.rejects(MemoryEngine.forScope('project', 'p_linked', 's1', { home }), /outside the project authority/);
 });
 
