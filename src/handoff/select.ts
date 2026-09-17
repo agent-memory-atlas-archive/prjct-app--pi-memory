@@ -1,7 +1,7 @@
 import { estimateTokens } from '@earendil-works/pi-coding-agent';
 import type { OperationalCheckpoint } from './checkpoint.ts';
 import { renderCheckpoint } from './checkpoint.ts';
-import { groupTurns, turnIsComplete, type HandoffMessage, type Turn } from './turns.ts';
+import { groupTurns, toolCallIds, turnIsComplete, type HandoffMessage, type Turn } from './turns.ts';
 
 export type HandoffBudget = Readonly<{
   maxTokens: number;
@@ -19,7 +19,7 @@ export type HandoffOverhead = Readonly<{
 }>;
 
 export const DEFAULT_HANDOFF_BUDGET: HandoffBudget = {
-  maxTokens: 8_000,
+  maxTokens: 16_000,
   maxBytes: 65_536,
   maxMessages: 48,
   toolSchemaReserveTokens: 1_500,
@@ -53,6 +53,7 @@ export type HandoffResult = Readonly<{
 }>;
 
 const messageBytes = (message: HandoffMessage): number => Buffer.byteLength(JSON.stringify(message), 'utf8');
+const messagePackBytes = (messages: readonly HandoffMessage[]): number => Buffer.byteLength(JSON.stringify(messages), 'utf8');
 
 const assertBudget = (budget: HandoffBudget, overhead: HandoffOverhead): void => {
   const positive = [budget.maxTokens, budget.maxBytes, budget.maxMessages];
@@ -77,7 +78,7 @@ const packCost = (messages: readonly HandoffMessage[], budget: HandoffBudget, ov
   return {
     messageTokens,
     tokens: overhead.systemTokens + (overhead.toolSchemaTokens ?? budget.toolSchemaReserveTokens) + messageTokens,
-    bytes: overhead.systemBytes + (overhead.toolSchemaBytes ?? 0) + messages.reduce((sum, message) => sum + messageBytes(message), 0),
+    bytes: overhead.systemBytes + (overhead.toolSchemaBytes ?? 0) + messagePackBytes(messages),
   };
 };
 
@@ -111,6 +112,50 @@ const fits = (messages: readonly HandoffMessage[], budget: HandoffBudget, overhe
   return cost.tokens <= budget.maxTokens && cost.bytes <= budget.maxBytes;
 };
 
+type CurrentTurnFit = Readonly<{
+  ok: true;
+  turn: Turn;
+  omittedToolRounds: number;
+}> | Readonly<{
+  ok: false;
+  minimum: readonly HandoffMessage[];
+}>;
+
+/**
+ * Keep the user request and the newest complete tool rounds. Older rounds in a
+ * long-running agent turn are expendable once their effects are reflected in
+ * later calls; retaining every round would eventually abort otherwise healthy
+ * work. Tool call/result pairs remain atomic.
+ */
+const fitCurrentTurn = (turn: Turn, prefix: readonly HandoffMessage[], budget: HandoffBudget,
+  overhead: HandoffOverhead): CurrentTurnFit => {
+  if (fits([...prefix, ...turn.messages], budget, overhead)) {
+    return { ok: true, turn, omittedToolRounds: 0 };
+  }
+  const starts = turn.messages.flatMap((message, index) => toolCallIds(message).length ? [index] : []);
+  if (!starts.length) return { ok: false, minimum: turn.messages };
+  const head = turn.messages.slice(0, starts[0]);
+  const rounds = starts.map((start, index) => ({
+    messages: turn.messages.slice(start, starts[index + 1] ?? turn.messages.length),
+    toolCallIds: toolCallIds(turn.messages[start]!),
+  } satisfies Turn));
+  if (rounds.some(round => !turnIsComplete(round))) return { ok: false, minimum: turn.messages };
+  const newest = rounds.at(-1)!;
+  const minimum = [...head, ...newest.messages];
+  if (!fits([...prefix, ...minimum], budget, overhead)) return { ok: false, minimum };
+  const kept = { rounds: [newest] as Turn[] };
+  for (const round of rounds.slice(0, -1).reverse()) {
+    const candidate = [...prefix, ...head, ...[round, ...kept.rounds].flatMap(item => item.messages)];
+    if (!fits(candidate, budget, overhead)) break;
+    kept.rounds = [round, ...kept.rounds];
+  }
+  return {
+    ok: true,
+    turn: { messages: [...head, ...kept.rounds.flatMap(round => round.messages)], toolCallIds: turn.toolCallIds },
+    omittedToolRounds: rounds.length - kept.rounds.length,
+  };
+};
+
 export const selectHandoffMessages = (
   messages: readonly HandoffMessage[],
   checkpoint: OperationalCheckpoint | undefined,
@@ -133,18 +178,22 @@ export const selectHandoffMessages = (
       toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     };
   }
-  const minimum = current ? [...prefix, ...current.messages] : prefix;
-  if (!fits(minimum, budget, overhead)) {
+  const currentFit = current ? fitCurrentTurn(current, prefix, budget, overhead) : undefined;
+  const minimum = currentFit?.ok === false ? [...prefix, ...currentFit.minimum] : prefix;
+  if (currentFit?.ok === false || (!current && !fits(minimum, budget, overhead))) {
+    const required = packCost(minimum, budget, overhead);
+    const requiredDiagnostic = `Required tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${required.messageTokens} = ${required.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${required.bytes - overhead.systemBytes - toolBytes} = ${required.bytes}.`;
     return {
       ok: false,
       instruction: `${prefix.length
-        ? 'Handoff refused: continuity checkpoint plus the current complete turn and provider overhead exceed the token/byte/message budget. Update a smaller checkpoint, increase the explicit budget, or start a new session.'
-        : 'Handoff refused: no continuity checkpoint and the current turn plus provider overhead exceed the token/byte/message budget. Start a fresh session with a concise handoff, reduce tool output, or explicitly use /compact (paid).'} ${diagnostic}`,
+        ? 'Handoff refused: continuity checkpoint plus the newest complete tool round and provider overhead exceed the token/byte/message budget. Reduce the latest tool output, update a smaller checkpoint, or start a new session.'
+        : 'Handoff refused: the current request plus its newest complete tool round and provider overhead exceed the token/byte/message budget. Reduce the latest tool output or start a fresh session.'} ${requiredDiagnostic}`,
       preTokens: pre.tokens, preBytes: pre.bytes, systemTokens: overhead.systemTokens,
       toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     };
   }
-  const kept = { turns: current ? [current] : [] as Turn[] };
+  const omittedToolRounds = currentFit?.ok ? currentFit.omittedToolRounds : 0;
+  const kept = { turns: currentFit?.ok ? [currentFit.turn] : [] as Turn[] };
   const older = current ? turns.slice(0, -1) : turns;
   for (const turn of [...older].reverse()) {
     if (!turnIsComplete(turn)) continue;
@@ -162,6 +211,6 @@ export const selectHandoffMessages = (
     systemTokens: overhead.systemTokens, toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     preBytes: pre.bytes, postBytes: post.bytes, systemBytes: overhead.systemBytes,
     omittedTurns: Math.max(0, turns.length - kept.turns.length),
-    reason: `Kept ${continuity} and ${kept.turns.length} complete turn(s); omitted ${Math.max(0, turns.length - kept.turns.length)} older turn(s). Tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${post.messageTokens} = ${post.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${post.bytes - overhead.systemBytes - toolBytes} = ${post.bytes}.`,
+    reason: `Kept ${continuity} and ${kept.turns.length} complete turn(s); omitted ${Math.max(0, turns.length - kept.turns.length)} older turn(s) and ${omittedToolRounds} older tool round(s) from the current turn. Tokens: system ${overhead.systemTokens} + active tools ${toolTokens} + messages ${post.messageTokens} = ${post.tokens}. Bytes: system ${overhead.systemBytes} + active tools ${toolBytes} + canonical messages ${post.bytes - overhead.systemBytes - toolBytes} = ${post.bytes}.`,
   };
 };
