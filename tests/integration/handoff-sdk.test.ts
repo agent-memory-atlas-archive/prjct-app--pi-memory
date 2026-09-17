@@ -189,7 +189,7 @@ test('public Pi SDK bounds uninitialized history before and after switching with
   });
   await resourceLoader.reload();
   const sessionManager = SessionManager.inMemory(root);
-  sessionManager.appendMessage({ role: 'user', content: 'UNBOUND_OLD_PRIVATE ' + 'old dump '.repeat(20_000), timestamp: 1 });
+  sessionManager.appendMessage({ role: 'user', content: 'UNBOUND_OLD_PRIVATE ' + 'old dump '.repeat(50_000), timestamp: 1 });
   const { session } = await createAgentSession({
     cwd: root, agentDir: join(root, 'agent'), model: modelA, modelRuntime, resourceLoader,
     sessionManager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
@@ -278,7 +278,7 @@ test('public Pi SDK cancels automatic compaction before any summary inference an
   });
   await resourceLoader.reload();
   const sessionManager = SessionManager.inMemory(root);
-  sessionManager.appendMessage({ role: 'user', content: 'OLD_COMPACTION_INPUT ' + 'historical dump '.repeat(5_000), timestamp: 1 });
+  sessionManager.appendMessage({ role: 'user', content: 'OLD_COMPACTION_INPUT ' + 'historical dump '.repeat(30_000), timestamp: 1 });
   const { session } = await createAgentSession({
     cwd: root, agentDir: join(root, 'agent'), model: modelA, modelRuntime, resourceLoader, sessionManager,
     settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 99_999, keepRecentTokens: 1 } }),
