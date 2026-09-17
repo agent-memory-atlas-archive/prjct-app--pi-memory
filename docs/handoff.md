@@ -22,6 +22,16 @@ The newest user requirement, including qualifications and evidence references in
 
 If the continuity prefix, current request, newest complete tool round (after truncation), and provider overhead cannot fit, the handler aborts, notifies, and returns a known safe instruction only if that instruction also fits. Otherwise it returns no messages. Thrown errors are caught because Pi swallows `context` exceptions (fail-open). There is **no** documented cancel-return that proves the HTTP request was prevented; `ctx.abort()` is best-effort. If Pi continues transport, the original history is never eligible. Fixed system/tool overhead can itself exceed the budget and cannot be removed safely by this message handler: this is not a guaranteed total-cost or transport-cancellation boundary.
 
+## Observation masking
+
+Old tool outputs were 70-86% of every request in real sessions and were re-sent on each of ~35 LLM calls per prompt. Before selection, the window replaces tool results that are older than the newest `keepRounds` tool rounds and larger than `minTokens` with a short stub: `read` names the path and range and says to read again, `bash` keeps the command and its last 15 lines (failures print last), `grep`/`find`/`ls` keep the arguments and first 10 lines. Tool calls, call/result pairing, user and assistant text, and signed thinking are untouched.
+
+Masking is a pure function of the host history and a session-local frontier. The frontier only advances when stale unmasked output behind the keep window reaches `advanceTokens`, then masks everything up to the keep boundary at once, so the serialized prefix is identical between advances and provider caches keep hitting. It resets with the watermark when history is replaced. Defaults (`keepRounds` 8, `minTokens` 300, `advanceTokens` 24,000) were chosen with `scripts/replay-context.ts`, which replays real session files: on the two largest sessions the shipped pipeline cut sent message tokens by 65% and 61% and cache-weighted cost by 47% and 53%. `MemoryExtensionOptions.observations` overrides them; `{ enabled: false }` turns masking off.
+
+## Output caps
+
+`bash` output above 16,000 characters keeps its first 4,000 and last 12,000 characters; `grep`/`find` output above 12,000 characters keeps its first matches. The full text is written first (Pi's own `fullOutputPath` when present, otherwise `$TMPDIR/pi-memory-tool-output/<toolCallId>.txt`) and the result names that file. If the write fails the output is left whole. `read` is never capped. `MemoryExtensionOptions.outputCaps` configures or disables this.
+
 ## Budgets
 
 Unless `MemoryExtensionOptions.handoff` is set, the ceiling is derived on every request from the active model: `contextWindow` minus a response reserve (the model's `maxTokens`, clamped to 16,384–32,768 and at most a quarter of the window), 16 bytes per budgeted token, and 4,096 messages. For a 272k model that is 239,232 estimated tokens. Only when the model exposes no usable window does the conservative fallback of 16,000 tokens, 262,144 bytes, and 48 messages apply. A fixed 16k ceiling applied to every request previously aborted or truncated ordinary document reads, so it is no longer the default. Every ceiling includes measured system/tool overhead. `MemoryExtensionOptions.handoff` configures an explicit ceiling:

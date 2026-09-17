@@ -5,6 +5,8 @@ import { checkpointAndEnqueueLegacy } from './curation/migrate.ts';
 import type { MemoryEngine } from './engine.ts';
 import { installMemoryHooks } from './extension/hooks.ts';
 import type { HandoffBudget } from './handoff/select.ts';
+import type { ObservationPolicy } from './handoff/observations.ts';
+import type { OutputCapPolicy } from './handoff/caps.ts';
 import { installMemoryTools } from './extension/tools.ts';
 import { runGc } from './retention/gc.ts';
 import { registerKnownSources, scopedEngines, type SourceInstallOptions } from './sources/install.ts';
@@ -21,6 +23,10 @@ export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
   /** Explicit bound for messages retained after a real model switch. */
   handoff?: HandoffBudget;
+  /** Stale tool-output masking in the request context; `{ enabled: false }` turns it off. */
+  observations?: Partial<ObservationPolicy>;
+  /** Source caps for bash/grep/find output; `{ enabled: false }` turns them off. */
+  outputCaps?: Partial<OutputCapPolicy>;
   /** Thresholds that make a source due; `{ enabled: false }` turns it off. */
   sync?: SyncPolicy;
   /** Optional publisher adapters. pi-session remains the only default source. */
@@ -123,6 +129,8 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     ...(options.home === undefined ? {} : { home: options.home }),
     ...(options.recallThreshold === undefined ? {} : { recallThreshold: options.recallThreshold }),
     ...(options.handoff === undefined ? {} : { handoff: options.handoff }),
+    ...(options.observations === undefined ? {} : { observations: options.observations }),
+    ...(options.outputCaps === undefined ? {} : { outputCaps: options.outputCaps }),
     // Deliberately not awaited by the hook: a source scan must never sit
     // between the user's prompt and the agent starting.
     onActivity: project => { void syncIfDue(project).catch(() => undefined); },

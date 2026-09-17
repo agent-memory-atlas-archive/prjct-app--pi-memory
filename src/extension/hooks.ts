@@ -1,9 +1,14 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { EvidenceRef } from '../contracts/evidence.ts';
 import type { MemoryKind } from '../contracts/memory.ts';
 import { hostEvidence, MemoryEngine } from '../engine.ts';
 import { createHandoffController, installHandoffHooks } from '../handoff/hooks.ts';
 import type { HandoffBudget } from '../handoff/select.ts';
+import type { ObservationPolicy } from '../handoff/observations.ts';
+import { capToolOutput, DEFAULT_OUTPUT_CAP_POLICY, isCappedTool, type OutputCapPolicy } from '../handoff/caps.ts';
 import { federatedSearch } from '../retrieval/federated.ts';
 import { admitCapture } from '../retention/capture-gate.ts';
 import { redactSecrets } from '../security/redact.ts';
@@ -61,10 +66,13 @@ export const DEFAULT_RECALL_THRESHOLD = 0;
 export const installMemoryHooks = (pi: ExtensionAPI, options: {
   home?: string; recallThreshold?: number;
   handoff?: HandoffBudget;
+  observations?: Partial<ObservationPolicy>;
+  outputCaps?: Partial<OutputCapPolicy>;
   /** Called after each turn is counted, so the caller can sync when due. */
   onActivity?: (project: MemoryEngine) => Promise<void> | void;
 } = {}) => {
   const recallThreshold = options.recallThreshold ?? DEFAULT_RECALL_THRESHOLD;
+  const outputCaps: OutputCapPolicy = { ...DEFAULT_OUTPUT_CAP_POLICY, ...options.outputCaps };
   const onActivity = options.onActivity;
   const slot: { current: MemorySession } = { current: {
     generation: {}, prompt: '', evidence: new Map(), contextTokens: 0, observations: [], declarations: [],
@@ -230,7 +238,8 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
       const toolSchemaBytes = Buffer.byteLength(JSON.stringify(definitions), 'utf8');
       return { toolSchemaBytes, toolSchemaTokens: Math.ceil(toolSchemaBytes / 4) };
     } catch { return {}; }
-  }, ...(options.handoff === undefined ? {} : { budget: options.handoff }) });
+  }, ...(options.handoff === undefined ? {} : { budget: options.handoff }),
+  ...(options.observations === undefined ? {} : { observations: options.observations }) });
 
   /**
    * Records what this turn cost. The host reports the size of the whole
@@ -310,6 +319,30 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     };
   });
 
+  /**
+   * Caps noisy bash/grep/find output at the source. The full text goes to a file
+   * first; if that write fails the output is left untouched rather than lost.
+   */
+  const capOutput = async (toolName: string, toolCallId: string, content: readonly unknown[], details: unknown,
+    raw: string): Promise<{ type: 'text'; text: string }[] | undefined> => {
+    if (!isCappedTool(toolName) || content.some(part => (part as { type?: unknown })?.type !== 'text')) return undefined;
+    try {
+      const existing = (details as { fullOutputPath?: unknown } | undefined)?.fullOutputPath;
+      const path = typeof existing === 'string' && existing
+        ? existing
+        : join(tmpdir(), 'pi-memory-tool-output', `${toolCallId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120) || 'call'}.txt`);
+      const text = capToolOutput(toolName, raw, path, outputCaps);
+      if (text === undefined) return undefined;
+      if (path !== existing) {
+        await mkdir(join(tmpdir(), 'pi-memory-tool-output'), { recursive: true });
+        await writeFile(path, raw, 'utf8');
+      }
+      return [{ type: 'text', text }];
+    } catch {
+      return undefined;
+    }
+  };
+
   pi.on('tool_result', async (event, ctx) => {
     if (event.toolName === 'memory_context' || event.toolName === 'memory_record') return;
     const raw = textContent(event.content as readonly unknown[]);
@@ -327,7 +360,8 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
         sessionId: ctx.sessionManager.getSessionId(),
       });
     }
-    return { content: [...event.content, { type: 'text', text: `[pi-memory evidence: ${handle}]` }] };
+    const capped = await capOutput(event.toolName, event.toolCallId, event.content as readonly unknown[], event.details, raw);
+    return { content: [...(capped ?? event.content), { type: 'text', text: `[pi-memory evidence: ${handle}]` }] };
   });
 
   pi.on('turn_end', async () => { await flushSessionObservations().catch(() => undefined); });

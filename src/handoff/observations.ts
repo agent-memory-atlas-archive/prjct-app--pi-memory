@@ -1,0 +1,128 @@
+import { estimateHandoffTokens } from './select.ts';
+import { toolCallIds, type HandoffMessage } from './turns.ts';
+
+/**
+ * Observation masking. Old tool outputs were 70-86% of every request in real
+ * sessions and were re-sent on each of ~35 calls per prompt. Outputs older than
+ * the newest `keepRounds` tool rounds are replaced with short stubs that name
+ * what was elided and how to get it back. Calls, results and all user/assistant
+ * text are kept, so call/result pairs stay atomic.
+ *
+ * Masking is a pure function of (messages, frontier). The frontier only moves in
+ * batches of at least `advanceTokens`, so the serialized prefix stays identical
+ * between advances and provider prompt caches keep hitting.
+ */
+export type ObservationPolicy = Readonly<{
+  enabled: boolean;
+  /** Newest tool rounds whose outputs are never masked. */
+  keepRounds: number;
+  /** Outputs at or below this estimate are left intact. */
+  minTokens: number;
+  /** Stale unmasked tokens required before the frontier advances. */
+  advanceTokens: number;
+}>;
+
+export const DEFAULT_OBSERVATION_POLICY: ObservationPolicy = {
+  enabled: true, keepRounds: 8, minTokens: 300, advanceTokens: 24_000,
+};
+
+type Call = Readonly<{ name: string; args: Record<string, unknown>; owner: number }>;
+
+const isResult = (message: HandoffMessage): boolean => message.role === 'toolResult' || message.role === 'tool';
+
+const callsOf = (messages: readonly HandoffMessage[]): ReadonlyMap<string, Call> => new Map(messages.flatMap((message, owner) => {
+  if (message.role !== 'assistant' || !Array.isArray(message.content)) return [];
+  return (message.content as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown }[]).flatMap(block =>
+    block?.type === 'toolCall' && typeof block.id === 'string'
+      ? [[block.id, {
+        name: typeof block.name === 'string' ? block.name : 'tool',
+        args: block.arguments && typeof block.arguments === 'object' ? block.arguments as Record<string, unknown> : {},
+        owner,
+      }] as const]
+      : []);
+}));
+
+const textOf = (message: HandoffMessage): string => typeof message.content === 'string'
+  ? message.content
+  : Array.isArray(message.content)
+    ? (message.content as { type?: unknown; text?: unknown }[])
+      .flatMap(block => block?.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n')
+    : '';
+
+const clip = (text: string, max: number): string => text.length <= max ? text : `${text.slice(0, max)}…`;
+
+const lines = (text: string): string[] => text.replace(/\n+$/, '').split('\n');
+
+const stubFor = (message: HandoffMessage, call: Call | undefined, tokens: number): string => {
+  const text = textOf(message);
+  const all = lines(text);
+  const name = call?.name ?? 'tool';
+  const args = call?.args ?? {};
+  const head = `[pi-memory: elided stale ${name} output, ~${tokens} tokens, ${all.length} lines`;
+  if (name === 'read') {
+    const range = [args.offset === undefined ? '' : ` offset=${String(args.offset)}`, args.limit === undefined ? '' : ` limit=${String(args.limit)}`].join('');
+    return `${head}, of ${clip(String(args.path ?? '?'), 300)}${range}. Read it again if you need the content.]`;
+  }
+  if (name === 'bash') {
+    const tail = clip(all.slice(-15).join('\n'), 1_200);
+    return `${head}, for: ${clip(String(args.command ?? '?'), 300)}. Last lines:]\n${tail}`;
+  }
+  if (name === 'grep' || name === 'find' || name === 'ls') {
+    const first = clip(all.slice(0, 10).join('\n'), 1_000);
+    return `${head}, for ${clip(JSON.stringify(args), 300)}. First lines:]\n${first}`;
+  }
+  return `${head}. Run the tool again if you need it.]`;
+};
+
+/** Message index of the assistant call that owns each masked-eligible result, with its size. */
+const eligible = (messages: readonly HandoffMessage[], calls: ReadonlyMap<string, Call>, policy: ObservationPolicy) =>
+  messages.flatMap((message, index) => {
+    if (!isResult(message) || !message.toolCallId) return [];
+    const call = calls.get(message.toolCallId);
+    if (!call) return [];
+    const tokens = estimateHandoffTokens(message);
+    return tokens > policy.minTokens ? [{ index, owner: call.owner, tokens }] : [];
+  });
+
+/** Index of the first assistant message inside the protected keep window. */
+export const keepBoundary = (messages: readonly HandoffMessage[], policy: ObservationPolicy): number => {
+  const owners = messages.flatMap((message, index) => message.role === 'assistant' && toolCallIds(message).length ? [index] : []);
+  return owners.length > policy.keepRounds ? owners[owners.length - policy.keepRounds]! : 0;
+};
+
+/**
+ * Next frontier: stays put until the stale, still-unmasked outputs behind the
+ * keep window reach `advanceTokens`, then jumps to the keep boundary at once.
+ */
+export const nextObservationFrontier = (messages: readonly HandoffMessage[], frontier: number,
+  policy: ObservationPolicy): number => {
+  if (!policy.enabled) return 0;
+  const boundary = keepBoundary(messages, policy);
+  if (boundary <= frontier) return Math.min(frontier, boundary);
+  const calls = callsOf(messages);
+  const pending = eligible(messages, calls, policy)
+    .filter(item => item.owner >= frontier && item.owner < boundary)
+    .reduce((sum, item) => sum + item.tokens, 0);
+  return pending >= policy.advanceTokens ? boundary : frontier;
+};
+
+/** Same length and order as the input; unchanged messages keep their identity. */
+export const maskObservations = (messages: readonly HandoffMessage[], frontier: number,
+  policy: ObservationPolicy): Readonly<{ messages: readonly HandoffMessage[]; maskedTokens: number; masked: number }> => {
+  if (!policy.enabled || frontier <= 0) return { messages, maskedTokens: 0, masked: 0 };
+  const calls = callsOf(messages);
+  const targets = new Map(eligible(messages, calls, policy).filter(item => item.owner < frontier).map(item => [item.index, item.tokens]));
+  const stats = { maskedTokens: 0, masked: 0 };
+  const view = messages.map((message, index) => {
+    const tokens = targets.get(index);
+    if (tokens === undefined) return message;
+    const text = stubFor(message, calls.get(message.toolCallId!), tokens);
+    const replacement = { ...message, content: [{ type: 'text', text }] } as HandoffMessage;
+    const saved = tokens - estimateHandoffTokens(replacement);
+    if (saved <= 0) return message;
+    stats.maskedTokens += saved;
+    stats.masked += 1;
+    return replacement;
+  });
+  return { messages: view, ...stats };
+};
