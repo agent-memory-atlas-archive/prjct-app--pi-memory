@@ -26,6 +26,28 @@ export const DEFAULT_HANDOFF_BUDGET: HandoffBudget = {
   toolSchemaReserveTokens: 1_500,
 };
 
+/**
+ * Derive the ceiling from the active model instead of a fixed cost cap. A fixed
+ * 16k budget applied to every request truncated or aborted ordinary document
+ * reads on 272k+ models. Reserve room for the response, like Pi's own
+ * compaction reserve, and fall back to the conservative default when the host
+ * does not expose a usable context window.
+ */
+export const budgetForModel = (model: Readonly<{ contextWindow?: number; maxTokens?: number }> | undefined): HandoffBudget => {
+  const window = model?.contextWindow;
+  if (!window || !Number.isSafeInteger(window) || window <= DEFAULT_HANDOFF_BUDGET.maxTokens) return DEFAULT_HANDOFF_BUDGET;
+  const output = model.maxTokens && Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : 16_384;
+  const reserve = Math.min(Math.max(16_384, Math.min(output, 32_768)), Math.floor(window / 4));
+  const maxTokens = Math.max(DEFAULT_HANDOFF_BUDGET.maxTokens, window - reserve);
+  return {
+    maxTokens,
+    // Signed reasoning and JSON escaping make bytes outgrow chars/4 estimates.
+    maxBytes: Math.max(DEFAULT_HANDOFF_BUDGET.maxBytes, maxTokens * 16),
+    maxMessages: 4_096,
+    toolSchemaReserveTokens: DEFAULT_HANDOFF_BUDGET.toolSchemaReserveTokens,
+  };
+};
+
 const NO_OVERHEAD: HandoffOverhead = { systemTokens: 0, systemBytes: 0 };
 
 export type HandoffResult = Readonly<{

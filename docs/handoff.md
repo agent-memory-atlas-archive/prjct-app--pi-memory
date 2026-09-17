@@ -24,7 +24,7 @@ If the continuity prefix, current request, newest complete tool round (after tru
 
 ## Budgets
 
-The default ceiling is 16,000 estimated tokens, 262,144 bytes, and 48 messages, including measured system/tool overhead. `MemoryExtensionOptions.handoff` configures:
+Unless `MemoryExtensionOptions.handoff` is set, the ceiling is derived on every request from the active model: `contextWindow` minus a response reserve (the model's `maxTokens`, clamped to 16,384–32,768 and at most a quarter of the window), 16 bytes per budgeted token, and 4,096 messages. For a 272k model that is 239,232 estimated tokens. Only when the model exposes no usable window does the conservative fallback of 16,000 tokens, 262,144 bytes, and 48 messages apply. A fixed 16k ceiling applied to every request previously aborted or truncated ordinary document reads, so it is no longer the default. Every ceiling includes measured system/tool overhead. `MemoryExtensionOptions.handoff` configures an explicit ceiling:
 
 - `maxTokens`: system prompt + explicit tool-schema reserve + selected messages
 - `maxBytes`: measured system prompt + active tool definitions + serialized selected messages
