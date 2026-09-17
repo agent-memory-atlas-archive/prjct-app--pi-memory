@@ -2,6 +2,7 @@ import { estimateTokens } from '@earendil-works/pi-coding-agent';
 import type { OperationalCheckpoint } from './checkpoint.ts';
 import { renderCheckpoint } from './checkpoint.ts';
 import { shrinkToFit } from './shrink.ts';
+import { normalizeToolFlow } from './normalize.ts';
 import { groupTurns, toolCallIds, turnIsComplete, type HandoffMessage, type Turn } from './turns.ts';
 
 export type HandoffBudget = Readonly<{
@@ -78,7 +79,24 @@ export type HandoffResult = Readonly<{
 }>;
 
 const messageBytes = (message: HandoffMessage): number => Buffer.byteLength(JSON.stringify(message), 'utf8');
-const messagePackBytes = (messages: readonly HandoffMessage[]): number => Buffer.byteLength(JSON.stringify(messages), 'utf8');
+
+/**
+ * Messages are immutable here, and selection prices the same objects many
+ * times while it grows candidate packs. Re-serializing every candidate made the
+ * context hook O(turns x history bytes): ~250ms per LLM call on a 15MB session.
+ */
+const measured = new WeakMap<object, { tokens?: number; bytes?: number }>();
+const cachedBytes = (message: HandoffMessage): number => {
+  const entry = measured.get(message) ?? {};
+  if (entry.bytes === undefined) {
+    entry.bytes = messageBytes(message);
+    measured.set(message, entry);
+  }
+  return entry.bytes;
+};
+/** Equals Buffer.byteLength(JSON.stringify(messages)): brackets plus comma separators. */
+const messagePackBytes = (messages: readonly HandoffMessage[]): number =>
+  2 + Math.max(0, messages.length - 1) + messages.reduce((sum, message) => sum + cachedBytes(message), 0);
 
 const assertBudget = (budget: HandoffBudget, overhead: HandoffOverhead): void => {
   const positive = [budget.maxTokens, budget.maxBytes, budget.maxMessages];
@@ -89,6 +107,15 @@ const assertBudget = (budget: HandoffBudget, overhead: HandoffOverhead): void =>
 };
 
 export const estimateHandoffTokens = (message: HandoffMessage): number => {
+  const entry = measured.get(message) ?? {};
+  if (entry.tokens === undefined) {
+    entry.tokens = uncachedTokens(message);
+    measured.set(message, entry);
+  }
+  return entry.tokens;
+};
+
+const uncachedTokens = (message: HandoffMessage): number => {
   try {
     return estimateTokens(message as never);
   } catch {
@@ -188,7 +215,7 @@ export const selectHandoffMessages = (
   overhead: HandoffOverhead = NO_OVERHEAD,
 ): HandoffResult => {
   assertBudget(budget, overhead);
-  const retained = messages;
+  const retained = normalizeToolFlow(messages);
   const pre = packCost(retained, budget, overhead);
   const prefix = continuityPrefix(retained, checkpoint);
   const turns = groupTurns(retained.filter(message => !isPiSummary(message)));

@@ -40,7 +40,14 @@ test('real Pi multi-call tool loops require a bijection and remain atomic out of
   const resultB: ToolResultMessage = {
     role: 'toolResult', toolCallId: 'call_b', toolName: 'read', content: [{ type: 'text', text: 'B' }], isError: false, timestamp: 2,
   };
-  assert.equal(selectHandoffMessages([user('inspect'), call, resultA], undefined).ok, false);
+  // A missing result is synthesized exactly as Pi transports it; duplicates still refuse.
+  const missing = selectHandoffMessages([user('inspect'), call, resultA], undefined);
+  assert.equal(missing.ok, true);
+  if (missing.ok) {
+    assert.deepEqual(missing.messages.slice(0, 3), [user('inspect'), call, resultA]);
+    assert.deepEqual(missing.messages[3], { role: 'toolResult', toolCallId: 'call_b', toolName: 'read',
+      content: [{ type: 'text', text: 'No result provided' }], isError: true, timestamp: 1 });
+  }
   assert.equal(selectHandoffMessages([user('inspect'), call, resultA, resultA, resultB], undefined).ok, false);
   const selected = selectHandoffMessages(
     [user('discard old'), assistant('old'), user('inspect'), call, resultB, resultA], undefined,
@@ -89,8 +96,23 @@ test('latest Pi summary is the deterministic fallback unless an explicit checkpo
   if (newerSummary.ok) assert.equal(newerSummary.messages[0]?.role, 'branchSummary');
 });
 
-test('unmatched tool pair is refused', () => {
-  const selected = selectHandoffMessages([user('go'), assistant('call', ['missing'])], undefined);
+test('an errored assistant tool call no longer blocks every later request', () => {
+  // Real session: a WebSocket error left a partial write call with no result.
+  const failed = { ...assistant('partial write', ['lost']), stopReason: 'error' } as HandoffMessage;
+  const later = [user('continue'), assistant('read', ['ok']), tool('ok', 'fine')];
+  const selected = selectHandoffMessages([user('write it'), failed, ...later], undefined);
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.equal(selected.messages.includes(failed), false, 'Pi skips errored assistant messages');
+    assert.deepEqual(selected.messages.slice(-3), later);
+  }
+  const orphanResult = selectHandoffMessages([user('go'), tool('unknown', 'stray')], undefined);
+  assert.equal(orphanResult.ok, true);
+  if (orphanResult.ok) assert.deepEqual(orphanResult.messages, [user('go')]);
+});
+
+test('duplicate tool results are still refused', () => {
+  const selected = selectHandoffMessages([user('go'), assistant('call', ['x']), tool('x', 'a'), tool('x', 'a')], undefined);
   assert.equal(selected.ok, false);
 });
 
