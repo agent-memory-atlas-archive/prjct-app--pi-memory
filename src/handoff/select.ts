@@ -91,8 +91,6 @@ const checkpointMessage = (checkpoint: OperationalCheckpoint): HandoffMessage =>
 // checkpoint wins so stale summaries cannot displace current operator intent.
 const isPiSummary = (message: HandoffMessage): boolean =>
   message.role === 'compactionSummary' || message.role === 'branchSummary';
-const isRegenerableRecall = (message: HandoffMessage): boolean =>
-  (message as HandoffMessage & { customType?: string }).customType === 'pi-memory-recall';
 
 const continuityPrefix = (
   messages: readonly HandoffMessage[], checkpoint: OperationalCheckpoint | undefined,
@@ -120,7 +118,7 @@ export const selectHandoffMessages = (
   overhead: HandoffOverhead = NO_OVERHEAD,
 ): HandoffResult => {
   assertBudget(budget, overhead);
-  const retained = messages.filter(message => !isRegenerableRecall(message));
+  const retained = messages;
   const pre = packCost(retained, budget, overhead);
   const prefix = continuityPrefix(retained, checkpoint);
   const turns = groupTurns(retained.filter(message => !isPiSummary(message)));
@@ -141,7 +139,7 @@ export const selectHandoffMessages = (
       ok: false,
       instruction: `${prefix.length
         ? 'Handoff refused: continuity checkpoint plus the current complete turn and provider overhead exceed the token/byte/message budget. Update a smaller checkpoint, increase the explicit budget, or start a new session.'
-        : 'Handoff refused: no continuity checkpoint and the current turn plus provider overhead exceed the token/byte/message budget. Write a bounded /memory checkpoint before switching models.'} ${diagnostic}`,
+        : 'Handoff refused: no continuity checkpoint and the current turn plus provider overhead exceed the token/byte/message budget. Start a fresh session with a concise handoff, reduce tool output, or explicitly use /compact (paid).'} ${diagnostic}`,
       preTokens: pre.tokens, preBytes: pre.bytes, systemTokens: overhead.systemTokens,
       toolSchemaReserveTokens: toolTokens, toolSchemaBytes: toolBytes,
     };

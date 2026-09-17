@@ -180,7 +180,7 @@ test('model_select engine failure makes the next public context hook fail closed
   assert.equal(aborted.n, 1);
 });
 
-test('context independently detects a missed model_select and arms bounded mode', async t => {
+test('context is bounded before a switch and stays bounded when model_select is missed', async t => {
   const root = await mkdtemp(join(tmpdir(), 'handoff-observe-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const engine = new MemoryEngine({ root, scopeId: 'p_observe', sessionId: 's-observe', provider: new TestEmbeddingProvider() });
@@ -194,7 +194,7 @@ test('context independently detects a missed model_select and arms bounded mode'
     ui: { notify: () => undefined }, sessionManager: { getSessionId: () => 's-observe' },
   };
   const history = [user('old history'), assistant('old answer'), user('current instruction')];
-  assert.deepEqual((await controller.safeContext(history, ctx as never)).messages, history);
+  assert.deepEqual((await controller.safeContext(history, ctx as never)).messages, [user('current instruction')]);
   ctx.model = { provider: 'offline', id: 'b' };
   const bounded = await controller.safeContext(history, ctx as never);
   assert.deepEqual(bounded.messages, [user('current instruction')]);
@@ -218,7 +218,7 @@ test('measured active tool definitions replace the fixed fallback reserve and ca
     abort: () => { aborted.n += 1; }, ui: { notify: () => undefined },
     sessionManager: { getSessionId: () => 's-overhead' },
   } as never);
-  assert.match(JSON.stringify(result.messages), /failed safely/);
+  assert.deepEqual(result.messages, []);
   assert.equal(aborted.n, 1);
 });
 
