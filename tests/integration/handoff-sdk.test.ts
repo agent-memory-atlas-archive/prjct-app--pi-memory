@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -37,6 +37,8 @@ type ProviderCapture = Readonly<{
   model: string;
   context: Readonly<{ systemPrompt: string; messages: Context['messages'] }>;
   payload: unknown;
+  sessionId?: string;
+  cacheRetention?: string;
 }>;
 
 const offlineProvider = (captures: ProviderCapture[]) =>
@@ -54,6 +56,8 @@ const offlineProvider = (captures: ProviderCapture[]) =>
           model: model.id,
           context: { systemPrompt: context.systemPrompt ?? '', messages: structuredClone(context.messages) },
           payload: replacement ?? proposed,
+          ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+          ...(options?.cacheRetention ? { cacheRetention: options.cacheRetention } : {}),
         });
         stream.push({ type: 'start', partial: output });
         const latestUser = [...context.messages].reverse().find(message => message.role === 'user');
@@ -130,14 +134,16 @@ test('public Pi SDK sends bounded provider contexts across A→B→A and a multi
     })],
   });
   await resourceLoader.reload();
+  const sessionManager = SessionManager.inMemory(root);
+  sessionManager.appendMessage({ role: 'user', content: `OLD_PRIVATE_TRANSCRIPT ${'do-not-replay '.repeat(10_000)}`, timestamp: 1 });
   const { session } = await createAgentSession({
     cwd: root, agentDir: join(root, 'agent'), model: modelA, modelRuntime, resourceLoader,
-    sessionManager: SessionManager.inMemory(root), settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
+    sessionManager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
     tools: ['offline_one', 'offline_two'], customTools: [tool('offline_one', 'RESULT_A'), tool('offline_two', 'RESULT_B')],
   });
   t.after(() => session.dispose());
 
-  await session.prompt(`OLD_PRIVATE_TRANSCRIPT ${'do-not-replay '.repeat(10_000)}`);
+  await session.prompt('READY_FOR_HANDOFF');
   await session.prompt('/memory checkpoint {"goal":"SDK_CHECKPOINT_GOAL","constraints":["KEEP_QUALIFICATION"],"done":[],"inProgress":[],"blocked":[],"decisions":[],"evidenceRefs":["ev_sdk"],"nextSteps":["run tools"]}');
   const afterOld = captures.length;
   await session.setModel(modelB);
@@ -172,6 +178,48 @@ test('public Pi SDK sends bounded provider contexts across A→B→A and a multi
   assert.equal(captures.at(-1)?.model, 'a');
 });
 
+test('public Pi SDK bounds uninitialized history before and after switching without writes', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-handoff-sdk-unbound-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const captures: ProviderCapture[] = [];
+  const { modelRuntime, modelA, modelB } = await createOfflineRuntime(root, captures);
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: root, agentDir: join(root, 'agent'), systemPromptOverride: () => 'SDK_UNBOUND_SYSTEM',
+    extensionFactories: [pi => installMemory(pi, { home: join(root, 'home') })],
+  });
+  await resourceLoader.reload();
+  const sessionManager = SessionManager.inMemory(root);
+  sessionManager.appendMessage({ role: 'user', content: 'UNBOUND_OLD_PRIVATE ' + 'old dump '.repeat(20_000), timestamp: 1 });
+  const { session } = await createAgentSession({
+    cwd: root, agentDir: join(root, 'agent'), model: modelA, modelRuntime, resourceLoader,
+    sessionManager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
+    tools: [],
+  });
+  t.after(() => session.dispose());
+  await session.prompt('UNBOUND_BASELINE');
+  const beforeSwitch = captures.length;
+  await session.setModel(modelB);
+  await session.prompt('UNBOUND_AFTER_SWITCH');
+  const switched = captures.slice(beforeSwitch);
+  assert.equal(switched.length, 1);
+  assert.equal(switched[0]?.model, 'b');
+  const context = JSON.stringify(switched[0]?.context.messages);
+  const payload = JSON.stringify(switched[0]?.payload);
+  for (const serialized of [context, payload]) {
+    assert.match(serialized, /UNBOUND_BASELINE/);
+    assert.match(serialized, /UNBOUND_AFTER_SWITCH/);
+    assert.equal(serialized.includes('failed safely'), false);
+    assert.equal(serialized.includes('UNBOUND_OLD_PRIVATE'), false);
+  }
+  assert.equal(JSON.stringify(captures[0]?.payload).includes('UNBOUND_OLD_PRIVATE'), false);
+  assert.deepEqual(switched[0]?.context.messages.slice(0, captures[0]!.context.messages.length), captures[0]?.context.messages);
+  assert.equal(captures[0]?.context.systemPrompt, switched[0]?.context.systemPrompt);
+  assert.ok(captures[0]?.sessionId, 'host supplies a stable provider routing/cache session id');
+  assert.equal(captures[0]?.sessionId, switched[0]?.sessionId);
+  assert.equal(captures[0]?.cacheRetention, switched[0]?.cacheRetention);
+  assert.deepEqual(await readdir(join(root, 'home')).catch(() => []), []);
+});
+
 test('public Pi SDK never transports original history after model activation cannot bind ownership', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-handoff-sdk-fault-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -180,7 +228,10 @@ test('public Pi SDK never transports original history after model activation can
   const resourceLoader = new DefaultResourceLoader({
     cwd: root, agentDir: join(root, 'agent'), systemPromptOverride: () => 'SDK_FAULT_SYSTEM',
     extensionFactories: [pi => {
-      const unavailable = async (): Promise<never> => { throw new Error('project ownership unavailable'); };
+      const unavailable = async () => {
+        if (captures.length) throw new Error('project ownership unavailable');
+        return undefined;
+      };
       const controller = createHandoffController({
         engine: unavailable,
         budget: { maxTokens: 2_000, maxBytes: 16_000, maxMessages: 6, toolSchemaReserveTokens: 100 },
@@ -210,4 +261,35 @@ test('public Pi SDK never transports original history after model activation can
     assert.match(transported, /failed safely/);
     assert.match(payload, /failed safely/);
   }
+});
+
+test('public Pi SDK cancels automatic compaction before any summary inference and still bounds the request', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-memory-no-paid-compact-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const captures: ProviderCapture[] = [];
+  const { modelRuntime, modelA } = await createOfflineRuntime(root, captures);
+  const attempts: string[] = [];
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: root, agentDir: join(root, 'agent'), systemPromptOverride: () => 'STABLE_SYSTEM',
+    extensionFactories: [pi => {
+      pi.on('session_before_compact', event => { attempts.push(event.reason); });
+      installMemory(pi, { home: join(root, 'home') });
+    }],
+  });
+  await resourceLoader.reload();
+  const sessionManager = SessionManager.inMemory(root);
+  sessionManager.appendMessage({ role: 'user', content: 'OLD_COMPACTION_INPUT ' + 'historical dump '.repeat(5_000), timestamp: 1 });
+  const { session } = await createAgentSession({
+    cwd: root, agentDir: join(root, 'agent'), model: modelA, modelRuntime, resourceLoader, sessionManager,
+    settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 99_999, keepRecentTokens: 1 } }),
+    tools: [],
+  });
+  t.after(() => session.dispose());
+  await session.prompt('LATEST_SMALL_REQUIREMENT');
+  assert.ok(attempts.includes('threshold'), 'exercise actual host auto-compaction, not just a hook mock');
+  assert.equal(captures.length, 1, 'only the user response, no summarizer inference');
+  assert.match(JSON.stringify(captures[0]?.payload), /LATEST_SMALL_REQUIREMENT/);
+  assert.doesNotMatch(JSON.stringify(captures[0]?.payload), /OLD_COMPACTION_INPUT/);
+  assert.equal(sessionManager.getBranch().some(entry => entry.type === 'compaction'), false);
+  assert.deepEqual(await readdir(join(root, 'home')).catch(() => []), []);
 });

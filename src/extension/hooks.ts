@@ -16,7 +16,10 @@ import { memoryHomeFor, sha256 } from '../workspace/project-identity.ts';
 import { resolveMemoryProject } from '../workspace/memory-registry.ts';
 
 export type MemorySession = Readonly<{
+  generation: object;
   engine?: Promise<MemoryEngine>;
+  /** Set only after ownership validation succeeds, never for a pending open. */
+  authorityId?: string;
   readable?: Promise<readonly MemoryEngine[]>;
   ctx?: ExtensionContext;
   prompt: string;
@@ -64,7 +67,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
   const recallThreshold = options.recallThreshold ?? DEFAULT_RECALL_THRESHOLD;
   const onActivity = options.onActivity;
   const slot: { current: MemorySession } = { current: {
-    prompt: '', evidence: new Map(), contextTokens: 0, observations: [], declarations: [],
+    generation: {}, prompt: '', evidence: new Map(), contextTokens: 0, observations: [], declarations: [],
   } };
   const get = (): MemorySession => slot.current;
   const set = (update: Partial<MemorySession>): MemorySession => (slot.current = { ...slot.current, ...update });
@@ -75,7 +78,10 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     const opening = MemoryEngine.forInitializedProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(),
       options.home === undefined ? {} : { home: options.home });
     const slot: { pending?: Promise<MemoryEngine> } = {};
-    const pending = opening.catch(error => {
+    const pending = opening.then(project => {
+      if (get().engine === slot.pending) set({ authorityId: project.scopeId });
+      return project;
+    }).catch(error => {
       if (get().engine === slot.pending) set({ engine: undefined, readable: undefined });
       throw error;
     });
@@ -89,9 +95,11 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     if (!current.ctx) throw new Error('Memory session has not started.');
     if (current.engine) {
       const opened = await current.engine;
-      if (get().ctx !== current.ctx) throw new Error('Memory session changed during initialization.');
+      if (get().generation !== current.generation) throw new Error('Memory session changed during initialization.');
       const binding = await resolveMemoryProject(current.ctx.cwd, memoryHomeFor(options.home));
       if (!binding) throw new Error('The open memory authority has no project binding.');
+      if (get().generation !== current.generation) throw new Error('Memory session changed during initialization.');
+      if (opened.scopeId !== binding.projectId) throw new Error('Memory project binding changed after the authority was opened.');
       return { engine: opened, binding, created: false };
     }
     const task = MemoryEngine.initializeProject(current.ctx.cwd, current.ctx.sessionManager.getSessionId(),
@@ -101,13 +109,31 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     set({ engine: pending, readable: undefined });
     try {
       const initialized = await task;
-      if (get().ctx !== current.ctx) throw new Error('Memory session changed during initialization.');
-      set({ engine: Promise.resolve(initialized.engine), readable: Promise.resolve([initialized.engine]) });
+      if (get().generation !== current.generation) throw new Error('Memory session changed during initialization.');
+      set({ engine: Promise.resolve(initialized.engine), authorityId: initialized.engine.scopeId, readable: Promise.resolve([initialized.engine]) });
       return initialized;
     } catch (error) {
       if (get().engine === pending) set({ engine: undefined, readable: undefined });
       throw error;
     }
+  };
+
+  const handoffEngine = async (): Promise<MemoryEngine | undefined> => {
+    const current = get();
+    if (!current.ctx) throw new Error('Memory session has not started.');
+    const binding = await resolveMemoryProject(current.ctx.cwd, memoryHomeFor(options.home));
+    if (get().generation !== current.generation) throw new Error('Memory session changed while resolving handoff ownership.');
+    if (!binding) {
+      if (get().authorityId) throw new Error('Memory project binding disappeared after the authority was opened.');
+      return undefined;
+    }
+    if (get().authorityId && get().authorityId !== binding.projectId) throw new Error('Memory project binding changed after the authority was opened.');
+    const project = await engine();
+    const verified = await resolveMemoryProject(current.ctx.cwd, memoryHomeFor(options.home));
+    if (get().generation !== current.generation) throw new Error('Memory session changed while opening the handoff authority.');
+    if (!verified) throw new Error('Memory project binding disappeared after the authority was opened.');
+    if (project.scopeId !== verified.projectId || project.scopeId !== binding.projectId) throw new Error('Memory project binding changed after the authority was opened.');
+    return project;
   };
 
   /** The active project's memory only. Team/shared databases are not readable. */
@@ -179,12 +205,14 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     if (!pending.observations.length && !pending.declarations.length) return;
     set({ observations: [], declarations: [] });
     const project = await engine();
+    if (get().generation !== pending.generation) throw new Error('Memory session changed while flushing observations.');
     try {
       await appendSessionObservations({ projectId: project.scopeId, records: pending.observations,
         ...(options.home === undefined ? {} : { home: options.home }) });
       await promoteDeclaredFacts(project, pending.declarations);
       await promoteSessionFailures(project, pending.observations);
     } catch (error) {
+      if (get().generation !== pending.generation) throw error;
       set({ observations: [...pending.observations, ...get().observations].slice(-64),
         declarations: [...pending.declarations, ...get().declarations].slice(-16) });
       throw error;
@@ -192,7 +220,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
   };
 
   const search: MemorySearch = async request => federatedSearch(await readable(), request);
-  const handoff = createHandoffController({ engine, toolOverhead: () => {
+  const handoff = createHandoffController({ engine: handoffEngine, toolOverhead: () => {
     try {
       const active = new Set(pi.getActiveTools());
       const definitions = pi.getAllTools().filter(tool => active.has(tool.name)).map(tool => ({
@@ -210,7 +238,9 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
    * has been compacted, and its new size is the growth since.
    */
   const countTurn = async (ctx: ExtensionContext): Promise<void> => {
+    const current = get();
     const project = await engine();
+    if (get().generation !== current.generation) throw new Error('Memory session changed while counting activity.');
     const seen = ctx.getContextUsage?.()?.tokens ?? null;
     const previous = get().contextTokens;
     const grown = seen === null ? 0 : seen > previous ? seen - previous : seen;
@@ -223,19 +253,24 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     handoff.clear();
     if (ctx.model) handoff.observeModel(ctx.cwd, ctx.sessionManager.getSessionId(), ctx.model);
     const previous = get();
-    if (previous.ctx && previous.ctx.cwd !== ctx.cwd) {
+    set({ generation: {}, engine: undefined, authorityId: undefined, readable: undefined, ctx, prompt: '', evidence: new Map(), contextTokens: 0,
+      observations: [], declarations: [] });
+    if (previous.ctx) {
       const opened = await previous.readable?.catch(() => []) ?? [];
       const pending = previous.engine ? [await previous.engine.catch(() => undefined)] : [];
-      for (const memory of [...opened, ...pending]) await memory?.dispose().catch(() => undefined);
+      const engines = [...new Set([...opened, ...pending].filter(memory => memory !== undefined))];
+      for (const memory of engines) await memory.dispose().catch(() => undefined);
     }
-    set({ engine: undefined, readable: undefined, ctx, prompt: '', evidence: new Map(), contextTokens: 0,
-      observations: [], declarations: [] });
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
+    const current = get();
+    const stale = (): boolean => get().generation !== current.generation;
     await flushSessionObservations().catch(() => undefined);
+    if (stale()) return { systemPrompt: event.systemPrompt };
     set({ ctx, prompt: event.prompt });
     await countTurn(ctx).catch(() => undefined);
+    if (stale()) return { systemPrompt: event.systemPrompt };
     const prompt = clipSessionSummary(event.prompt);
     const observedAt = new Date().toISOString();
     const correction = declaredCorrectionQuote(event.prompt);
@@ -259,6 +294,7 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     }
     const recalled = await search({ queries: [event.prompt], limit: 4, maxBytes: 1500, dense: false, scoreThreshold: recallThreshold, namespaces: ['memory', 'memory.topic'] })
       .catch(() => undefined);
+    if (stale()) return { systemPrompt: event.systemPrompt };
     const highConfidence = (recalled?.items ?? []).filter(item => item.standing === 'supported').slice(0, 4);
     const memoryBlock = highConfidence.length
       ? `<retained_memory trust="untrusted">\n${highConfidence.map(item => retainedJson({
@@ -296,13 +332,15 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
 
   pi.on('turn_end', async () => { await flushSessionObservations().catch(() => undefined); });
 
-  installHandoffHooks(pi, handoff, engine);
+  installHandoffHooks(pi, handoff, handoffEngine);
 
   pi.on('session_shutdown', async () => {
+    const current = get();
     await flushSessionObservations().catch(() => undefined);
+    if (get().generation !== current.generation) return;
     const { engine: pending, readable: opened } = get();
     handoff.clear();
-    set({ engine: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '', contextTokens: 0,
+    set({ generation: {}, engine: undefined, authorityId: undefined, readable: undefined, ctx: undefined, evidence: new Map(), prompt: '', contextTokens: 0,
       observations: [], declarations: [] });
     // The project engine is one of the readable ones; dispose the set, not both.
     const engines = await opened?.catch(() => []) ?? (pending ? [await pending] : []);

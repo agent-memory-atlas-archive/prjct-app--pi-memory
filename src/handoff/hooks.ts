@@ -3,6 +3,7 @@ import type { MemoryEngine } from '../engine.ts';
 import { DEFAULT_HANDOFF_BUDGET, estimateHandoffTokens, selectHandoffMessages, type HandoffBudget } from './select.ts';
 import { assertCheckpoint, readCheckpoint, writeCheckpoint, type OperationalCheckpoint } from './checkpoint.ts';
 import type { HandoffMessage } from './turns.ts';
+import { createContextWindow } from './window.ts';
 
 export type HandoffState = Readonly<{
   projectId: string;
@@ -22,22 +23,15 @@ type HandoffGate = Readonly<{
 const keyOf = (projectId: string, sessionId: string): string => `${projectId}\u0000${sessionId}`;
 const gateKeyOf = (workspace: string, sessionId: string): string => `${workspace}\u0000${sessionId}`;
 const modelKeyOf = (model: Readonly<{ provider: string; id: string }>): string => `${model.provider}\u0000${model.id}`;
-const currentRecallOnly = (messages: readonly HandoffMessage[]): HandoffMessage[] => {
-  const latest = messages.map((_message, index) => index)
-    .filter(index => (messages[index] as HandoffMessage & { customType?: string }).customType === 'pi-memory-recall').at(-1) ?? -1;
-  return messages.filter((message, index) => {
-    const customType = (message as HandoffMessage & { customType?: string }).customType;
-    return customType !== 'pi-memory-recall' || index === latest;
-  });
-};
 
 const SAFE: HandoffMessage = {
   role: 'user',
-  content: [{ type: 'text', text: 'Model-switch handoff failed safely. Pi 0.85.1 context handlers cannot cancel the network request by throwing; this replacement context is the fail-safe. Write a smaller /memory checkpoint and retry.' }],
+  content: [{ type: 'text', text: 'Model-switch handoff failed safely. Pi 0.85.1 context handlers cannot cancel the network request by throwing; this replacement context is the fail-safe. Reduce tool output or start a fresh session with a concise handoff. Manual /compact is an explicit paid alternative.' }],
 };
 
 export const createHandoffController = (options: {
-  engine: () => Promise<MemoryEngine>;
+  /** Undefined means transient context bounding without durable memory. */
+  engine: () => Promise<MemoryEngine | undefined>;
   budget?: HandoffBudget;
   toolOverhead?: () => { toolSchemaTokens?: number; toolSchemaBytes?: number };
 } ) => {
@@ -46,7 +40,12 @@ export const createHandoffController = (options: {
     states: ReadonlyMap<string, HandoffState>;
     gates: ReadonlyMap<string, HandoffGate>;
     models: ReadonlyMap<string, string>;
-  } = { states: new Map(), gates: new Map(), models: new Map() };
+    pending: Map<string, Promise<void>>;
+    windows: Map<string, ReturnType<typeof createContextWindow>>;
+    generation: object;
+    compactionNotified: boolean;
+  } = { states: new Map(), gates: new Map(), models: new Map(), pending: new Map(),
+    windows: new Map(), generation: {}, compactionNotified: false };
   const get = (projectId: string, sessionId: string): HandoffState | undefined => slot.states.get(keyOf(projectId, sessionId));
   const getGate = (workspace: string, sessionId: string): HandoffGate | undefined => slot.gates.get(gateKeyOf(workspace, sessionId));
   const put = (state: HandoffState): void => {
@@ -59,6 +58,10 @@ export const createHandoffController = (options: {
     slot.states = new Map();
     slot.gates = new Map();
     slot.models = new Map();
+    slot.pending = new Map();
+    slot.windows = new Map();
+    slot.generation = {};
+    slot.compactionNotified = false;
   };
 
   const observeModel = (workspace: string, sessionId: string, model: Readonly<{ provider: string; id: string }>): void => {
@@ -73,58 +76,106 @@ export const createHandoffController = (options: {
     slot.gates = new Map([...slot.gates, [gateKeyOf(workspace, sessionId), { workspace, sessionId, failure }]]);
   };
 
+  // Publish a pending gate synchronously. Concurrent context events must await
+  // ownership resolution, never race through with the original history.
+  const prepare = (ctx: ExtensionContext, notice: string): Promise<void> => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const key = gateKeyOf(ctx.cwd, sessionId);
+    const existing = slot.pending.get(key);
+    if (existing) return existing;
+    const generation = slot.generation;
+    const task = Promise.resolve().then(async () => {
+      try {
+        const project = await options.engine();
+        if (generation !== slot.generation) throw new Error('Memory session changed during handoff activation.');
+        const prior = getGate(ctx.cwd, sessionId);
+        if (prior?.failure) return;
+        if (prior?.projectId && project?.scopeId !== prior.projectId) throw new Error('Handoff project changed.');
+        if (project) activate(project.scopeId, ctx.cwd, sessionId, notice);
+        else slot.gates = new Map([...slot.gates, [key, { workspace: ctx.cwd, sessionId }]]);
+      } catch (error) {
+        if (generation !== slot.generation) throw error;
+        failClosed(ctx.cwd, sessionId, `Handoff could not bind the project: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (generation === slot.generation) slot.pending.delete(key);
+      }
+    });
+    slot.pending.set(key, task);
+    return task;
+  };
+
+  const preventAutomaticCompaction = (reason: string, ctx: ExtensionContext): { cancel: true } | undefined => {
+    if (reason === 'manual') return undefined;
+    if (!slot.compactionNotified) {
+      slot.compactionNotified = true;
+      try { ctx.ui.notify('Automatic paid compaction blocked. Context is bounded locally; /compact remains an explicit paid option.', 'info'); } catch { /* UI must not enable paid inference. */ }
+    }
+    return { cancel: true };
+  };
+
   const persist = async (engine: MemoryEngine, sessionId: string, draft: Omit<OperationalCheckpoint, 'projectId' | 'sessionId' | 'updatedAt'>): Promise<OperationalCheckpoint> =>
     writeCheckpoint(engine, {
       ...draft, projectId: engine.scopeId, sessionId, updatedAt: new Date().toISOString(),
     });
 
-  const refuse = (ctx: ExtensionContext, message: string): { messages: HandoffMessage[] } => {
-    try { ctx.abort(); } catch { /* Pi provides a void best-effort abort; SAFE remains the primary fallback. */ }
-    try { ctx.ui.notify(message, 'error'); } catch { /* A UI fault must not restore the original context. */ }
-    return { messages: [SAFE] };
-  };
-
-  const boundContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<{ messages: HandoffMessage[] }> => {
-    const current = currentRecallOnly(messages);
-    const sessionId = ctx.sessionManager.getSessionId();
-    const gate = getGate(ctx.cwd, sessionId);
-    if (!gate) return { messages: current };
-    if (gate.failure) throw new Error(gate.failure);
-    const engine = await options.engine();
-    if (engine.scopeId !== gate.projectId) throw new Error('Handoff project changed before context selection.');
-    const state = get(engine.scopeId, sessionId);
-    if (!state?.active || state.workspace !== ctx.cwd) throw new Error('Handoff activation state is unavailable.');
-    const checkpoint = readCheckpoint(engine, sessionId);
+  const overheadFor = (ctx: ExtensionContext) => {
     const systemPrompt = ctx.getSystemPrompt();
-    const selected = selectHandoffMessages(current, checkpoint, budget, {
+    return {
       systemTokens: estimateHandoffTokens({ role: 'user', content: systemPrompt }),
       systemBytes: Buffer.byteLength(systemPrompt, 'utf8'),
       ...options.toolOverhead?.(),
-    });
+    };
+  };
+
+  const refuse = (ctx: ExtensionContext, message: string): { messages: HandoffMessage[] } => {
+    try { ctx.abort(); } catch { /* Best effort: extensions cannot guarantee zero network calls. */ }
+    try { ctx.ui.notify(message, 'error'); } catch { /* UI must not restore original context. */ }
+    try {
+      const fallback = selectHandoffMessages([SAFE], undefined, budget, overheadFor(ctx));
+      if (fallback.ok) return { messages: [SAFE] };
+    } catch { /* Invalid configuration or unavailable overhead: send no history. */ }
+    // Even SAFE must fit. If fixed system/tools alone exceed the budget, no
+    // message replacement can make the full request fit; never strip policies
+    // or claim that best-effort abort is a guaranteed transport cancellation.
+    return { messages: [] };
+  };
+
+  const boundContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<{ messages: HandoffMessage[] }> => {
+    const current = messages;
+    const generation = slot.generation;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const gate = getGate(ctx.cwd, sessionId);
+    if (!gate) throw new Error('Context budget gate is unavailable.');
+    if (gate.failure) throw new Error(gate.failure);
+    const engine = await options.engine();
+    if (generation !== slot.generation) throw new Error('Memory session changed during context selection.');
+    if (gate.projectId && engine?.scopeId !== gate.projectId) throw new Error('Handoff project changed before context selection.');
+    if (engine && !gate.projectId) activate(engine.scopeId, ctx.cwd, sessionId, 'Durable checkpoint authority available');
+    const checkpoint = engine ? readCheckpoint(engine, sessionId) : undefined;
+    const windowKey = gateKeyOf(ctx.cwd, sessionId);
+    const window = slot.windows.get(windowKey) ?? createContextWindow();
+    slot.windows.set(windowKey, window);
+    const selected = window(current, checkpoint, budget, overheadFor(ctx));
     if (!selected.ok) return refuse(ctx, selected.instruction);
-    ctx.ui.notify(
-      `Handoff ${selected.preTokens}→${selected.postTokens} tokens, ${selected.preBytes}→${selected.postBytes} bytes. ${selected.reason}`,
-      'info',
-    );
+    if (selected.omittedTurns > 0) {
+      try { ctx.ui.notify(
+        `Handoff ${selected.preTokens}→${selected.postTokens} tokens, ${selected.preBytes}→${selected.postBytes} bytes. ${selected.reason}`,
+        'info',
+      ); } catch { /* UI failure must not discard the valid bounded context. */ }
+    }
     return { messages: [...selected.messages] };
   };
 
   const safeContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<{ messages: HandoffMessage[] }> => {
+    const generation = slot.generation;
     try {
       const sessionId = ctx.sessionManager.getSessionId();
       if (!ctx.model) return refuse(ctx, 'Handoff refused: Pi did not expose the current model, so model-switch state cannot be verified.');
-      const observedKey = gateKeyOf(ctx.cwd, sessionId);
-      const currentModel = modelKeyOf(ctx.model);
-      const previousModel = slot.models.get(observedKey);
-      if (previousModel && previousModel !== currentModel && !getGate(ctx.cwd, sessionId)) {
-        try {
-          const project = await options.engine();
-          activate(project.scopeId, ctx.cwd, sessionId, `Context detected model change ${previousModel} → ${currentModel}`);
-        } catch (error) {
-          failClosed(ctx.cwd, sessionId,
-            `Context detected a model change but could not bind the project: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
+      const key = gateKeyOf(ctx.cwd, sessionId);
+      const pending = slot.pending.get(key);
+      if (pending) await pending;
+      else if (!getGate(ctx.cwd, sessionId)) await prepare(ctx, 'Local context budget active');
+      if (generation !== slot.generation) throw new Error('Memory session changed before context selection.');
       observeModel(ctx.cwd, sessionId, ctx.model);
       return await boundContext(messages, ctx);
     } catch (error) {
@@ -132,39 +183,30 @@ export const createHandoffController = (options: {
     }
   };
 
-  return { activate, failClosed, observeModel, clear, persist, safeContext, get, getGate, budget };
+  return { activate, failClosed, observeModel, clear, persist, safeContext, get, getGate, prepare, preventAutomaticCompaction, budget };
 };
 
-export const installHandoffHooks = (pi: ExtensionAPI, controller: ReturnType<typeof createHandoffController>, engine: () => Promise<MemoryEngine>): void => {
+export const installHandoffHooks = (pi: ExtensionAPI, controller: ReturnType<typeof createHandoffController>,
+  _engine: () => Promise<MemoryEngine | undefined>): void => {
   pi.on('model_select', async (event, ctx) => {
-    const sessionId = ctx.sessionManager.getSessionId();
-    controller.observeModel(ctx.cwd, sessionId, event.model);
-    if (!event.previousModel) return;
-    const notice = `Model switch ${event.source}: ${event.previousModel.provider}/${event.previousModel.id} → ${event.model.provider}/${event.model.id}`;
+    controller.observeModel(ctx.cwd, ctx.sessionManager.getSessionId(), event.model);
+    if (!event.previousModel || modelKeyOf(event.model) === modelKeyOf(event.previousModel)) return;
     try {
-      const project = await engine();
-      controller.activate(project.scopeId, ctx.cwd, sessionId, notice);
-      ctx.ui.notify('Bounded model-switch handoff is active for subsequent LLM calls. No extra inference was started.', 'info');
+      await controller.prepare(ctx, `Model switch ${event.source}: ${event.previousModel.provider}/${event.previousModel.id} → ${event.model.provider}/${event.model.id}`);
     } catch (error) {
-      const failure = `Model-switch handoff could not bind the project: ${error instanceof Error ? error.message : String(error)}`;
-      controller.failClosed(ctx.cwd, sessionId, failure);
-      ctx.ui.notify(`${failure}. The next context will be replaced with the safe refusal.`, 'error');
+      try { ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error'); } catch { /* UI only. */ }
     }
   });
+
+  pi.on('session_before_compact', (event, ctx) => controller.preventAutomaticCompaction(event.reason, ctx));
 
   pi.on('context', async (event, ctx) => {
     const result = await controller.safeContext(event.messages as HandoffMessage[], ctx);
     return { messages: result.messages as typeof event.messages };
   });
 
-  pi.on('before_provider_request', (_event, ctx) => {
-    const sessionId = ctx.sessionManager.getSessionId();
-    void engine().then(project => {
-      const state = controller.get(project.scopeId, sessionId);
-      if (state?.notice) ctx.ui.notify(`Handoff diagnostic (payload not logged): ${state.notice}`, 'info');
-    }).catch(() => undefined);
-    return undefined;
-  });
+  // Leave provider-native cache keys, retention and routing untouched.
+  pi.on('before_provider_request', () => undefined);
 };
 
 export { assertCheckpoint, readCheckpoint, writeCheckpoint };
