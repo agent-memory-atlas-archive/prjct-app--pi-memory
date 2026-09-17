@@ -42,16 +42,20 @@ test('explicit public handoff budget reaches the controller', () => {
   assert.deepEqual(runtime.handoff.budget, handoff);
 });
 
-test('host tool results expose session-local evidence handles to the active agent', async () => {
+test('host tool results stage evidence for every call but expose handles only on failures', async () => {
   const { runtime, handlers } = hookHarness();
-  const content = [{ type: 'text', text: 'npm test passed' }];
-  const patched = await handlers.get('tool_result')!({ toolName: 'bash', toolCallId: 'call_1', isError: false, content },
+  const success = await handlers.get('tool_result')!({ toolName: 'bash', toolCallId: 'call_0', isError: false,
+    content: [{ type: 'text', text: 'npm test passed' }] }, { sessionManager: { getSessionId: () => 'session_1' } });
+  assert.equal(success, undefined, 'a successful result is left untouched');
+  assert.equal(runtime.stagedEvidence().size, 1);
+  const content = [{ type: 'text', text: 'npm test failed: Error: cannot open database' }];
+  const patched = await handlers.get('tool_result')!({ toolName: 'bash', toolCallId: 'call_1', isError: true, content },
     { sessionManager: { getSessionId: () => 'session_1' } });
   const marker = patched.content.at(-1).text as string;
   assert.match(marker, /^\[pi-memory evidence: e_[a-z0-9_-]+\]$/);
   const id = marker.slice('[pi-memory evidence: '.length, -1);
   const staged = runtime.stagedEvidence().get(id);
-  assert.equal(staged?.excerpt, 'bash succeeded\nnpm test passed');
+  assert.equal(staged?.excerpt, 'bash failed\nnpm test failed: Error: cannot open database');
   assert.match(staged?.id ?? '', /^ev_/u);
   assert.notEqual(staged?.id, id);
   await handlers.get('session_start')!({}, { cwd: '/tmp/new-session', sessionManager: { getSessionId: () => 'session_2' } });

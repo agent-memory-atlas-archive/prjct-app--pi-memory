@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { checkpointAndEnqueueLegacy } from './curation/migrate.ts';
+import { loadDaemonConfig } from './daemon/config.ts';
 import type { MemoryEngine } from './engine.ts';
 import { installMemoryHooks } from './extension/hooks.ts';
 import type { HandoffBudget } from './handoff/select.ts';
@@ -104,8 +105,15 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
    * last run crosses a threshold does a source get re-read — in the background,
    * so the turn is never waiting on it, and never twice at once.
    */
+  // Automatic sync only enqueues analysis for the daemon; without an analysis
+  // provider those jobs never run, so there is nothing to enqueue.
+  const analysis: { configured?: Promise<boolean> } = {};
+  const analysisConfigured = (): Promise<boolean> => analysis.configured ??= loadDaemonConfig({ home: memoryHomeFor(options.home) })
+    .then(config => Boolean(config.provider), () => false);
+
   const syncIfDue = async (project: MemoryEngine): Promise<void> => {
     if (options.sync?.enabled === false || running.now) return;
+    if (!(await analysisConfigured())) return;
     const ready = await sources(project);
     const due = ready.list().filter(adapter => dueAdapters(project.projection, [adapter], adapter === SESSION_ADAPTER_ID
       ? { ...PI_SESSION_SYNC_POLICY, enabled: options.sync?.enabled ?? true }
@@ -125,6 +133,21 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     }
   };
 
+  // Outside a git repository nothing can be recorded, so the tools only cost
+  // schema tokens and failed calls. Restore exactly what was hidden.
+  const MEMORY_TOOLS = ['memory_context', 'memory_record'];
+  const hidden: { tools: readonly string[] } = { tools: [] };
+  const syncToolVisibility = async (): Promise<void> => {
+    if (typeof pi.getActiveTools !== 'function' || typeof pi.setActiveTools !== 'function') return;
+    const where = await runtime.location().catch(() => undefined);
+    const bound = where ? await resolveMemoryProject(where.path, memoryHomeFor(options.home)).catch(() => undefined) : undefined;
+    const available = Boolean(where?.repository || bound);
+    const active = pi.getActiveTools();
+    const next = available ? [...new Set([...active, ...hidden.tools])] : active.filter(name => !MEMORY_TOOLS.includes(name));
+    hidden.tools = available ? [] : MEMORY_TOOLS.filter(name => active.includes(name) || hidden.tools.includes(name));
+    if (next.length !== active.length || next.some((name, index) => name !== active[index])) pi.setActiveTools(next);
+  };
+
   const runtime = installMemoryHooks(pi, {
     ...(options.home === undefined ? {} : { home: options.home }),
     ...(options.recallThreshold === undefined ? {} : { recallThreshold: options.recallThreshold }),
@@ -134,8 +157,10 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     // Deliberately not awaited by the hook: a source scan must never sit
     // between the user's prompt and the agent starting.
     onActivity: project => { void syncIfDue(project).catch(() => undefined); },
+    onSessionStart: () => syncToolVisibility(),
   });
   installMemoryTools(pi, runtime);
+
 
   const adapterIds = [...new Set([
     SESSION_ADAPTER_ID,
@@ -165,7 +190,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
         return;
       }
       if (action === 'status') {
-        const binding = await resolveMemoryProject(ctx.cwd, home);
+        const binding = await resolveMemoryProject((await runtime.location()).path, home);
         if (!binding) {
           const legacy = await resolveLegacyProject(ctx.cwd, home);
           await show(resultModel('memory · status', [

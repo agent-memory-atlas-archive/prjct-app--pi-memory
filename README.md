@@ -18,18 +18,20 @@ Requires Pi, Node.js 22.19 or later, macOS or Linux.
 pi install npm:@prjct.app/pi-memory
 ```
 
-Initialize each checkout explicitly before using memory:
-
-```text
-/memory init
-```
+Memory belongs to a git repository. The first thing worth keeping — a
+`memory_record` call or a "remember/recuerda…" declaration — initializes the
+repository root automatically, wherever inside it Pi was started. Reading never
+initializes: a lookup in a repository without memory abstains. Outside a git
+repository nothing is created and the memory tools are hidden. `/memory init`
+still binds a checkout explicitly.
 
 `/memory status` and extension startup are read-only while a checkout is
 uninitialized. Initialization writes a checksummed binding to pi-memory's own
-registry and creates exactly one owner-bound project database. The first dense
-operation then downloads the default local multilingual encoder into the active
-project's `memory/models` directory. Until it is available, writes and lexical
-search continue to work and report that dense indexing is pending.
+registry and creates exactly one owner-bound project database. The default
+local multilingual encoder is downloaded once into `<memory-home>/pi-memory/models`
+and shared by every project. New memories are embedded in the background, so a
+write never waits on the encoder; until it is available, writes and lexical
+search keep working.
 
 ## Agent tools
 
@@ -41,8 +43,8 @@ search continue to work and report that dense indexing is pending.
   of rewriting history, or indexes a generic source document.
 
 The extension keeps a bounded, session-local staging window for host tool
-results and exposes each staged `ev_` id in the corresponding tool result.
-The agent can selectively promote an observation with `memory_record`.
+results. A failed tool result carries its staged evidence handle so the agent
+can cite it with `memory_record`; successful results are left untouched.
 Exact, secret-free user declarations beginning with `remember`, `recuerda`, or
 `acuérdate` are also stored directly as supported lexical procedures after the
 turn; corrections follow the same declared-evidence path. Memory's own tools
@@ -53,6 +55,15 @@ the current prompt.
 The agent should remember decisions, corrections, stable constraints,
 preferences, verified failures, and reusable procedures—not routine reads,
 progress narration, secrets, or generic summaries.
+
+Automatic recall runs before each prompt in a repository with memory. It
+searches the prompt and each of its sentences, so an instruction-wrapped
+question still matches. Agent-recorded memories without a user quote recall
+labelled `needs_review`. Dense recall uses the local encoder, which starts
+loading with the session; the first prompt waits at most two seconds for it.
+A dense-only match must be close (cosine ≥ 0.6) and clearly ahead of the other
+candidates (margin ≥ 0.2), so answers phrased in another language recall while
+unrelated prompts still abstain.
 
 ## Commands
 
@@ -90,7 +101,10 @@ transient; only validated selected knowledge, fingerprints and citations enter
 the project authority. The only built-in source is pi-memory's own Pi session
 log: selected failed tool results (native host provenance), exact corrections,
 and explicit remember/recuerda declarations stated in the prompt. Routine
-successes are not written. The extension never calls a model; the standalone daemon analyzes
+successes are not written. A failure is stored as its diagnosis — up to three
+distinct error lines without runner framing or stack frames — and only in a
+repository that already has memory; red tests during development are not
+stored. The extension never calls a model; the standalone daemon analyzes
 fingerprints while Pi is closed.
 
 Each adapter declares its owner. The production registry installs only the
@@ -109,7 +123,10 @@ for reproducible private-snapshot checks with the real encoder.
 
 ### When sources are re-read
 
-Sync is not on a schedule and does not run at start-up. Each turn adds to a
+Sync is not on a schedule and does not run at start-up. Automatic sync only
+queues analysis for the daemon, so it is skipped entirely until an analysis
+provider is configured (`PI_MEMORY_ANALYSIS_PROVIDER` or the shared memory
+config); `/memory sync` still runs on demand. Each turn adds to a
 watermark table in the project's projection — turns taken, context tokens
 consumed, memories written — and a source is re-read only once the work done
 since its last run crosses a threshold:
