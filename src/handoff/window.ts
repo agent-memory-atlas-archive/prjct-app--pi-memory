@@ -1,12 +1,24 @@
 import { createHash } from 'node:crypto';
 import type { OperationalCheckpoint } from './checkpoint.ts';
-import { selectHandoffMessages, type HandoffBudget, type HandoffOverhead, type HandoffResult } from './select.ts';
+import {
+  estimateHandoffTokens, selectHandoffMessages, type HandoffBudget, type HandoffOverhead, type HandoffResult,
+} from './select.ts';
 import {
   DEFAULT_OBSERVATION_POLICY, maskObservations, nextObservationFrontier, type ObservationPolicy,
 } from './observations.ts';
 import type { HandoffMessage } from './turns.ts';
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+/**
+ * Cheap identity for a message across Pi's deep-copied context events. Hashing
+ * the serialized prefix cost ~60% of the hook's CPU on large sessions; role,
+ * timestamp, tool call id and size still change whenever compaction or tree
+ * navigation replaces history.
+ */
+const fingerprintKey = (message: HandoffMessage): string =>
+  `${message.role}\u0000${message.timestamp ?? ''}\u0000${message.toolCallId ?? ''}\u0000${estimateHandoffTokens(message)}`;
+const prefixDigest = (keys: readonly string[], count: number): string =>
+  createHash('sha256').update(keys.slice(0, count).join('\n')).digest('hex');
 const isSummary = (message: HandoffMessage): boolean =>
   message.role === 'compactionSummary' || message.role === 'branchSummary';
 
@@ -34,13 +46,14 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
     budget: HandoffBudget, overhead: HandoffOverhead): WindowResult => {
     // Compaction/tree edits replace the source history; only append-only histories
     // may reuse the watermark. Hashes work with Pi's deep-copied context events.
+    const keys = messages.map(fingerprintKey);
     const floor = state.floor < messages.length
-      && state.prefix === digest(messages.slice(0, state.floor + 1)) ? state.floor : 0;
+      && state.prefix === prefixDigest(keys, state.floor + 1) ? state.floor : 0;
     const priorFrontier = state.frontier <= messages.length
-      && state.frontierPrefix === digest(messages.slice(0, state.frontier)) ? state.frontier : 0;
+      && state.frontierPrefix === prefixDigest(keys, state.frontier) ? state.frontier : 0;
     const frontier = nextObservationFrontier(messages, priorFrontier, policy);
     state.frontier = frontier;
-    state.frontierPrefix = digest(messages.slice(0, frontier));
+    state.frontierPrefix = prefixDigest(keys, frontier);
     // The masked view has the same indexes as the host history.
     const masking = maskObservations(messages, frontier, policy);
     const view = masking.messages;
@@ -63,7 +76,7 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
     const first = result.messages.find(message => !isSummary(message) && view.includes(message));
     const nextFloor = first ? view.indexOf(first) : floor;
     state.floor = Math.max(floor, nextFloor);
-    state.prefix = digest(messages.slice(0, state.floor + 1));
+    state.prefix = prefixDigest(keys, state.floor + 1);
     return frontier > priorFrontier
       ? { ...result, observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } }
       : result;
