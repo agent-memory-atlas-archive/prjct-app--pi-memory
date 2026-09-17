@@ -29,9 +29,7 @@ still binds a checkout explicitly.
 uninitialized. Initialization writes a checksummed binding to pi-memory's own
 registry and creates exactly one owner-bound project database. The default
 local multilingual encoder is downloaded once into `<memory-home>/pi-memory/models`
-and shared by every project. New memories are embedded in the background, so a
-write never waits on the encoder; until it is available, writes and lexical
-search keep working.
+and shared by every project, and only when memory outgrows the prompt block.
 
 ## Agent tools
 
@@ -56,14 +54,17 @@ The agent should remember decisions, corrections, stable constraints,
 preferences, verified failures, and reusable procedures—not routine reads,
 progress narration, secrets, or generic summaries.
 
-Automatic recall runs before each prompt in a repository with memory. It
-searches the prompt and each of its sentences, so an instruction-wrapped
-question still matches. Agent-recorded memories without a user quote recall
-labelled `needs_review`. Dense recall uses the local encoder, which starts
-loading with the session; the first prompt waits at most two seconds for it.
-A dense-only match must be close (cosine ≥ 0.6) and clearly ahead of the other
-candidates (margin ≥ 0.2), so answers phrased in another language recall while
-unrelated prompts still abstain.
+In a repository with memory, every request carries a `<project_memory>` block in
+the system prompt: active memories ordered by kind (corrections, constraints,
+preferences and decisions first), escaped as data, capped at 4KB and stable
+between prompts, so it stays in the provider's cached prefix. The model itself
+matches paraphrases and other languages, with no encoder loaded and nothing to
+wait for. Agent-recorded memories without a user quote are marked
+`(unconfirmed)`. Only when memory outgrows the block are the remaining memories
+searched per prompt (the prompt and each of its sentences); their vectors are
+built and the local encoder is loaded in the background, and a prompt never
+waits for it. A dense-only match must then be close (cosine ≥ 0.6) and clearly
+ahead of the other candidates (margin ≥ 0.2).
 
 ## Commands
 

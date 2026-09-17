@@ -70,15 +70,22 @@ test('outside a git repository a record explains why and nothing is created', as
   assert.equal(await resolveMemoryProject(h.cwd, h.home), undefined);
 });
 
-test('an agent-recorded memory recalls automatically in a later prompt, labelled needs_review', async t => {
+test('an agent-recorded memory is in the next prompt\'s system prompt without loading an encoder', async t => {
   const h = await harness(t, { git: true });
-  await h.tools.get('memory_record').execute('c1', {
+  const embedded = { calls: 0 };
+  const engine0 = await h.tools.get('memory_record').execute('c1', {
     action: 'remember', kind: 'decision', statement: 'Compiled Pi builds live in the agent builds directory outside repositories.',
   });
-  const result = await h.handlers.get('before_agent_start')!({ prompt: 'where do compiled Pi builds live?', systemPrompt: 'base' }, h.ctx);
-  assert.ok(result.message, 'recall injected a memory block');
-  assert.match(result.message.content, /Compiled Pi builds live/);
-  assert.match(result.message.content, /needs_review/);
+  assert.equal(engine0.details.status, 'ok');
+  const engine = await h.runtime.engine();
+  const original = (engine as any).vector.provider.embed.bind((engine as any).vector.provider);
+  (engine as any).vector.provider.embed = async (...args: any[]) => { embedded.calls += 1; return original(...args); };
+  const result = await h.handlers.get('before_agent_start')!({ prompt: '¿dónde quedan los artefactos compilados?', systemPrompt: 'base' }, h.ctx);
+  assert.match(result.systemPrompt, /<project_memory trust="untrusted">[\s\S]*- decision \(unconfirmed\): Compiled Pi builds live/);
+  assert.equal(result.message, undefined, 'the digest already carries the whole memory');
+  assert.equal(embedded.calls, 0, 'no encoder for memory that fits the digest');
+  const again = await h.handlers.get('before_agent_start')!({ prompt: 'otra pregunta', systemPrompt: 'base' }, h.ctx);
+  assert.equal(again.systemPrompt, result.systemPrompt, 'the digest is stable across prompts');
 });
 
 test('a remember declaration initializes repository memory; a tool failure alone does not', async t => {
@@ -105,15 +112,25 @@ test('failure statements keep the diagnosis and drop red tests and runner framin
   assert.equal(sessionFailureStatement('bash failed\nall good here'), '');
 });
 
-test('recorded memories get vectors in the background', async t => {
+test('memory larger than the digest gets vectors in the background and per-prompt recall for the rest', async t => {
   const h = await harness(t, { git: true });
-  await h.tools.get('memory_record').execute('c1', {
-    action: 'remember', kind: 'preference', statement: 'Prefer measured numbers from real sessions over estimates in reports.',
+  for (const index of Array.from({ length: 40 }, (_, i) => i)) {
+    await h.tools.get('memory_record').execute(`c${index}`, {
+      action: 'remember', kind: 'fact', userQuote: undefined,
+      statement: `Service ${index} runbook: restart the worker pool, drain the queue, then verify health checks for region ${index} before paging.`,
+    });
+  }
+  await h.tools.get('memory_record').execute('late', {
+    action: 'remember', kind: 'failure', statement: 'Deploys to the staging cluster fail when the kubeconfig context points at production.',
   });
   const engine = await h.runtime.engine();
   const deadline = Date.now() + 5_000;
   while (engine.projection.stats().vectors === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
-  assert.ok(engine.projection.stats().vectors > 0);
+  assert.ok(engine.projection.stats().vectors > 0, 'vectors once memory exceeds the digest');
+  const result = await h.handlers.get('before_agent_start')!({ prompt: 'why do deploys to the staging cluster fail?', systemPrompt: 'base' }, h.ctx);
+  assert.match(result.systemPrompt, /<project_memory/);
+  assert.doesNotMatch(result.systemPrompt, /kubeconfig context/, 'failures come last and did not fit');
+  assert.match(result.message?.content ?? '', /kubeconfig context points at production/);
 });
 
 test('memory tools are hidden outside repositories and restored inside one', async t => {

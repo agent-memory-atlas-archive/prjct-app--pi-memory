@@ -285,7 +285,8 @@ test('automatic recall preserves evidence already bounded by retrieval instead o
   await engine.recordFact({ kind: 'procedure', statement: text.slice(0, 8000), standing: 'supported', entities: [], evidence: [], episodeIds: [],
     confidence: 0.9, tags: { area: 'backup' } });
   const response = await handlers.get('before_agent_start')!({ prompt: 'SQLite backup', systemPrompt: 'Base rules.' }, ctx);
-  assert.doesNotMatch(response.systemPrompt, /Decision: preserve the WAL/);
+  assert.doesNotMatch(response.systemPrompt, /Decision: preserve the WAL/, 'a long memory is only previewed in the digest');
+  assert.equal(response.systemPrompt.match(/<\/project_memory>/g)?.length, 1, 'stored text cannot close the digest');
   assert.equal(response.message.customType, 'pi-memory-recall');
   assert.match(response.message.content, /Decision: preserve the WAL/);
   assert.match(response.message.content, /^<retained_memory trust="untrusted">/);
