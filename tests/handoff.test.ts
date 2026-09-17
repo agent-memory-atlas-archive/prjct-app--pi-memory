@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai';
 import { assertCheckpoint, readCheckpoint, writeCheckpoint } from '../src/handoff/checkpoint.ts';
 import { createHandoffController } from '../src/handoff/hooks.ts';
-import { DEFAULT_HANDOFF_BUDGET, selectHandoffMessages } from '../src/handoff/select.ts';
+import { budgetForModel, DEFAULT_HANDOFF_BUDGET, selectHandoffMessages } from '../src/handoff/select.ts';
 import { groupTurns, type HandoffMessage } from '../src/handoff/turns.ts';
 import { MemoryEngine } from '../src/engine.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
@@ -158,6 +158,39 @@ test('truncation drops oversized images and caps large tool-call arguments befor
     assert.ok(selected.postBytes <= DEFAULT_HANDOFF_BUDGET.maxBytes);
     assert.ok(selected.postTokens <= DEFAULT_HANDOFF_BUDGET.maxTokens);
   }
+});
+
+test('the budget follows the active model context window instead of a fixed 16k cap', () => {
+  assert.deepEqual(budgetForModel(undefined), DEFAULT_HANDOFF_BUDGET);
+  assert.deepEqual(budgetForModel({ contextWindow: 8_000, maxTokens: 4_000 }), DEFAULT_HANDOFF_BUDGET);
+  const sol = budgetForModel({ contextWindow: 272_000, maxTokens: 128_000 });
+  assert.equal(sol.maxTokens, 272_000 - 32_768);
+  assert.ok(sol.maxBytes >= sol.maxTokens * 4);
+  assert.ok(sol.maxMessages >= 1_000);
+  // Two ~55KB reads in one round: aborted under 16k, whole under a 272k model budget.
+  const doc = (word: string) => Array.from({ length: 700 }, (_, index) => index === 350
+    ? `line 0351: THE CODE WORD IS ${word}` : `line ${index}: lorem ipsum dolor sit amet consectetur adipiscing elit sed do`).join('\n');
+  const messages = [user('read both'), assistant('read', ['a', 'b']), tool('a', doc('PAPAYA-7731')), tool('b', doc('MANGO-2290'))];
+  const overhead = { systemTokens: 3_402, systemBytes: 13_610, toolSchemaTokens: 3_401, toolSchemaBytes: 13_604 };
+  const selected = selectHandoffMessages(messages, undefined, sol, overhead);
+  assert.equal(selected.ok, true);
+  if (selected.ok) {
+    assert.equal(selected.truncatedFields, 0);
+    assert.deepEqual(selected.messages, messages);
+  }
+});
+
+test('an unconfigured controller derives its ceiling from ctx.model', async () => {
+  const controller = createHandoffController({ engine: async () => undefined });
+  const big = tool('r', 'q'.repeat(200_000));
+  const messages = [user('read the large document'), assistant('read', ['r']), big];
+  const ctx = (model: object) => ({
+    cwd: '/transient-model-budget', model: { provider: 'offline', id: 'm', ...model }, getSystemPrompt: () => 'policy',
+    abort: () => { throw new Error('must not abort'); }, ui: { notify: () => undefined },
+    sessionManager: { getSessionId: () => 's-model-budget' },
+  }) as never;
+  const result = await controller.safeContext(messages, ctx({ contextWindow: 272_000, maxTokens: 128_000 }));
+  assert.equal(result.messages.at(-1), big);
 });
 
 test('the newest tool round remains atomic and refuses when even truncation cannot fit', () => {

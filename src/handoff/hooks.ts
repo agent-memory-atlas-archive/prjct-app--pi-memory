@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { MemoryEngine } from '../engine.ts';
-import { DEFAULT_HANDOFF_BUDGET, estimateHandoffTokens, selectHandoffMessages, type HandoffBudget } from './select.ts';
+import { budgetForModel, DEFAULT_HANDOFF_BUDGET, estimateHandoffTokens, selectHandoffMessages, type HandoffBudget } from './select.ts';
 import { assertCheckpoint, readCheckpoint, writeCheckpoint, type OperationalCheckpoint } from './checkpoint.ts';
 import type { HandoffMessage } from './turns.ts';
 import { createContextWindow } from './window.ts';
@@ -32,10 +32,12 @@ const SAFE: HandoffMessage = {
 export const createHandoffController = (options: {
   /** Undefined means transient context bounding without durable memory. */
   engine: () => Promise<MemoryEngine | undefined>;
+  /** Explicit ceiling. Omitted means derived per request from the active model's context window. */
   budget?: HandoffBudget;
   toolOverhead?: () => { toolSchemaTokens?: number; toolSchemaBytes?: number };
 } ) => {
   const budget = options.budget ?? DEFAULT_HANDOFF_BUDGET;
+  const budgetFor = (ctx: ExtensionContext): HandoffBudget => options.budget ?? budgetForModel(ctx.model);
   const slot: {
     states: ReadonlyMap<string, HandoffState>;
     gates: ReadonlyMap<string, HandoffGate>;
@@ -131,7 +133,7 @@ export const createHandoffController = (options: {
     try { ctx.abort(); } catch { /* Best effort: extensions cannot guarantee zero network calls. */ }
     try { ctx.ui.notify(message, 'error'); } catch { /* UI must not restore original context. */ }
     try {
-      const fallback = selectHandoffMessages([SAFE], undefined, budget, overheadFor(ctx));
+      const fallback = selectHandoffMessages([SAFE], undefined, budgetFor(ctx), overheadFor(ctx));
       if (fallback.ok) return { messages: [SAFE] };
     } catch { /* Invalid configuration or unavailable overhead: send no history. */ }
     // Even SAFE must fit. If fixed system/tools alone exceed the budget, no
@@ -155,7 +157,7 @@ export const createHandoffController = (options: {
     const windowKey = gateKeyOf(ctx.cwd, sessionId);
     const window = slot.windows.get(windowKey) ?? createContextWindow();
     slot.windows.set(windowKey, window);
-    const selected = window(current, checkpoint, budget, overheadFor(ctx));
+    const selected = window(current, checkpoint, budgetFor(ctx), overheadFor(ctx));
     if (!selected.ok) return refuse(ctx, selected.instruction);
     if (selected.omittedTurns > 0 || selected.truncatedFields > 0) {
       try { ctx.ui.notify(
