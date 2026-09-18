@@ -124,7 +124,7 @@ test('small contexts remain byte-stable without initialization', async t => {
     { role: 'user', content: 'keep the normal context' },
   ];
   const result = await handlers.get('context')!({ messages: original }, ctx);
-  assert.deepEqual(result.messages, original);
+  assert.deepEqual(result, {}, 'identity context leaves the host messages in place');
   assert.equal(aborted.count, 0);
   assert.deepEqual(notices, []);
 });
@@ -286,12 +286,34 @@ test('automatic recall preserves evidence already bounded by retrieval instead o
     confidence: 0.9, tags: { area: 'backup' } });
   const response = await handlers.get('before_agent_start')!({ prompt: 'SQLite backup', systemPrompt: 'Base rules.' }, ctx);
   assert.doesNotMatch(response.systemPrompt, /Decision: preserve the WAL/, 'a long memory is only previewed in the digest');
-  assert.equal(response.systemPrompt.match(/<\/project_memory>/g)?.length, 1, 'stored text cannot close the digest');
+  assert.equal(response.message.content.match(/<\/project_memory>/g)?.length, 1, 'stored text cannot close the digest');
   assert.equal(response.message.customType, 'pi-memory-recall');
   assert.match(response.message.content, /Decision: preserve the WAL/);
-  assert.match(response.message.content, /^<retained_memory trust="untrusted">/);
+  assert.match(response.message.content, /<retained_memory trust="untrusted">/);
   assert.match(response.message.content, /\\u003c\/retained_memory\\u003e/);
   assert.equal(response.message.content.match(/<\/retained_memory>/g)?.length, 1, 'stored text cannot close the data boundary');
+  const repeated = await handlers.get('before_agent_start')!({ prompt: 'SQLite backup', systemPrompt: 'Base rules.' }, ctx);
+  assert.deepEqual(repeated.message, response.message, 'a pending or failed request must not mark recall delivered');
+  const { createContextWindow } = await import('../src/handoff/window.ts');
+  const window = createContextWindow();
+  const budget = { maxTokens: 8_000, maxBytes: 32_768, maxMessages: 8, toolSchemaReserveTokens: 0 };
+  const overhead = { systemTokens: 0, systemBytes: 0 };
+  const firstRecall = { role: 'custom', ...response.message, timestamp: 1 };
+  const firstHistory = [{ role: 'user', content: 'SQLite backup' }, firstRecall];
+  const retained = window([...firstHistory, { role: 'user', content: 'SQLite backup again' },
+    { role: 'custom', ...repeated.message, timestamp: 2 }], undefined, budget, overhead);
+  assert.ok(retained.ok);
+  assert.deepEqual(retained.messages, [...firstHistory, { role: 'user', content: 'SQLite backup again' }]);
+  const recovered = await handlers.get('before_agent_start')!({ prompt: 'SQLite backup', systemPrompt: 'Base rules.' }, ctx);
+  const replacement = [{ role: 'user', content: 'After compaction' }, { role: 'custom', ...recovered.message, timestamp: 3 }];
+  const fresh = window(replacement, undefined, budget, overhead);
+  assert.ok(fresh.ok);
+  assert.deepEqual(fresh.messages, replacement, 'the same recall is available after actual context eviction');
+  assert.equal(repeated.systemPrompt, response.systemPrompt, 'the system policy remains byte-stable');
+   await engine.recordFact({ kind: 'constraint', statement: 'NEW_DYNAMIC_FACT', standing: 'supported', entities: [], evidence: [], episodeIds: [], confidence: 0.9, tags: {} });
+   const updated = await handlers.get('before_agent_start')!({ prompt: 'SQLite backup', systemPrompt: 'Base rules.' }, ctx);
+   assert.equal(updated.systemPrompt, response.systemPrompt, 'active fact updates must not invalidate L0');
+   assert.match(updated.message.content, /NEW_DYNAMIC_FACT/);
 });
 
 test('a pending failed engine attempt is not mistaken for a previously opened authority', async t => {
@@ -315,10 +337,10 @@ test('a pending failed engine attempt is not mistaken for a previously opened au
   const rejected = assert.rejects(opening, /not initialized/);
   await handlers.get('model_select')!({ model: ctx.model, previousModel: { provider: 'offline', id: 'a' }, source: 'set' }, ctx);
   const messages = [{ role: 'user', content: 'preserve current instruction' }];
-  assert.deepEqual((await handlers.get('context')!({ messages }, ctx)).messages, messages);
+  assert.deepEqual(await handlers.get('context')!({ messages }, ctx), {});
   deferred.reject!(new Error('Memory is not initialized'));
   await rejected;
-  assert.deepEqual((await handlers.get('context')!({ messages }, ctx)).messages, messages);
+  assert.deepEqual(await handlers.get('context')!({ messages }, ctx), {});
   assert.deepEqual(await readdir(home).catch(() => []), []);
   await handlers.get('session_shutdown')!({}, ctx);
   await rm(root, { recursive: true, force: true });
@@ -350,10 +372,10 @@ test('model switching during explicit initialization uses transient mode until o
   const opening = runtime.initialize();
   await handlers.get('model_select')!({ model: ctx.model, previousModel: { provider: 'offline', id: 'a' }, source: 'set' }, ctx);
   const messages = [{ role: 'user', content: 'current instruction' }];
-  assert.deepEqual((await handlers.get('context')!({ messages }, ctx)).messages, messages);
+  assert.deepEqual(await handlers.get('context')!({ messages }, ctx), {});
   deferred.release!();
   const initialized = await opening;
-  assert.deepEqual((await handlers.get('context')!({ messages }, ctx)).messages, messages);
+  assert.deepEqual(await handlers.get('context')!({ messages }, ctx), {});
   assert.equal(runtime.handoff.getGate(root, 'pending-init')?.projectId, initialized.engine.scopeId);
   await rm(memoryRegistryPath(home));
   assert.match(JSON.stringify((await handlers.get('context')!({ messages }, ctx)).messages), /failed safely/);

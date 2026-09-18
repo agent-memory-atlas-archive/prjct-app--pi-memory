@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  keepBoundary, maskObservations, nextObservationFrontier, type ObservationPolicy,
+  DEFAULT_OBSERVATION_POLICY, keepBoundary, maskObservations, nextObservationFrontier, type ObservationPolicy,
 } from '../src/handoff/observations.ts';
 import { groupTurns, turnIsComplete, type HandoffMessage } from '../src/handoff/turns.ts';
 import { createContextWindow } from '../src/handoff/window.ts';
-import { budgetForModel } from '../src/handoff/select.ts';
+import { budgetForModel, estimateHandoffTokens } from '../src/handoff/select.ts';
 
 const policy: ObservationPolicy = { enabled: true, keepRounds: 2, minTokens: 50, advanceTokens: 1_000 };
 const user = (text: string): HandoffMessage => ({ role: 'user', content: [{ type: 'text', text }] });
@@ -27,6 +27,17 @@ const history = (): HandoffMessage[] => [
 ];
 const text = (message: HandoffMessage | undefined): string =>
   ((message?.content ?? []) as { text?: string }[]).map(block => block.text ?? '').join('\n');
+
+test('the default policy keeps short histories intact rather than rewriting the prefix', () => {
+  const messages = history();
+  const staleTokens = estimateHandoffTokens(messages[2]!);
+  assert.ok(staleTokens > DEFAULT_OBSERVATION_POLICY.minTokens && staleTokens < 24_000);
+  const frontier = nextObservationFrontier(messages, 0, DEFAULT_OBSERVATION_POLICY);
+  assert.equal(frontier, 0);
+  const masked = maskObservations(messages, frontier, DEFAULT_OBSERVATION_POLICY);
+  assert.equal(masked.masked, 0);
+  assert.equal(JSON.stringify(masked.messages), JSON.stringify(messages));
+});
 
 test('stale outputs become stubs while the newest rounds, calls and pairs stay intact', () => {
   const messages = history();
@@ -75,9 +86,11 @@ test('the live window masks, keeps its frontier across calls, and resets on hist
   const first = window(messages, undefined, budget, overhead);
   assert.equal(first.ok, true);
   assert.ok(first.observations && first.observations.masked === 3);
+  assert.equal(first.unchanged, undefined);
   const again = window([...messages, user('next')], undefined, budget, overhead);
   assert.equal(again.ok, true);
   assert.equal(again.observations, undefined, 'no second advance without a new batch');
+  assert.equal(again.unchanged, undefined, 'repeated masking still replaces host messages');
   if (first.ok && again.ok) assert.deepEqual(again.messages.slice(0, first.messages.length), first.messages);
   const replaced = window([user('fresh after compaction'), ...messages.slice(1)], undefined, budget, overhead);
   assert.equal(replaced.ok, true);

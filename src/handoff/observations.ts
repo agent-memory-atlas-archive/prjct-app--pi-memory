@@ -9,8 +9,9 @@ import { toolCallIds, type HandoffMessage } from './turns.ts';
  * text are kept, so call/result pairs stay atomic.
  *
  * Masking is a pure function of (messages, frontier). The frontier only moves in
- * batches of at least `advanceTokens`, so the serialized prefix stays identical
- * between advances and provider prompt caches keep hitting.
+ * batches of at least `advanceTokens`. The 24k default amortizes prefix
+ * rewrites across many calls rather than trading fewer raw tokens for higher
+ * uncached cost. The serialized prefix stays identical between advances.
  */
 export type ObservationPolicy = Readonly<{
   enabled: boolean;
@@ -78,6 +79,8 @@ const stubFor = (message: HandoffMessage, call: Call | undefined, tokens: number
 const eligible = (messages: readonly HandoffMessage[], calls: ReadonlyMap<string, Call>, policy: ObservationPolicy) =>
   messages.flatMap((message, index) => {
     if (!isResult(message) || !message.toolCallId) return [];
+    if (Array.isArray(message.content) && message.content.some(block => !block || typeof block !== 'object'
+      || (block as { type?: unknown }).type !== 'text')) return [];
     const call = calls.get(message.toolCallId);
     if (!call) return [];
     const tokens = estimateHandoffTokens(message);
@@ -93,9 +96,10 @@ export const keepBoundary = (messages: readonly HandoffMessage[], policy: Observ
 /**
  * Next frontier: stays put until the stale, still-unmasked outputs behind the
  * keep window reach `advanceTokens`, then jumps to the keep boundary at once.
+ * `force` flushes any pending output: the prefix is already being rewritten.
  */
 export const nextObservationFrontier = (messages: readonly HandoffMessage[], frontier: number,
-  policy: ObservationPolicy): number => {
+  policy: ObservationPolicy, force = false): number => {
   if (!policy.enabled) return 0;
   const boundary = keepBoundary(messages, policy);
   if (boundary <= frontier) return Math.min(frontier, boundary);
@@ -103,7 +107,7 @@ export const nextObservationFrontier = (messages: readonly HandoffMessage[], fro
   const pending = eligible(messages, calls, policy)
     .filter(item => item.owner >= frontier && item.owner < boundary)
     .reduce((sum, item) => sum + item.tokens, 0);
-  return pending >= policy.advanceTokens ? boundary : frontier;
+  return pending >= (force ? 1 : policy.advanceTokens) ? boundary : frontier;
 };
 
 /** Same length and order as the input; unchanged messages keep their identity. */

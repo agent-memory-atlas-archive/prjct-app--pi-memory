@@ -34,7 +34,7 @@ test('default lookup and automatic recall retain positives/qualified evidence an
   const o8 = cases.find(kase => kase.name === 'O8')!;
   const recalled = await handlers.get('before_agent_start')!({ prompt: o8.query, systemPrompt: 'Base' }, ctx);
   assert.match(recalled.systemPrompt, /absence is not evidence of absence/);
-  assert.equal(recalled.message, undefined);
+  assert.equal(recalled.message.details.memory.recall, undefined, 'unrelated prompt gets no overflow recall');
   const lookup = await tools.get('memory_context').execute('call', { action: 'lookup', queries: [o8.query] });
   assert.equal(scoreOracle(lookup.details.items, o8, lookup.details).passed, true);
   for (const kase of cases) {

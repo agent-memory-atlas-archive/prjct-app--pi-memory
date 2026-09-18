@@ -78,7 +78,13 @@ export type HandoffResult = Readonly<{
   toolSchemaBytes: number;
 }>;
 
-const messageBytes = (message: HandoffMessage): number => Buffer.byteLength(JSON.stringify(message), 'utf8');
+// `details` is host/UI metadata that Pi never sends to the provider. Counting
+// it priced a 53-token agent_jobs status at ~100KB, so the byte ceiling evicted
+// a current-turn tool round on every call and re-billed the whole prompt.
+const messageBytes = (message: HandoffMessage): number => {
+  const { details: _details, ...sent } = message as HandoffMessage & { details?: unknown };
+  return Buffer.byteLength(JSON.stringify(sent), 'utf8');
+};
 
 /**
  * Messages are immutable here, and selection prices the same objects many

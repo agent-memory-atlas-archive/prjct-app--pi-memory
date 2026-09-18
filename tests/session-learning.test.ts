@@ -155,7 +155,7 @@ test('a declared correction is supported and recalled by the next session before
   const recalled = await handlers.get('before_agent_start')!({
     prompt: 'Should this repository use npm or pnpm?', systemPrompt: 'Base',
   }, ctx(cwd, 'new-session'));
-  assert.match(recalled.systemPrompt, /<project_memory trust="untrusted">[\s\S]*Never use npm; use pnpm/);
+  assert.match(recalled.message.content, /<project_memory trust="untrusted">[\s\S]*Never use npm; use pnpm/);
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
 });
 
@@ -183,7 +183,7 @@ test('an explicit recuerda declaration is supported and recalled by the next ses
   const recalled = await handlers.get('before_agent_start')!({
     prompt: '¿Debemos usar Zod para validar los límites de la API?', systemPrompt: 'Base',
   }, ctx(cwd, 'new-session'));
-  assert.match(recalled.systemPrompt, /<project_memory trust="untrusted">[\s\S]*Recuerda usar Zod/);
+  assert.match(recalled.message.content, /<project_memory trust="untrusted">[\s\S]*Recuerda usar Zod/);
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
 });
 
@@ -214,7 +214,7 @@ test('a compiler failure is a supported fact and is recalled without a daemon', 
   const recalled = await handlers.get('before_agent_start')!({
     prompt: 'error TS2688 Cannot find type definition file for node', systemPrompt: 'Base',
   }, ctx(cwd, 'next-session'));
-  assert.match(recalled.systemPrompt, /<project_memory trust="untrusted">[\s\S]*error TS2688/);
+  assert.match(recalled.message.content, /<project_memory trust="untrusted">[\s\S]*error TS2688/);
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'next-session'));
 });
 

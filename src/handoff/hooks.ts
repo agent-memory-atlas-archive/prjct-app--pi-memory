@@ -4,6 +4,8 @@ import { budgetForModel, DEFAULT_HANDOFF_BUDGET, estimateHandoffTokens, selectHa
 import { assertCheckpoint, readCheckpoint, writeCheckpoint, type OperationalCheckpoint } from './checkpoint.ts';
 import type { HandoffMessage } from './turns.ts';
 import { createContextWindow } from './window.ts';
+import { createSessionReferenceResolver } from './session-references.ts';
+import { DEFAULT_HISTORY_POLICY, type HistoryPolicy } from './history.ts';
 import { DEFAULT_OBSERVATION_POLICY, type ObservationPolicy } from './observations.ts';
 
 export type HandoffState = Readonly<{
@@ -12,6 +14,11 @@ export type HandoffState = Readonly<{
   sessionId: string;
   active: boolean;
   notice?: string;
+}>;
+
+type ContextResult = Readonly<{
+  messages: readonly HandoffMessage[];
+  unchanged?: true;
 }>;
 
 type HandoffGate = Readonly<{
@@ -38,6 +45,8 @@ export const createHandoffController = (options: {
   toolOverhead?: () => { toolSchemaTokens?: number; toolSchemaBytes?: number };
   /** Stale tool-output masking; defaults to DEFAULT_OBSERVATION_POLICY. */
   observations?: Partial<ObservationPolicy>;
+  /** Economic completed-history target, not a hard model/request limit. */
+  history?: Partial<HistoryPolicy>;
 } ) => {
   const observations: ObservationPolicy = { ...DEFAULT_OBSERVATION_POLICY, ...options.observations };
   const budget = options.budget ?? DEFAULT_HANDOFF_BUDGET;
@@ -146,7 +155,7 @@ export const createHandoffController = (options: {
     return { messages: [] };
   };
 
-  const boundContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<{ messages: HandoffMessage[] }> => {
+  const boundContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<ContextResult> => {
     const current = messages;
     const generation = slot.generation;
     const sessionId = ctx.sessionManager.getSessionId();
@@ -159,10 +168,13 @@ export const createHandoffController = (options: {
     if (engine && !gate.projectId) activate(engine.scopeId, ctx.cwd, sessionId, 'Durable checkpoint authority available');
     const checkpoint = engine ? readCheckpoint(engine, sessionId) : undefined;
     const windowKey = gateKeyOf(ctx.cwd, sessionId);
-    const window = slot.windows.get(windowKey) ?? createContextWindow(observations);
+    const window = slot.windows.get(windowKey) ?? createContextWindow(observations, { ...DEFAULT_HISTORY_POLICY, ...options.history });
     slot.windows.set(windowKey, window);
-    const selected = window(current, checkpoint, budgetFor(ctx), overheadFor(ctx));
+    const resolve = createSessionReferenceResolver(ctx.sessionManager, current, generation);
+    const selected = window(current, checkpoint, budgetFor(ctx), overheadFor(ctx),
+      assistant => resolve(ctx.sessionManager, slot.generation, assistant));
     if (!selected.ok) return refuse(ctx, selected.instruction);
+    if (selected.unchanged) return { messages, unchanged: true };
     if (selected.observations?.masked) {
       try { ctx.ui.notify(
         `Context: elided ${selected.observations.masked} stale tool output(s), ~${selected.observations.maskedTokens} tokens. Recent rounds are intact; re-run a tool to see an elided output.`,
@@ -178,7 +190,7 @@ export const createHandoffController = (options: {
     return { messages: [...selected.messages] };
   };
 
-  const safeContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<{ messages: HandoffMessage[] }> => {
+  const safeContext = async (messages: readonly HandoffMessage[], ctx: ExtensionContext): Promise<ContextResult> => {
     const generation = slot.generation;
     try {
       const sessionId = ctx.sessionManager.getSessionId();
@@ -214,6 +226,7 @@ export const installHandoffHooks = (pi: ExtensionAPI, controller: ReturnType<typ
 
   pi.on('context', async (event, ctx) => {
     const result = await controller.safeContext(event.messages as HandoffMessage[], ctx);
+    if (result.unchanged) return {};
     return { messages: result.messages as typeof event.messages };
   });
 

@@ -1,10 +1,9 @@
 import { factIsValidAt, type MemoryKind, type TemporalFact } from '../contracts/memory.ts';
 
 /**
- * A repository's memory in the system prompt. The model reads meaning itself,
- * so a paraphrase or another language still finds a memory, with no encoder
- * loaded and nothing to wait for. The block is ordered deterministically and
- * only changes when memory changes, so it stays inside the cached prefix.
+ * A repository's bounded L1 snapshot, delivered in messages, never the system
+ * prefix. The model reads meaning itself, so paraphrases need no encoder when
+ * all facts fit. Stable ordering permits retained-context deduplication.
  */
 export const MEMORY_DIGEST_BYTES = 4_000;
 const MAX_STATEMENT_CHARS = 500;
