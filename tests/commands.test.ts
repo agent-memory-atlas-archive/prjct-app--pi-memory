@@ -83,6 +83,7 @@ test('memory commands require explicit initialization and reject empty checkpoin
 
   await command('status', ctx);
   assert.match(notices.at(-1) ?? '', /initialized no/u);
+  assert.match(notices.at(-1) ?? '', /session-references-v2/u);
   assert.doesNotMatch(notices.at(-1) ?? '', /"initialized"/u);
   assert.deepEqual(await readdir(home).catch(() => []), []);
   await assert.rejects(() => command('unknown', ctx), /Usage: \/memory init/u);

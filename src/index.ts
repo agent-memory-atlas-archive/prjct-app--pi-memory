@@ -7,6 +7,7 @@ import type { MemoryEngine } from './engine.ts';
 import { installMemoryHooks } from './extension/hooks.ts';
 import type { HandoffBudget } from './handoff/select.ts';
 import type { ObservationPolicy } from './handoff/observations.ts';
+import type { HistoryPolicy } from './handoff/history.ts';
 import type { OutputCapPolicy } from './handoff/caps.ts';
 import { installMemoryTools } from './extension/tools.ts';
 import { runGc } from './retention/gc.ts';
@@ -26,6 +27,8 @@ export type MemoryExtensionOptions = Readonly<{
   handoff?: HandoffBudget;
   /** Stale tool-output masking in the request context; `{ enabled: false }` turns it off. */
   observations?: Partial<ObservationPolicy>;
+  /** Soft completed-history target; `{ enabled: false }` disables economic retirement. */
+  history?: Partial<HistoryPolicy>;
   /** Source caps for bash/grep/find output; `{ enabled: false }` turns them off. */
   outputCaps?: Partial<OutputCapPolicy>;
   /** Thresholds that make a source due; `{ enabled: false }` turns it off. */
@@ -153,6 +156,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     ...(options.recallThreshold === undefined ? {} : { recallThreshold: options.recallThreshold }),
     ...(options.handoff === undefined ? {} : { handoff: options.handoff }),
     ...(options.observations === undefined ? {} : { observations: options.observations }),
+    ...(options.history === undefined ? {} : { history: options.history }),
     ...(options.outputCaps === undefined ? {} : { outputCaps: options.outputCaps }),
     // Deliberately not awaited by the hook: a source scan must never sit
     // between the user's prompt and the agent starting.
@@ -172,7 +176,9 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     description: 'Initialize, inspect or maintain pi-memory: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
     getArgumentCompletions: prefix => argumentCompletions(prefix, adapterIds),
     handler: async (args, ctx) => {
-      const show = (model: Parameters<typeof presentMemoryPanel>[1]): Promise<void> => presentMemoryPanel(ctx, model);
+      const show = (model: Parameters<typeof presentMemoryPanel>[1]): Promise<void> => presentMemoryPanel(ctx,
+        (args.trim().split(/\s+/)[0] || 'status') === 'status'
+          ? { ...model, rows: [{ id: 'cache-policy', cells: ['cache policy session-references-v2'] }, ...model.rows] } : model);
       try {
       const [action = 'status', target] = args.trim().split(/\s+/).filter(Boolean);
       if (!ACTIONS.has(action)) throw new Error(USAGE);

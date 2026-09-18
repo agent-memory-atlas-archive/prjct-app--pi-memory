@@ -1,49 +1,40 @@
 import { createHash } from 'node:crypto';
 import type { OperationalCheckpoint } from './checkpoint.ts';
 import {
-  estimateHandoffTokens, selectHandoffMessages, type HandoffBudget, type HandoffOverhead, type HandoffResult,
+  selectHandoffMessages, type HandoffBudget, type HandoffOverhead, type HandoffResult,
 } from './select.ts';
 import {
   DEFAULT_OBSERVATION_POLICY, maskObservations, nextObservationFrontier, type ObservationPolicy,
 } from './observations.ts';
 import type { HandoffMessage } from './turns.ts';
+import { uniqueMemory } from './memory-envelope.ts';
+import { DEFAULT_HISTORY_POLICY, retainHistory, type HistoryPolicy, type ReferenceLookup } from './history.ts';
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-/**
- * Cheap identity for a message across Pi's deep-copied context events. Hashing
- * the serialized prefix cost ~60% of the hook's CPU on large sessions; role,
- * timestamp, tool call id and size still change whenever compaction or tree
- * navigation replaces history.
+/** Content identity, not role/time/size: equal-sized replacements must reset.
+ * One serialization per source message per event, O(history bytes), rather
+ * than serializing every growing candidate pack (quadratic). Pi deep-copies
+ * context events, so an object-identity ledger cannot establish continuity.
  */
-const fingerprintKey = (message: HandoffMessage): string =>
-  `${message.role}\u0000${message.timestamp ?? ''}\u0000${message.toolCallId ?? ''}\u0000${estimateHandoffTokens(message)}`;
+const fingerprintKey = (message: HandoffMessage): string => digest(message);
 const prefixDigest = (keys: readonly string[], count: number): string =>
   createHash('sha256').update(keys.slice(0, count).join('\n')).digest('hex');
 const isSummary = (message: HandoffMessage): boolean =>
   message.role === 'compactionSummary' || message.role === 'branchSummary';
 
-/** Keep the first retained copy: deleting it would invalidate the cached prefix. */
-const uniqueRecall = (messages: readonly HandoffMessage[]): readonly HandoffMessage[] => {
-  const seen = new Set<string>();
-  return messages.filter(message => {
-    if ((message as HandoffMessage & { customType?: string }).customType !== 'pi-memory-recall') return true;
-    const key = digest(message.content);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-};
-
 export type WindowResult = HandoffResult & Readonly<{
+  /** Present only when the full host history keeps its message identity and order. */
+  unchanged?: true;
   /** Present when this call advanced the observation-masking frontier. */
   observations?: Readonly<{ masked: number; maskedTokens: number }>;
 }>;
 
 /** Session-local watermark, not a provider cache. No transcript or state is written to disk. */
-export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVATION_POLICY) => {
-  const state = { floor: 0, prefix: '', frontier: 0, frontierPrefix: '' };
-  return (messages: readonly HandoffMessage[], checkpoint: OperationalCheckpoint | undefined,
-    budget: HandoffBudget, overhead: HandoffOverhead): WindowResult => {
+export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVATION_POLICY,
+  history: HistoryPolicy = DEFAULT_HISTORY_POLICY) => {
+  const state = { floor: 0, prefix: '', frontier: 0, frontierPrefix: '', historyFrontier: 0, historyPrefix: '' };
+  return function selectWindow(messages: readonly HandoffMessage[], checkpoint: OperationalCheckpoint | undefined,
+    budget: HandoffBudget, overhead: HandoffOverhead, reference?: ReferenceLookup): WindowResult {
     // Compaction/tree edits replace the source history; only append-only histories
     // may reuse the watermark. Hashes work with Pi's deep-copied context events.
     const keys = messages.map(fingerprintKey);
@@ -51,16 +42,32 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
       && state.prefix === prefixDigest(keys, state.floor + 1) ? state.floor : 0;
     const priorFrontier = state.frontier <= messages.length
       && state.frontierPrefix === prefixDigest(keys, state.frontier) ? state.frontier : 0;
-    const frontier = nextObservationFrontier(messages, priorFrontier, policy);
+    const historyFrontier = state.historyFrontier <= messages.length
+      && state.historyPrefix === prefixDigest(keys, state.historyFrontier) ? state.historyFrontier : 0;
+    // Either policy advancing rewrites the prefix and re-bills everything after
+    // it. Flush the other policy in the same request instead of paying a second
+    // full miss a few turns later when its own batch threshold is reached.
+    const natural = nextObservationFrontier(messages, priorFrontier, policy);
+    const planned = retainHistory(maskObservations(messages, natural, policy).messages, historyFrontier, history,
+      reference, natural > priorFrontier);
+    const frontier = planned.frontier > historyFrontier ? nextObservationFrontier(messages, priorFrontier, policy, true) : natural;
     state.frontier = frontier;
     state.frontierPrefix = prefixDigest(keys, frontier);
     // The masked view has the same indexes as the host history.
     const masking = maskObservations(messages, frontier, policy);
+    const economic = frontier === natural ? planned : retainHistory(masking.messages, historyFrontier, history, reference, true);
+    state.historyFrontier = economic.frontier;
+    state.historyPrefix = prefixDigest(keys, economic.frontier);
+    // Economic replacement changes array indexes, but watermarks use source indexes.
     const view = masking.messages;
-    const summary = view.filter(isSummary).at(-1);
-    const candidates = uniqueRecall([
-      ...(summary ? [summary] : []), ...view.slice(floor).filter(message => !isSummary(message)),
-    ]);
+    const sourceIndexes = new Map(economic.messages.map((message, index) => [message, economic.sourceIndexes[index]!]));
+    const economicView = economic.messages.filter(message => sourceIndexes.get(message)! >= floor);
+    // The floor tracks the first retained non-summary message, so the summary
+    // always sits below it; filtering it by the floor would drop it next turn.
+    const summary = economic.messages.filter(isSummary).at(-1);
+    const candidates = uniqueMemory([
+      ...(summary ? [summary] : []), ...economicView.filter(message => !isSummary(message)),
+    ], (replacement, source) => sourceIndexes.set(replacement, sourceIndexes.get(source)!));
     const selected = selectHandoffMessages(candidates, checkpoint, budget, overhead);
     if (!selected.ok) return selected;
     // Prune in batches, leaving growth room instead of shifting the cache prefix
@@ -73,12 +80,30 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
       maxMessages: Math.max(1, Math.floor(budget.maxMessages * 0.75)),
     }, overhead) : selected;
     const result = compact.ok ? compact : selected;
-    const first = result.messages.find(message => !isSummary(message) && view.includes(message));
-    const nextFloor = first ? view.indexOf(first) : floor;
+    const first = result.messages.find(message => !isSummary(message) && sourceIndexes.has(message));
+    const nextFloor = first ? sourceIndexes.get(first)! : floor;
     state.floor = Math.max(floor, nextFloor);
     state.prefix = prefixDigest(keys, state.floor + 1);
-    return frontier > priorFrontier
-      ? { ...result, observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } }
-      : result;
+    // Deduplication preceded selection. If selection evicted the first copy,
+    // rerun from the advanced floor so a newer copy is available immediately.
+    // The strict floor advance bounds retries by the number of input messages.
+    const recallKeys = (items: readonly HandoffMessage[]) => new Set(items
+      .filter(message => (message as HandoffMessage & { customType?: string }).customType === 'pi-memory-recall')
+      .map(message => digest(message.content)));
+    const retainedRecall = recallKeys(result.messages);
+    if (state.floor > floor && [...recallKeys(view.slice(state.floor))].some(key => !retainedRecall.has(key))) {
+      const recovered = selectWindow(messages, checkpoint, budget, overhead, reference);
+      return frontier > priorFrontier && recovered.ok
+        ? { ...recovered, observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } }
+        : recovered;
+    }
+    const unchanged = masking.masked === 0 && result.omittedTurns === 0 && result.truncatedFields === 0
+      && result.messages.length === messages.length
+      && result.messages.every((message, index) => message === messages[index]);
+    return {
+      ...result,
+      ...(unchanged ? { unchanged: true as const } : {}),
+      ...(frontier > priorFrontier ? { observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } } : {}),
+    };
   };
 };

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { inspectSessionReferences, isSessionReference } from '../handoff/session-references.ts';
 import { StringEnum } from '@earendil-works/pi-ai';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
@@ -115,7 +116,12 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
     name: 'memory_context', label: 'Memory context',
     description: 'Search or inspect bounded project memory; consolidate exact candidates or record positive retrieval feedback.',
     parameters: contextParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (params.action === 'inspect' && params.ids?.some(isSessionReference)) {
+        if (!params.ids.every(isSessionReference)) throw new Error('Cannot mix session reference IDs and project memory IDs.');
+        const details = inspectSessionReferences(ctx.sessionManager, params.ids, params.maxBytes ?? 4096);
+        return { content: [{ type: 'text' as const, text: JSON.stringify(details) }], details };
+      }
       // Nothing recorded yet is an empty memory, not a failure the agent must work around.
       const engine = await runtime.engine().catch(error => {
         if (error instanceof Error && /not initialized/iu.test(error.message)) return undefined;
@@ -177,6 +183,7 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
       return result({ status: applied.count ? 'ok' : 'abstained', recorded: applied.count, signal: params.signal,
         gaps: missing.length ? [`No open scope holds ${missing.join(', ')}.`] : [] });
     },
+    renderShell: "self",
     renderCall(args, theme) { return renderMemoryCall(theme.fg('accent', 'memory context'), args); },
     renderResult(output, options) { return renderMemoryResult('memory context', output.details, options.expanded); },
   });
@@ -236,6 +243,7 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
         dense: recorded.dense || Boolean(runtime.scheduleBackfill),
         gaps: recorded.dense || runtime.scheduleBackfill ? [] : ['Dense indexing deferred; memory and lexical index committed.'] });
     },
+    renderShell: "self",
     renderCall(args, theme) { return renderMemoryCall(theme.fg('accent', 'memory record'), args); },
     renderResult(output, options) { return renderMemoryResult('memory record', output.details, options.expanded); },
   });
