@@ -46,7 +46,7 @@
     "@huggingface/transformers": "4.2.0",
     "sqlite-vec": "0.1.9",
     "tsx": "^4.20.0",
-    "@prjct.app/pi-tui-kit": "^0.1.0"
+    "@prjct.app/pi-tui-kit": "file:../pi-tui-kit"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
