@@ -184,8 +184,8 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
         gaps: missing.length ? [`No open scope holds ${missing.join(', ')}.`] : [] });
     },
     renderShell: "self",
-    renderCall(args, theme) { return renderMemoryCall(theme.fg('accent', 'memory context'), args); },
-    renderResult(output, options) { return renderMemoryResult('memory context', output.details, options.expanded); },
+    renderCall(args, theme, context) { return renderMemoryCall(theme, 'context', args, context?.isPartial !== false); },
+    renderResult(output, options, theme, context) { return renderMemoryResult(theme, 'context', context?.args, output.details, options.expanded, Boolean(context?.isError)); },
   });
 
   pi.registerTool({
@@ -244,7 +244,7 @@ export const installMemoryTools = (pi: ExtensionAPI, runtime: ExtensionMemoryRun
         gaps: recorded.dense || runtime.scheduleBackfill ? [] : ['Dense indexing deferred; memory and lexical index committed.'] });
     },
     renderShell: "self",
-    renderCall(args, theme) { return renderMemoryCall(theme.fg('accent', 'memory record'), args); },
-    renderResult(output, options) { return renderMemoryResult('memory record', output.details, options.expanded); },
+    renderCall(args, theme, context) { return renderMemoryCall(theme, 'record', args, context?.isPartial !== false); },
+    renderResult(output, options, theme, context) { return renderMemoryResult(theme, 'record', context?.args, output.details, options.expanded, Boolean(context?.isError)); },
   });
 };
