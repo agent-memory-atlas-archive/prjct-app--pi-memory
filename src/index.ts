@@ -20,6 +20,8 @@ import { resolveMemoryProject } from './workspace/memory-registry.ts';
 import {
   errorModel, panelDismissed, presentMemoryPanel, resultModel, sourcesModel, statusModel, syncModel,
 } from './extension/panel.ts';
+import { memoryPanelSpec, type MemoryOps } from './extension/memory-panel.ts';
+import { openPanel } from '@prjct.app/pi-tui-kit';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
@@ -176,6 +178,54 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     description: 'Initialize, inspect or maintain pi-memory: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
     getArgumentCompletions: prefix => argumentCompletions(prefix, adapterIds),
     handler: async (args, ctx) => {
+      const [first, second] = args.trim().split(/\s+/).filter(Boolean);
+      if ((first === undefined || first === 'status' || first === 'sources') && second === undefined
+        && ctx.mode === 'tui' && ctx.hasUI && typeof ctx.ui.custom === 'function') {
+        const home = memoryHomeFor(options.home);
+        const summary = (value: unknown): string => typeof value === 'object' && value
+          ? Object.entries(value).filter(([, item]) => item === null || ['string', 'number', 'boolean'].includes(typeof item))
+            .slice(0, 4).map(([key, item]) => `${key} ${String(item)}`).join(' · ')
+          : String(value);
+        const ops: MemoryOps = {
+          load: async () => {
+            const binding = await resolveMemoryProject((await runtime.location()).path, home);
+            if (!binding) return { initialized: false, ready: false, legacy: Boolean(await resolveLegacyProject(ctx.cwd, home)), sources: [] };
+            if (!existsSync(memoryDatabasePath(home, binding.projectId))) return { initialized: true, ready: false, project: binding.projectId, sources: [] };
+            const engine = await runtime.engine();
+            const ready = await sources(engine);
+            return {
+              initialized: true, ready: true, project: binding.projectId, scope: `${engine.scopeKind}/${engine.scopeId}`,
+              stats: engine.projection.stats(), curation: engine.curation.stats(),
+              sources: ready.list().map(adapter => ({
+                ...dueAdapters(engine.projection, [adapter], adapter === SESSION_ADAPTER_ID
+                  ? { ...PI_SESSION_SYNC_POLICY, enabled: options.sync?.enabled ?? true }
+                  : options.sync ?? {})[0]!,
+                last: engine.projection.syncState(adapter) ?? null,
+              })),
+              ...(lastFault.message ? { error: lastFault.message } : {}),
+            };
+          },
+          init: async () => { const done = await runtime.initialize(); return `${done.created ? 'Initialized' : 'Already initialized'} · project ${done.binding.projectId}`; },
+          sync: async adapter => {
+            const engine = await runtime.engine();
+            const results = await syncSources(await sources(engine), ctx.sessionManager.getSessionId(), engine, adapter, options);
+            const seen = results.reduce((sum, item) => sum + item.discovered, 0);
+            const added = results.reduce((sum, item) => sum + item.indexed, 0);
+            const queued = results.reduce((sum, item) => sum + item.queued, 0);
+            const gaps = results.flatMap(item => item.gaps);
+            return `Synced ${adapter ?? 'all sources'} · ${seen} seen · ${added} new · ${queued} queued${gaps.length ? ` · gap: ${gaps[0]}` : ''}`;
+          },
+          gc: async () => `GC · ${summary(await runGc(await runtime.engine()))}`,
+          checkpointWal: async () => `WAL checkpoint · ${summary((await runtime.engine()).projection.checkpointWal())}`,
+          rebuild: async () => `Rebuilt · ${summary(await (await runtime.engine()).rebuild())}`,
+        };
+        try {
+          await openPanel(ctx, memoryPanelSpec(ops, await ops.load()));
+        } catch (error) {
+          if (!panelDismissed(error)) throw error;
+        }
+        return;
+      }
       const show = (model: Parameters<typeof presentMemoryPanel>[1]): Promise<void> => presentMemoryPanel(ctx,
         (args.trim().split(/\s+/)[0] || 'status') === 'status'
           ? { ...model, rows: [{ id: 'cache-policy', cells: ['cache policy session-references-v2'] }, ...model.rows] } : model);

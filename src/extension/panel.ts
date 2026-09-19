@@ -273,19 +273,18 @@ export const memoryPanel = (model: MemoryPanelModel, theme: Theme, done: () => v
   },
 });
 
+/** Plain lines: the result of a typed /memory command, without a modal. */
+export const plainPanel = (model: MemoryPanelModel): string => [
+  `${sanitize(model.title)}${model.scope ? ` · ${sanitize(model.scope)}` : ''}`,
+  ...(model.metrics.length ? [model.metrics.map(item => `${sanitize(item.label)} ${sanitize(item.value)}`).join(' · ')] : []),
+  ...model.rows.filter(row => row.id !== 'head').map(row => sanitize(row.cells.join('  '))),
+  ...(model.error ? [`error: ${sanitize(model.error)}`] : []),
+].join('\n');
+
+/**
+ * Typed subcommands answer in the transcript as plain lines. The browsable
+ * view is the docked /memory panel; nothing here opens a modal.
+ */
 export const presentMemoryPanel = async (ctx: MemoryPresenter, model: MemoryPanelModel): Promise<void> => {
-  const text = formatPanel(model, 80).join('\n');
-  if (ctx.mode === 'tui' && ctx.hasUI && ctx.ui.custom) {
-    try {
-      await ctx.ui.custom((_tui, theme, _keys, done) => memoryPanel(model, theme, () => done(null)), {
-        overlay: true,
-        overlayOptions: { minWidth: 52, width: 72, maxHeight: 18, anchor: 'center' },
-        onHandle: handle => { handle.focus(); },
-      });
-      return;
-    } catch (error) {
-      if (!panelDismissed(error)) throw error;
-    }
-  }
-  ctx.ui.notify(text, model.kind === 'error' ? 'error' : 'info');
+  ctx.ui.notify(plainPanel(model), model.kind === 'error' ? 'error' : 'info');
 };
