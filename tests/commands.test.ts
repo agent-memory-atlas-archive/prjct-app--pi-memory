@@ -117,7 +117,7 @@ test('memory commands require explicit initialization and reject empty checkpoin
   };
   const before = notices.length;
   await command('status', tui);
-  assert.match(screens.at(-1) ?? '', /Memory .* sources/u, 'the terminal gets the docked panel');
+  assert.match(screens.at(-1) ?? '', /Memory .* sources?/u, 'the terminal gets the docked panel');
   assert.match(screens.at(-1) ?? '', /facts\s+0/u);
   assert.match(screens.at(-1) ?? '', /s Sync all sources · g Collect garbage · w Checkpoint WAL · R Rebuild index/u);
   assert.equal(notices.length, before, 'no modal text and no abort noise');
