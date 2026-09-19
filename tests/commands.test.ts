@@ -45,7 +45,7 @@ test('memory command completes every action and configured sync adapter without 
   assert.equal(await values('sync missing'), null);
   assert.equal(await values('index {'), null, 'JSON input must remain under direct editor control');
   const root = await complete('');
-  assert.ok(root?.every(item => item.description));
+  assert.ok(root?.every(item => item.description?.startsWith('p · ')), 'every option carries the prjct mark');
 
   const provider = new CombinedAutocompleteProvider([{ name: 'memory', getArgumentCompletions: complete }], rootDir);
   const suggestions = await provider.getSuggestions(['/memory sync p'], 0, '/memory sync p'.length, {

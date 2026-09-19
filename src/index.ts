@@ -21,7 +21,7 @@ import {
   errorModel, panelDismissed, presentMemoryPanel, resultModel, sourcesModel, statusModel, syncModel,
 } from './extension/panel.ts';
 import { memoryPanelSpec, type MemoryOps } from './extension/memory-panel.ts';
-import { openPanel } from '@prjct.app/pi-tui-kit';
+import { brand, openPanel } from '@prjct.app/pi-tui-kit';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
@@ -60,13 +60,14 @@ const argumentCompletions = (prefix: string, adapterIds: readonly string[]): Aut
   if (sync) {
     const adapterPrefix = sync[1] ?? '';
     const matching = adapterIds.filter(id => id.startsWith(adapterPrefix)).map(id => ({
-      value: `sync ${id}`, label: `sync ${id}`, description: `Scan only the ${id} source`,
+      value: `sync ${id}`, label: id, description: brand(`scan only the ${id} source`),
     }));
     return matching.length ? matching : null;
   }
   if (/\s/u.test(prefix)) return null;
-  const matching = ACTION_COMPLETIONS.filter(item => item.value.startsWith(prefix));
-  return matching.length ? [...matching] : null;
+  const matching = ACTION_COMPLETIONS.filter(item => item.value.startsWith(prefix))
+    .map(item => ({ ...item, description: brand((item.description ?? item.value).replace(/^./u, first => first.toLowerCase())) }));
+  return matching.length ? matching : null;
 };
 
 /**
@@ -175,7 +176,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   ].filter(id => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id)))].sort();
 
   pi.registerCommand('memory', {
-    description: 'Initialize, inspect or maintain pi-memory: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}',
+    description: brand('project memory: panel, init, sync, gc, rebuild'),
     getArgumentCompletions: prefix => argumentCompletions(prefix, adapterIds),
     handler: async (args, ctx) => {
       const [first, second] = args.trim().split(/\s+/).filter(Boolean);
