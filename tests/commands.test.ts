@@ -103,18 +103,24 @@ test('memory commands require explicit initialization and reject empty checkpoin
   assert.match(notices.at(-1) ?? '', /memory · sync/u);
   assert.doesNotMatch(notices.at(-1) ?? '', /"discovered"/u);
 
+  const screens: string[] = [];
   const tui = {
     ...ctx, mode: 'tui', hasUI: true,
     ui: {
       notify(message: string) { notices.push(message); },
-      async custom() {
+      async custom(factory: any) {
+        const panel = factory({ terminal: { columns: 120, rows: 30 }, requestRender() {} }, { fg: (_tone: string, text: string) => text, bold: (text: string) => text }, undefined, () => undefined);
+        screens.push(panel.render(120).join('\n'));
         throw Object.assign(new Error('Operation aborted'), { name: 'AbortError' });
       },
     },
   };
+  const before = notices.length;
   await command('status', tui);
-  assert.match(notices.at(-1) ?? '', /facts 0/u);
-  assert.doesNotMatch(notices.at(-1) ?? '', /Operation aborted/u);
+  assert.match(screens.at(-1) ?? '', /Memory .* sources/u, 'the terminal gets the docked panel');
+  assert.match(screens.at(-1) ?? '', /facts\s+0/u);
+  assert.match(screens.at(-1) ?? '', /s Sync all sources · g Collect garbage · w Checkpoint WAL · R Rebuild index/u);
+  assert.equal(notices.length, before, 'no modal text and no abort noise');
 
   await assert.rejects(() => command('checkpoint {}', ctx), /non-empty goal/u);
 });
