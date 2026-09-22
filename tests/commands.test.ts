@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -35,11 +35,11 @@ test('memory command completes every action and configured sync adapter without 
     return items?.map(item => item.value) ?? null;
   };
   assert.deepEqual(await values(''), [
-    'init', 'status', 'sources', 'sync', 'index', 'checkpoint', 'replay', 'rebuild', 'gc',
+    'init', 'setup', 'status', 'sources', 'sync', 'index', 'checkpoint', 'replay', 'rebuild', 'gc', 'prune', 'purge',
     'checkpoint-wal', 'migrate-curated',
   ]);
   assert.deepEqual(await values('st'), ['status']);
-  assert.deepEqual(await values('s'), ['status', 'sources', 'sync']);
+  assert.deepEqual(await values('s'), ['setup', 'status', 'sources', 'sync']);
   assert.deepEqual(await values('sync '), ['sync custom-json', 'sync pi-session', 'sync prjct-observations']);
   assert.deepEqual(await values('sync p'), ['sync pi-session', 'sync prjct-observations']);
   assert.equal(await values('sync missing'), null);
@@ -123,4 +123,63 @@ test('memory commands require explicit initialization and reject empty checkpoin
   assert.equal(notices.length, before, 'no modal text and no abort noise');
 
   await assert.rejects(() => command('checkpoint {}', ctx), /non-empty goal/u);
+});
+
+const commandHarness = async (t: { after(fn: () => unknown): void }) => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'pi-memory-command-'));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const repo = join(rootDir, 'repo');
+  await mkdir(repo, { recursive: true });
+  await mkdir(join(repo, '.git'), { recursive: true });
+  const commands = new Map<string, CommandDefinition>();
+  const handlers = new Map<string, (event: any, context: any) => Promise<unknown>>();
+  const notices: Array<{ level: string; text: string }> = [];
+  const pi = {
+    on(name: string, handler: (event: any, context: any) => Promise<unknown>) { handlers.set(name, handler); },
+    registerTool() {},
+    registerCommand(name: string, definition: CommandDefinition) { commands.set(name, definition); },
+  } as unknown as ExtensionAPI;
+  installMemory(pi, { home: join(rootDir, 'home') });
+  const ctx = {
+    cwd: repo, mode: 'rpc', hasUI: false,
+    sessionManager: { getSessionId: () => 'cmd-session' },
+    ui: { notify: (text: string, level = 'info') => notices.push({ level, text }) },
+  };
+  await handlers.get('session_start')!({}, ctx);
+  t.after(async () => { await handlers.get('session_shutdown')?.({}, ctx); });
+  const run = async (args: string): Promise<{ level: string; text: string } | undefined> => {
+    await commands.get('memory')!.handler(args, ctx);
+    return notices.at(-1);
+  };
+  return { run, notices };
+};
+
+test('/memory index without a payload answers with its usage, as it always has', async t => {
+  const h = await commandHarness(t);
+  // The handler renders the card and rethrows, so the host logs it too. That
+  // double report is long-standing behaviour for every command error.
+  await assert.rejects(h.run('index'), /not initialized|Usage: \/memory index/u);
+  assert.equal(h.notices.at(-1)?.level, 'error');
+});
+
+test('/memory setup before init explains itself instead of failing at the host', async t => {
+  const h = await commandHarness(t);
+  const answer = await h.run('setup');
+  assert.notEqual(answer?.level, 'error', 'setup must not reach the host error channel');
+  assert.match(answer?.text ?? '', /\/memory init/u);
+});
+
+test('/memory setup after init reports the evaluator without a terminal to ask on', async t => {
+  const h = await commandHarness(t);
+  await h.run('init');
+  const answer = await h.run('setup');
+  assert.notEqual(answer?.level, 'error');
+  assert.match(answer?.text ?? '', /rerank/u);
+});
+
+test('/memory index with a payload is accepted once memory exists', async t => {
+  const h = await commandHarness(t);
+  await h.run('init');
+  const answer = await h.run('index {"namespace":"project.docs","externalId":"doc-1","text":"The release checklist lives in docs/release.md."}');
+  assert.notEqual(answer?.level, 'error');
 });

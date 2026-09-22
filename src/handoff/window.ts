@@ -8,7 +8,7 @@ import {
 } from './observations.ts';
 import type { HandoffMessage } from './turns.ts';
 import { uniqueMemory } from './memory-envelope.ts';
-import { DEFAULT_HISTORY_POLICY, retainHistory, type HistoryPolicy, type ReferenceLookup } from './history.ts';
+import { DEFAULT_HISTORY_POLICY, retainHistory, type HistoryPolicy, type ReferenceLookup, type TurnVerdicts } from './history.ts';
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 /** Content identity, not role/time/size: equal-sized replacements must reset.
@@ -27,6 +27,8 @@ export type WindowResult = HandoffResult & Readonly<{
   unchanged?: true;
   /** Present when this call advanced the observation-masking frontier. */
   observations?: Readonly<{ masked: number; maskedTokens: number }>;
+  /** Old turns Jev judged no longer needed that are out of the context now. */
+  judged?: Readonly<{ turns: number; tokens: number }>;
 }>;
 
 /** Session-local watermark, not a provider cache. No transcript or state is written to disk. */
@@ -34,7 +36,7 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
   history: HistoryPolicy = DEFAULT_HISTORY_POLICY) => {
   const state = { floor: 0, prefix: '', frontier: 0, frontierPrefix: '', historyFrontier: 0, historyPrefix: '' };
   return function selectWindow(messages: readonly HandoffMessage[], checkpoint: OperationalCheckpoint | undefined,
-    budget: HandoffBudget, overhead: HandoffOverhead, reference?: ReferenceLookup): WindowResult {
+    budget: HandoffBudget, overhead: HandoffOverhead, reference?: ReferenceLookup, verdicts?: TurnVerdicts): WindowResult {
     // Compaction/tree edits replace the source history; only append-only histories
     // may reuse the watermark. Hashes work with Pi's deep-copied context events.
     const keys = messages.map(fingerprintKey);
@@ -49,13 +51,13 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
     // full miss a few turns later when its own batch threshold is reached.
     const natural = nextObservationFrontier(messages, priorFrontier, policy);
     const planned = retainHistory(maskObservations(messages, natural, policy).messages, historyFrontier, history,
-      reference, natural > priorFrontier);
+      reference, natural > priorFrontier, verdicts);
     const frontier = planned.frontier > historyFrontier ? nextObservationFrontier(messages, priorFrontier, policy, true) : natural;
     state.frontier = frontier;
     state.frontierPrefix = prefixDigest(keys, frontier);
     // The masked view has the same indexes as the host history.
     const masking = maskObservations(messages, frontier, policy);
-    const economic = frontier === natural ? planned : retainHistory(masking.messages, historyFrontier, history, reference, true);
+    const economic = frontier === natural ? planned : retainHistory(masking.messages, historyFrontier, history, reference, true, verdicts);
     state.historyFrontier = economic.frontier;
     state.historyPrefix = prefixDigest(keys, economic.frontier);
     // Economic replacement changes array indexes, but watermarks use source indexes.
@@ -92,7 +94,7 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
       .map(message => digest(message.content)));
     const retainedRecall = recallKeys(result.messages);
     if (state.floor > floor && [...recallKeys(view.slice(state.floor))].some(key => !retainedRecall.has(key))) {
-      const recovered = selectWindow(messages, checkpoint, budget, overhead, reference);
+      const recovered = selectWindow(messages, checkpoint, budget, overhead, reference, verdicts);
       return frontier > priorFrontier && recovered.ok
         ? { ...recovered, observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } }
         : recovered;
@@ -102,6 +104,7 @@ export const createContextWindow = (policy: ObservationPolicy = DEFAULT_OBSERVAT
       && result.messages.every((message, index) => message === messages[index]);
     return {
       ...result,
+      ...(economic.judged.turns ? { judged: economic.judged } : {}),
       ...(unchanged ? { unchanged: true as const } : {}),
       ...(frontier > priorFrontier ? { observations: { masked: masking.masked, maskedTokens: masking.maskedTokens } } : {}),
     };

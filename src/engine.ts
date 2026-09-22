@@ -69,6 +69,10 @@ export class MemoryEngine {
   private storageModeValue!: 'compact' | 'indexed';
   private compact: CompactStore | undefined;
   private readonly provider: EmbeddingProvider;
+
+  /** Read-only access for passes that compare stored text with the same encoder
+   * dense search already uses: consolidation must not load a second model. */
+  get embeddings(): EmbeddingProvider { return this.provider; }
   private refreshing = false;
 
   get journal(): JournalPort { this.refreshStorageMode(); return this.journalValue; }
@@ -375,6 +379,12 @@ export class MemoryEngine {
       throw new Error('A closed interval cannot be reopened without losing history; record a new fact instead.');
     }
     if (replacementId && (replacementId === factId || !this.projection.getFact(replacementId))) throw new Error('Replacement must be another existing memory.');
+    // A superseded or contradicted fact is dead: delete it now instead of keeping
+    // it forever with a flag. The journal catches up in compactJournal().
+    if (standing === 'superseded' || standing === 'contradicted') {
+      this.projection.purgeFacts([factId]);
+      return;
+    }
     await this.commit({ type: 'fact.resolved', factId, standing, rationale: redactSecrets(rationale), ...(replacementId ? { replacementId } : {}) });
   }
 
@@ -391,6 +401,36 @@ export class MemoryEngine {
         contentHash: fact.evidence[0]?.contentHash ?? sha256(fact.statement),
       });
     }
+  }
+
+  /**
+   * Delete facts for good: the projection rows and everything hanging off them,
+   * and every journal event that mentions them. Only their ids stay behind so
+   * nothing brings them back. See retention/purge.ts.
+   */
+  async purgeFacts(ids: readonly string[]): Promise<{ facts: number; documents: number; evidence: number; events: number; deferred: number }> {
+    const unique = [...new Set(ids.filter(id => typeof id === 'string' && id.length > 0))];
+    const counts = unique.length ? this.projection.purgeFacts(unique) : { facts: 0, documents: 0, evidence: 0 };
+    return { ...counts, ...await this.compactJournal() };
+  }
+
+  /**
+   * Remove every purged fact from the journal files in one pass. Resolving a
+   * fact dead only touches the projection, so a curation pass that retires
+   * fifty facts rewrites the journal once, here, not fifty times.
+   */
+  async compactJournal(): Promise<{ events: number; deferred: number }> {
+    const journal = this.journal;
+    const purged = this.projection.purgedFacts();
+    if (!(journal instanceof MemoryJournal) || !purged.size) return { events: 0, deferred: 0 };
+    return withRebuildLock(this.root, async () => {
+      const { purgeJournal } = await import('./retention/purge.ts');
+      const rewritten = await journal.exclusive(
+        writerId => purgeJournal(this.root, this.scopeId, purged, { ownWriter: writerId }),
+        result => result.heads.get(journal.writerId));
+      this.projection.purgeFacts([], rewritten.removed);
+      return { events: rewritten.removed.length, deferred: rewritten.deferred.length };
+    });
   }
 
   async recordGc(removed: readonly string[], retained: number): Promise<void> {

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { daemonAlivePath, daemonLogPath, daemonPidPath, daemonStateDir, type DaemonConfig } from './config.ts';
@@ -66,8 +67,40 @@ export const stopDaemon = async (home: string, timeoutMs = 10_000): Promise<{ st
 };
 
 // The compiled local build (scripts/build-pi.mjs) ships memory-daemon.js; source runs keep the .ts entry.
-const cliPath = (): string => fileURLToPath(new URL(
-  import.meta.url.endsWith('.ts') ? '../../scripts/memory-daemon.ts' : '../../scripts/memory-daemon.js', import.meta.url));
+// Source checkouts run from src/daemon; the Pi build bundles everything into
+// its root index.js with scripts/ beside it.
+const cliPath = (): string => {
+  const candidates = import.meta.url.endsWith('.ts')
+    ? ['../../scripts/memory-daemon.ts']
+    : ['./scripts/memory-daemon.js', '../../scripts/memory-daemon.js'];
+  const paths = candidates.map(relative => fileURLToPath(new URL(relative, import.meta.url)));
+  return paths.find(path => existsSync(path)) ?? paths[0]!;
+};
+
+/**
+ * One detached cycle with the session's model, started when a session closes.
+ * It does nothing when a resident daemon owns the home or another run is still
+ * going, and it never blocks the caller.
+ */
+export const spawnCurationRun = async (config: DaemonConfig, argv: readonly string[] = process.execArgv): Promise<number | undefined> => {
+  if ((await daemonStatus(config.home)).running) return undefined;
+  const lock = join(daemonStateDir(config.home), 'curation.pid');
+  const held = Number(await readFile(lock, 'utf8').catch(() => ''));
+  if (held && isRunning(held)) return undefined;
+  mkdirSync(daemonStateDir(config.home), { recursive: true, mode: 0o700 });
+  const log = await open(daemonLogPath(config.home), 'a', 0o600);
+  const child = spawn(process.execPath, [...argv, cliPath(), 'once',
+    '--home', config.home,
+    ...(config.provider ? ['--provider', config.provider] : []),
+    ...(config.model ? ['--model', config.model] : []),
+    ...(config.projectId ? ['--project', config.projectId] : []),
+    ...(config.sessionFile ? ['--session', config.sessionFile] : []),
+  ], { detached: true, stdio: ['ignore', log.fd, log.fd], env: { ...process.env, PI_MEMORY_HOME: config.home, PI_SUBAGENTS_CHILD: '1' } });
+  child.unref();
+  await log.close();
+  if (child.pid !== undefined) await writeFile(lock, String(child.pid), { mode: 0o600 });
+  return child.pid;
+};
 
 const waitAlive = async (home: string, token: string, pid: number, timeoutMs = 8_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;

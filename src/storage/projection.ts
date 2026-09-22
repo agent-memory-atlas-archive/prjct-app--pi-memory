@@ -14,6 +14,7 @@ import { sha256 } from '../workspace/project-identity.ts';
 import { privateDatabaseFiles, privateDirectorySync } from './private-files.ts';
 import { migrateIndexedPath } from './migration-coordinator.ts';
 import { acquireMaintenanceLock } from './maintenance-lock.ts';
+import { withoutPurged } from '../retention/purge.ts';
 
 export const MAX_QUIESCENT_WAL_BYTES = 512 * 1024;
 export type LexicalHit = Readonly<{ chunkId: string; documentKey: string; score: number }>;
@@ -231,11 +232,70 @@ export class Projection {
     return Boolean(this.stmt('SELECT 1 FROM applied_events WHERE id = ?').get(id));
   }
 
+  /** Ids of purged facts: the only thing a purge keeps, so no event can bring them back. */
+  purgedFacts(): Set<string> {
+    const rows = this.stmt("SELECT key FROM meta WHERE key LIKE 'purged:%' LIMIT ?").all(RELATION_LIMIT * 100) as Row[];
+    return new Set(rows.map(row => String(row.key).slice('purged:'.length)));
+  }
+
+  /**
+   * Delete facts and everything that exists only because of them: links,
+   * evidence nothing else cites, their memory document with its chunks,
+   * full-text rows and vectors, and the applied marks of events the journal no
+   * longer holds. Frees the pages afterwards.
+   */
+  purgeFacts(ids: readonly string[], removedEvents: readonly string[] = [], at = Date.now()): { facts: number; documents: number; evidence: number } {
+    if (!ids.length && !removedEvents.length) return { facts: 0, documents: 0, evidence: 0 };
+    const counts = { facts: 0, documents: 0, evidence: 0 };
+    this.transaction(() => {
+      for (const id of ids) {
+        const cited = (this.stmt('SELECT evidence_id FROM fact_evidence WHERE fact_id=? LIMIT ?').all(id, RELATION_LIMIT) as Row[])
+          .map(row => String(row.evidence_id));
+        this.stmt('DELETE FROM fact_links WHERE from_fact_id=? OR to_fact_id=?').run(id, id);
+        for (const table of ['fact_entities', 'fact_evidence', 'fact_episodes', 'usefulness']) {
+          this.stmt(`DELETE FROM ${table} WHERE fact_id=?`).run(id);
+        }
+        this.stmt('UPDATE facts SET replacement_id=NULL WHERE replacement_id=?').run(id);
+        counts.facts += Number(this.stmt('DELETE FROM facts WHERE id=?').run(id).changes);
+        for (const evidence of cited) {
+          const used = this.stmt(`SELECT 1 FROM fact_evidence WHERE evidence_id=?
+            UNION ALL SELECT 1 FROM episode_evidence WHERE evidence_id=? LIMIT 1`).get(evidence, evidence);
+          if (!used) counts.evidence += Number(this.stmt('DELETE FROM evidence WHERE id=?').run(evidence).changes);
+        }
+        const key = documentKey({ namespace: 'memory', externalId: id });
+        this.deleteChunksForDocument(key);
+        counts.documents += Number(this.stmt('DELETE FROM documents WHERE document_key=?').run(key).changes);
+        this.stmt("INSERT INTO meta(key,value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING").run(`purged:${id}`, String(at));
+      }
+      // Curation shares this database: a topic or dependency must not point at a fact that is gone.
+      const tables = new Set((this.stmt("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('topics','dependencies')").all() as Row[])
+        .map(row => String(row.name)));
+      const gone = new Set(ids);
+      if (tables.has('dependencies')) for (const id of ids) this.stmt('DELETE FROM dependencies WHERE fact_id=?').run(id);
+      if (tables.has('topics')) {
+        const topics = this.stmt('SELECT id, fact_ids FROM topics LIMIT ?').all(RELATION_LIMIT * 40) as Row[];
+        for (const topic of topics) {
+          const factIds = ((): string[] => { try { return JSON.parse(String(topic.fact_ids)) as string[]; } catch { return []; } })();
+          const kept = factIds.filter(id => !gone.has(id));
+          if (kept.length !== factIds.length) this.stmt('UPDATE topics SET fact_ids=? WHERE id=?').run(JSON.stringify(kept), String(topic.id));
+        }
+      }
+      for (const event of removedEvents) this.stmt('DELETE FROM applied_events WHERE id=?').run(event);
+    });
+    this.db.exec('PRAGMA incremental_vacuum');
+    return counts;
+  }
+
   apply(event: MemoryEvent): boolean {
     if (this.hasEvent(event.id)) return false;
     return this.transaction(() => {
       if (this.hasEvent(event.id)) return false;
-      const payload = event.payload;
+      const payload = withoutPurged(event.payload, this.purgedFacts());
+      if (!payload) {
+        this.stmt('INSERT INTO applied_events(id, event_hash, recorded_at) VALUES (?, ?, ?)')
+          .run(event.id, event.eventHash, Date.parse(event.recordedAt));
+        return false;
+      }
       if (payload.type === 'document.upserted') this.upsertDocument(payload.document);
       if (payload.type === 'document.deleted') this.deleteDocument(payload.namespace, payload.externalId, event.recordedAt);
       if (payload.type === 'episode.recorded') this.insertEpisode(payload.episode);
@@ -716,6 +776,12 @@ export class Projection {
       WHERE a.fact_id IN (${placeholders})
       ORDER BY f2.recorded_at DESC LIMIT ?`).all(...factIds, limit) as Row[];
     return this.getFacts(rows.map(row => String(row.id)));
+  }
+
+  /** Ids of facts left superseded or contradicted before deleting meant deleting. */
+  deadFactIds(scopeId: string): string[] {
+    return (this.stmt(`SELECT id FROM facts WHERE scope_id=? AND standing IN ('superseded','contradicted') LIMIT ?`)
+      .all(scopeId, MAX_PAGE_SIZE * 10) as Row[]).map(row => String(row.id));
   }
 
   activeFacts(scopeId: string, limit = PAGE_SIZE): StoredFact[] {

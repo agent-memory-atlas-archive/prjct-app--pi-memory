@@ -32,7 +32,7 @@ test('records evidence-backed temporal facts and retrieves them through dense sy
   assert.ok(recalled.items[0]?.reason.includes('dense'));
 });
 
-test('superseded temporal facts are excluded now but available before invalidation', async t => {
+test('a superseded fact is deleted: gone now and gone from history', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-engine-'));
   const engine = new MemoryEngine({ root, scopeId: 'p_test', sessionId: 's1', provider: new TestEmbeddingProvider() });
   t.after(async () => { await engine.dispose(); await rm(root, { recursive: true, force: true }); });
@@ -41,8 +41,8 @@ test('superseded temporal facts are excluded now but available before invalidati
   await engine.resolveFact(old.fact.id, 'superseded', 'Schedule changed');
   assert.equal((await engine.search({ queries: ['deploy releases'], dense: false })).items.length, 0);
   const historical = await engine.search({ queries: ['deploy releases'], dense: false, asOf: '2025-06-01T00:00:00.000Z' });
-  assert.equal(historical.items[0]?.id, old.fact.id);
-  assert.ok(Date.parse(engine.projection.getFact(old.fact.id)?.invalidAt ?? '') < Date.parse('2099-01-01T00:00:00.000Z'));
+  assert.equal(historical.items.length, 0, 'deleting is deleting: no history is kept');
+  assert.equal(engine.projection.getFact(old.fact.id), undefined);
 });
 
 test('dense outages leave lexical chunks available for an explicit backfill', async t => {

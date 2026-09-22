@@ -171,11 +171,10 @@ test('cancelling a planned decision leaves an empty interval and deleted facts d
     evidence: [], episodeIds: [], confidence: 0.8, tags: {} };
   const plan = await engine.recordFact({ ...base, statement: 'Zephyr launch policy starts next century', validAt: '2099-01-01T00:00:00.000Z' });
   await engine.resolveFact(plan.fact.id, 'contradicted', 'Cancelled before it starts');
-  assert.equal(engine.projection.getFact(plan.fact.id)?.invalidAt, '2099-01-01T00:00:00.000Z');
+  assert.equal(engine.projection.getFact(plan.fact.id), undefined, 'a contradicted fact is deleted');
   await engine.rebuild();
   assert.equal((await engine.search({ queries: ['Zephyr launch'], dense: false, asOf: '2099-01-01T00:00:00.000Z' })).items.length, 0);
   const seed = await engine.recordFact({ ...base, statement: 'Zephyr current policy' });
-  await engine.remove('memory', plan.fact.id, 'Removed');
   assert.ok(!engine.projection.graphNeighbors([seed.fact.id], 10).some(fact => fact.id === plan.fact.id));
 });
 

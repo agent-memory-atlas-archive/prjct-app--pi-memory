@@ -144,6 +144,21 @@ export class MemoryJournal {
     return operation;
   }
 
+  /**
+   * Run a rewrite of the journal files with appends held back, then continue
+   * this writer's chain from the head the rewrite left, if it touched it.
+   */
+  exclusive<T>(action: (writerId: string) => Promise<T>, head: (result: T) => Readonly<{ sequence: number; eventHash?: string }> | undefined): Promise<T> {
+    const operation = this.serial.then(async () => {
+      const result = await action(this.writerId);
+      const next = head(result);
+      if (next) { this.sequence = next.sequence; this.previousHash = next.eventHash; }
+      return result;
+    });
+    this.serial = operation.catch(() => undefined);
+    return operation;
+  }
+
   async readAll(): Promise<MemoryEvent[]> {
     const eventsRoot = join(this.root, 'events');
     const days = (await readdir(eventsRoot, { withFileTypes: true }).catch(() => []))

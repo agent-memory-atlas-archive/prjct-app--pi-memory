@@ -113,3 +113,26 @@ test('bash caps keep head, tail and a pointer; grep keeps first matches; read is
   assert.equal(capToolOutput('bash', 'short', '/tmp/s.txt'), undefined);
   assert.equal(capToolOutput('bash', log, '/tmp/full.txt', { enabled: false, bashChars: 1, bashHeadChars: 1, searchChars: 1 }), undefined);
 });
+
+test('stale call arguments are stubbed, recent ones kept, and the self_compact note never travels twice', () => {
+  const big = 'x'.repeat(3_000);
+  const call = (id: string, name: string, args: Record<string, unknown>) =>
+    ({ role: 'assistant', content: [{ type: 'toolCall', id, name, arguments: args }] }) as any;
+  const result = (id: string) => ({ role: 'toolResult', toolCallId: id, content: [{ type: 'text', text: 'ok' }] }) as any;
+  const messages = [
+    call('w1', 'write', { path: 'src/a.ts', content: big }), result('w1'),
+    call('b1', 'bash', { command: `echo ${big}` }), result('b1'),
+    call('w2', 'write', { path: 'src/b.ts', content: big }), result('w2'),
+    call('s1', 'self_compact', { note_to_self: 'GOAL: finish the PR' }), result('s1'),
+  ];
+  const { messages: view } = maskObservations(messages, 4, DEFAULT_OBSERVATION_POLICY);
+  const args = (index: number) => (view[index]!.content as any)[0].arguments;
+  assert.equal(args(0).path, 'src/a.ts');
+  assert.match(args(0).content, /elided 3000 chars written/);
+  assert.match(args(2).command, /elided \d+ chars of command/);
+  assert.equal(args(4).content, big, 'a call inside the keep window is untouched');
+  assert.match(args(6).note_to_self, /delivered as the handoff message/);
+  const early = maskObservations(messages, 0, DEFAULT_OBSERVATION_POLICY).messages;
+  assert.match((early[6]!.content as any)[0].arguments.note_to_self, /delivered as the handoff/, 'the note is stubbed even before any frontier');
+  assert.equal(early[0], messages[0], 'nothing else changes before the frontier moves');
+});

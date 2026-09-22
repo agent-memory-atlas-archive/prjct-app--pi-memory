@@ -75,6 +75,13 @@ export const sessionObservationWorthy = (input: Readonly<{
 const NOISE_LINE = /^(?:ok \d+\b|# (?:subtest|pass|fail|tests|suites|duration|cancelled|skipped|todo)\b|---$|\.\.\.$|duration_ms:|type: '|TAP version|at |stack: |location: |\[pi-memory evidence)/iu;
 const DIAGNOSTIC_LINE = /(?:error|fail(?:ed|ure)?\b|exception|cannot|can't|denied|refused|not found|no such|invalid|unexpected|timed? ?out|EACCES|EPERM|ENOENT|EADDRINUSE|ECONNREFUSED|SQLITE_|panic|fatal)/iu;
 const TEST_ASSERTION = /(?:AssertionError|ERR_ASSERTION|^\s*not ok \d+|testCodeFailure)/imu;
+/**
+ * A path that was not there when one tool call looked is a fact about that
+ * moment, not about the project: the file is created, renamed or the guess was
+ * simply wrong. Kept out of memory entirely, the way a red test already is.
+ * Real diagnoses that merely mention a path keep their other lines.
+ */
+const TRANSIENT_PATH = /^(?:\S+:\s*)?(?:ENOENT|ENOTDIR)\b|no such file or directory/iu;
 const MAX_FAILURE_STATEMENT = 320;
 
 /**
@@ -89,7 +96,8 @@ export const sessionFailureStatement = (summary: string): string => {
   if (TEST_ASSERTION.test(redacted)) return '';
   const lines = redacted.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
   const tool = lines[0]?.match(/^(\S+)\s+failed$/u)?.[1];
-  const diagnostic = [...new Set(lines.slice(tool ? 1 : 0).filter(line => !NOISE_LINE.test(line) && DIAGNOSTIC_LINE.test(line)))]
+  const diagnostic = [...new Set(lines.slice(tool ? 1 : 0)
+    .filter(line => !NOISE_LINE.test(line) && !TRANSIENT_PATH.test(line) && DIAGNOSTIC_LINE.test(line)))]
     .slice(0, 3).map(line => line.length > 160 ? `${line.slice(0, 159)}…` : line);
   if (!diagnostic.length) return '';
   const statement = clipSessionSummary(`${tool ? `${tool}: ` : ''}${diagnostic.join(' · ')}`);

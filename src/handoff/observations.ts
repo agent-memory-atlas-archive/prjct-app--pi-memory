@@ -110,14 +110,59 @@ export const nextObservationFrontier = (messages: readonly HandoffMessage[], fro
   return pending >= (force ? 1 : policy.advanceTokens) ? boundary : frontier;
 };
 
+/**
+ * The agent's own arguments are context too: a file written in full, a long
+ * edit, a script pasted into bash. Once stale they are replaced like outputs;
+ * the file is on disk and the command already ran. The self_compact note is
+ * always stubbed: it comes back byte for byte as the next message.
+ */
+const ARG_STUB_CHARS = 1_200;
+const stubArgs = (name: string, args: Record<string, unknown>, stale: boolean): Record<string, unknown> | undefined => {
+  const size = JSON.stringify(args).length;
+  if (name === 'self_compact' && typeof args.note_to_self === 'string') {
+    return { note_to_self: `[pi-memory: note of ${args.note_to_self.length} chars, delivered as the handoff message]` };
+  }
+  if (!stale || size <= ARG_STUB_CHARS) return undefined;
+  if (name === 'write') return { path: args.path, content: `[pi-memory: elided ${String(args.content ?? '').length} chars written; the file is on disk]` };
+  if (name === 'edit') return { path: args.path, edits: `[pi-memory: elided ${size} chars of edits; read the file for its current content]` };
+  if (name === 'bash' && typeof args.command === 'string') return { ...args, command: `${args.command.slice(0, 300)}… [pi-memory: elided ${args.command.length - 300} chars of command]` };
+  return undefined;
+};
+
+const maskArgs = (message: HandoffMessage, stale: boolean): HandoffMessage => {
+  if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
+  const blocks = message.content as { type?: unknown; name?: unknown; arguments?: unknown }[];
+  const content = blocks.map(block => {
+    if (block?.type !== 'toolCall' || typeof block.name !== 'string' || !block.arguments || typeof block.arguments !== 'object') return block;
+    const stub = stubArgs(block.name, block.arguments as Record<string, unknown>, stale);
+    return stub ? { ...block, arguments: stub } : block;
+  });
+  return content.some((block, index) => block !== blocks[index]) ? { ...message, content } as HandoffMessage : message;
+};
+
 /** Same length and order as the input; unchanged messages keep their identity. */
 export const maskObservations = (messages: readonly HandoffMessage[], frontier: number,
   policy: ObservationPolicy): Readonly<{ messages: readonly HandoffMessage[]; maskedTokens: number; masked: number }> => {
-  if (!policy.enabled || frontier <= 0) return { messages, maskedTokens: 0, masked: 0 };
+  if (!policy.enabled) return { messages, maskedTokens: 0, masked: 0 };
+  if (frontier <= 0) {
+    const notes = messages.map(message => maskArgs(message, false));
+    return notes.every((message, index) => message === messages[index])
+      ? { messages, maskedTokens: 0, masked: 0 }
+      : { messages: notes, maskedTokens: 0, masked: 0 };
+  }
   const calls = callsOf(messages);
   const targets = new Map(eligible(messages, calls, policy).filter(item => item.owner < frontier).map(item => [item.index, item.tokens]));
   const stats = { maskedTokens: 0, masked: 0 };
   const view = messages.map((message, index) => {
+    if (message.role === 'assistant') {
+      const masked = maskArgs(message, index < frontier);
+      if (masked !== message) {
+        const saved = estimateHandoffTokens(message) - estimateHandoffTokens(masked);
+        stats.maskedTokens += Math.max(0, saved);
+        stats.masked += 1;
+      }
+      return masked;
+    }
     const tokens = targets.get(index);
     if (tokens === undefined) return message;
     const text = stubFor(message, calls.get(message.toolCallId!), tokens);

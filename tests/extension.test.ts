@@ -30,7 +30,7 @@ test('installs only Pi-native hooks, tools and commands', () => {
   assert.equal(context.promptSnippet, undefined);
   assert.equal(context.promptGuidelines, undefined);
   for (const obsolete of ['scopes', 'dense', 'scoreThreshold']) assert.equal(context.parameters.properties?.[obsolete], undefined);
-  assert.deepEqual(events, ['session_start', 'before_agent_start', 'tool_result', 'turn_end', 'model_select', 'session_before_compact', 'context', 'before_provider_request', 'session_shutdown']);
+  assert.deepEqual(events, ['session_start', 'session_compact', 'session_tree', 'before_agent_start', 'tool_result', 'turn_end', 'model_select', 'session_before_compact', 'context', 'before_provider_request', 'session_shutdown']);
 });
 
 test('explicit public handoff budget reaches the controller', () => {
@@ -92,7 +92,7 @@ test('ordinary prompts do not initialize an unbound checkout', async t => {
   await handlers.get('session_start')!({}, ctx);
   t.after(async () => { await handlers.get('session_shutdown')!({}, ctx); await rm(root, { recursive: true, force: true }); });
   const response = await handlers.get('before_agent_start')!({ prompt: 'Prefer pnpm for this project.', systemPrompt: 'Base.' }, ctx);
-  assert.match(response.systemPrompt, /Pi-memory policy/u);
+  assert.equal(response?.systemPrompt, undefined, 'memory never edits the system prompt: it would break the cached prefix on automated turns');
   await handlers.get('turn_end')!({}, ctx);
   assert.deepEqual(await readdir(home).catch(() => []), []);
 });

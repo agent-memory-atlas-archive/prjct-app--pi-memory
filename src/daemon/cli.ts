@@ -16,6 +16,8 @@ export const parseDaemonArgs = (argv: readonly string[]): { command: string; con
       ...(flag(argv, '--home') ? { home: flag(argv, '--home') } : {}),
       ...(flag(argv, '--provider') ? { provider: flag(argv, '--provider') } : {}),
       ...(flag(argv, '--model') ? { model: flag(argv, '--model') } : {}),
+      ...(flag(argv, '--project') ? { projectId: flag(argv, '--project') } : {}),
+      ...(flag(argv, '--session') ? { sessionFile: flag(argv, '--session') } : {}),
       ...(interval && Number(interval) > 0 ? { intervalMs: Number(interval) } : {}),
     },
   };

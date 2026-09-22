@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { tryCreateSdkAnalyzer } from '../curation/analyzer.ts';
 import { processAvailable } from '../curation/pipeline.ts';
@@ -7,9 +8,14 @@ import { MemoryEngine } from '../engine.ts';
 import { registerKnownSources } from '../sources/install.ts';
 import { SourceRegistry, type SourceAdapter } from '../sources/registry.ts';
 import { memoryDatabasePath, trustedProjectIds } from '../workspace/project-identity.ts';
-import { registeredMemoryProjectIds } from '../workspace/memory-registry.ts';
-import type { DaemonConfig } from './config.ts';
+import { memoryProjectBindings, registeredMemoryProjectIds } from '../workspace/memory-registry.ts';
+import { daemonStateDir, type DaemonConfig } from './config.ts';
 import { GlobalBudgetLedger } from './budget.ts';
+import { applyMaintenance, factJudgeFrom, planMaintenance, runHygiene, type FactJudge, type MaintenanceOptions } from '../retention/maintenance.ts';
+import { backfillProject, createSdkCurator, curateProject, readUserMessages, sessionsDirFor, type Curator } from '../curation/curator.ts';
+import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { createJevCurator, createSdkWriter, type Ask } from '../curation/jev-curator.ts';
+import { createRerankProvider, readRerankConfig } from '../retrieval/rerank.ts';
 
 export type CycleReport = Readonly<{
   scopes: number;
@@ -21,6 +27,12 @@ export type CycleReport = Readonly<{
   outputTokens: number;
   blocked?: string;
   failedScopes?: number;
+  /** Standing changes written by the maintenance pass. */
+  superseded?: number;
+  reviewed?: number;
+  removedDocuments?: number;
+  /** Rules the curator retired, folded or rewrote. */
+  curated?: number;
 }>;
 
 export type CycleOptions = Readonly<{
@@ -31,6 +43,13 @@ export type CycleOptions = Readonly<{
   engines?: readonly MemoryEngine[];
   extraAdapters?: readonly SourceAdapter[];
   signal?: AbortSignal;
+  /**
+   * Revisiting stored facts is what makes memory living rather than a capture
+   * log. `false` keeps a cycle to ingestion only.
+   */
+  maintenance?: MaintenanceOptions | boolean;
+  /** Judges the rule set as a whole with the session's own model. */
+  curator?: Curator;
 }>;
 
 export const discoverProjectIds = async (home: string): Promise<string[]> =>
@@ -62,6 +81,83 @@ const enqueueDueReviews = (engine: MemoryEngine, adapterId: string, now: number,
     added.n += 1;
   }
   return added.n;
+};
+
+/**
+ * Ingestion brings new documents in; this puts the existing ones in order.
+ * It runs after processing so a duplicate published in the same cycle is
+ * already visible, and it never takes the cycle down: memory that could not be
+ * tidied is still memory that works.
+ */
+/**
+ * Jev already judges whether a passage tries to instruct rather than state
+ * something, which is the axis reclassification needs. Resolved per cycle and
+ * never required: no credential means the pass still consolidates and collects,
+ * it just does not reclassify.
+ */
+/** Jev over the global TypeSafe credential, or nothing when there is no key. */
+const jevAsk = async (): Promise<Ask | undefined> => {
+  try {
+    const [{ resolveKey }, { openSecretStore }] = await Promise.all([
+      import('@prjct.app/pi-tui-kit'), import('../security/credentials.ts')]);
+    const resolved = await resolveKey(await openSecretStore());
+    if (!resolved.key) return undefined;
+    const provider = createRerankProvider({ enabled: true, apiKey: resolved.key, timeoutMs: 60_000 });
+    return provider?.ask ? (state, questions, signal) => provider.ask!(state, questions, signal ? { signal } : {}) : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Judgement goes to Jev and only writing to the session model when a TypeSafe
+ * key exists; otherwise the session model does both in one batched call.
+ */
+export const resolveCurator = async (config: DaemonConfig): Promise<Curator | undefined> => {
+  if (!config.provider || !config.model) return undefined;
+  const target = { provider: config.provider, model: config.model };
+  const ask = await jevAsk();
+  const write = ask ? await createSdkWriter(target).catch(() => undefined) : undefined;
+  if (ask && write) return createJevCurator({ ...target, ask, write });
+  return createSdkCurator(target).catch(() => undefined);
+};
+
+const judgeFor = async (engine: MemoryEngine): Promise<FactJudge | undefined> => {
+  try {
+    const [{ resolveKey }, { openSecretStore }] = await Promise.all([
+      import('@prjct.app/pi-tui-kit'), import('../security/credentials.ts')]);
+    const resolved = await resolveKey(await openSecretStore());
+    if (!resolved.key) return undefined;
+    const config = await readRerankConfig(engine.root);
+    const provider = createRerankProvider({ ...config, enabled: config.enabled ?? true, apiKey: resolved.key });
+    return provider ? factJudgeFrom(provider) : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const maintainProject = async (engine: MemoryEngine, options: CycleOptions, totals: {
+  superseded: number; reviewed: number; removedDocuments: number;
+}): Promise<void> => {
+  // Opt-in: un ciclo normal ingiere, no reescribe lo ya guardado.
+  if (options.maintenance === false) return;
+  if (!options.maintenance && !options.config.maintenance) return;
+  const settings = options.maintenance === true || !options.maintenance ? {} : options.maintenance;
+  try {
+    const judge = settings.judge ?? await judgeFor(engine);
+    const plan = await planMaintenance(engine, {
+      embed: texts => engine.embeddings.embed(texts, { inputType: 'passage' }),
+      ...(judge ? { judge } : {}), ...settings,
+    });
+    const applied = await applyMaintenance(engine, plan, {
+      ...(settings.maxActions ? { maxActions: settings.maxActions } : {}),
+    });
+    totals.superseded += applied.superseded + applied.retired;
+    totals.reviewed += applied.reviewed;
+    totals.removedDocuments += applied.removed;
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+  }
 };
 
 const processProject = async (engine: MemoryEngine, options: CycleOptions, totals: {
@@ -105,11 +201,35 @@ const processProject = async (engine: MemoryEngine, options: CycleOptions, total
 
 export const runCycle = async (options: CycleOptions): Promise<CycleReport> => {
   const totals = { queued: 0, processed: 0, modelCalls: 0, embeddingCalls: 0, inputTokens: 0, outputTokens: 0 };
+  const upkeep = { superseded: 0, reviewed: 0, removedDocuments: 0, curated: 0 };
   const scoped = { n: 0, failed: 0 };
   const globalBudget = new GlobalBudgetLedger(options.config.home);
   const processOne = async (engine: MemoryEngine): Promise<void> => {
     try {
-      await processProject(engine, options, totals, globalBudget);
+      // A session-close run only curates. A full run learns from sessions it has
+      // not read yet through Jev + one write per project; the old path spent one
+      // generative call per session document (31 min for 9 projects) and
+      // re-extracted facts it already had on every cycle.
+      if (!options.config.projectId) {
+        const location = (await memoryProjectBindings(options.config.home).catch(() => []))
+          .find(binding => binding.projectId === engine.scopeId)?.location;
+        if (options.curator && location) {
+          const learned = await backfillProject(engine, options.curator, join(daemonStateDir(options.config.home), 'curation'),
+            sessionsDirFor(getAgentDir(), location), options.signal).catch(() => undefined);
+          if (learned) upkeep.curated += learned.added + learned.retired + learned.superseded + learned.rewritten;
+        } else {
+          await processProject(engine, options, totals, globalBudget);
+        }
+        await maintainProject(engine, options, upkeep);
+      }
+      await runHygiene(engine).catch(() => undefined);
+      if (options.curator) {
+        const { sessionFile, projectId } = options.config;
+        const said = sessionFile && projectId === engine.scopeId ? await readUserMessages(sessionFile) : [];
+        const curated = await curateProject(engine, options.curator, join(daemonStateDir(options.config.home), 'curation'), options.signal,
+          said, sessionFile ? sessionFile.split('/').at(-1) : undefined).catch(() => undefined);
+        if (curated) upkeep.curated += curated.added + curated.retired + curated.superseded + curated.rewritten;
+      }
       scoped.n += 1;
     } catch (error) {
       if (options.signal?.aborted) throw error;
@@ -120,7 +240,9 @@ export const runCycle = async (options: CycleOptions): Promise<CycleReport> => {
     if (options.engines) {
       for (const engine of options.engines) await processOne(engine);
     } else {
-      for (const id of await discoverProjectIds(options.config.home)) {
+      // A session-close run touches only the project that session worked in.
+      const ids = options.config.projectId ? [options.config.projectId] : await discoverProjectIds(options.config.home);
+      for (const id of ids) {
         const engine = await MemoryEngine.forScope('project', id, options.owner, { home: options.config.home }).catch(() => undefined);
         if (!engine) { scoped.failed += 1; continue; }
         try { await processOne(engine); } finally { await engine.dispose().catch(() => undefined); }
@@ -132,6 +254,10 @@ export const runCycle = async (options: CycleOptions): Promise<CycleReport> => {
   return {
     scopes: scoped.n, queued: totals.queued, processed: totals.processed, modelCalls: totals.modelCalls,
     embeddingCalls: totals.embeddingCalls, inputTokens: totals.inputTokens, outputTokens: totals.outputTokens,
+    ...(upkeep.superseded ? { superseded: upkeep.superseded } : {}),
+    ...(upkeep.reviewed ? { reviewed: upkeep.reviewed } : {}),
+    ...(upkeep.removedDocuments ? { removedDocuments: upkeep.removedDocuments } : {}),
+    ...(upkeep.curated ? { curated: upkeep.curated } : {}),
     ...(scoped.failed ? { failedScopes: scoped.failed } : {}), ...(options.block ? { blocked: options.block.code } : {}),
   };
 };
@@ -163,7 +289,9 @@ export const runLoop = async (options: CycleOptions, once: boolean): Promise<Cyc
     const resolved = options.analyzer || options.block
       ? { ...(options.analyzer ? { analyzer: options.analyzer } : {}), ...(options.block ? { block: options.block } : {}) }
       : await resolveAnalyzer(options.config);
-    cycle.last = await runCycle({ ...options, ...resolved });
+    // The curator uses the model the session ran on, through the same subscription.
+    const curator = options.curator ?? await resolveCurator(options.config);
+    cycle.last = await runCycle({ ...options, ...resolved, ...(curator ? { curator } : {}) });
     return cycle.last;
   };
   if (once) return tick();

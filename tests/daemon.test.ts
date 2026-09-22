@@ -126,8 +126,9 @@ test('a daemon cycle curates pi-session corrections once, advances its watermark
     seen.push(bundle.text);
     return {
       noChange: false,
-      topic: { id: bundle.identity.externalId, title: 'Session correction', summary: bundle.text },
-      facts: [{ action: 'create', kind: 'correction', epistemic: 'correction', statement: bundle.text,
+      // A real analysis restates the session; copying its raw body is rejected by validation.
+      topic: { id: bundle.identity.externalId, title: 'Session correction', summary: 'The user corrected the package manager and how tokens are referenced.' },
+      facts: [{ action: 'create', kind: 'correction', epistemic: 'correction', statement: 'Use pnpm instead of npm, and reference tokens through the vault.',
         confidence: 1, standing: 'supported', semanticKey: bundle.identity.metadata.semanticKey ?? bundle.identity.externalId,
         excerpt: bundle.text, sourceRefs: [{ adapter: bundle.identity.adapter, namespace: bundle.identity.namespace,
           externalId: bundle.identity.externalId, revision: bundle.identity.revision, observedAt: bundle.identity.observedAt }] }],
@@ -135,12 +136,13 @@ test('a daemon cycle curates pi-session corrections once, advances its watermark
     };
   });
   const first = await runCycle({ config, owner: 'session-daemon', engines: [engine], analyzer });
-  assert.equal(first.modelCalls, 2);
+  // Las dos correcciones son una sola sesion: un documento, una llamada.
+  assert.equal(first.modelCalls, 1);
   assert.ok(engine.projection.activeFacts(engine.scopeId).every(fact => fact.standing === 'supported'));
   assert.ok(engine.projection.activeFacts(engine.scopeId).every(fact => fact.evidence[0]?.provenance === 'declared'));
   assert.ok(seen.every(text => !text.includes(secret)));
   assert.doesNotMatch(JSON.stringify(engine.projection.activeFacts(engine.scopeId)), new RegExp(secret));
-  const marks = engine.curation.adapterFingerprints('pi-session').map(identity => engine.curation.watermark('pi-session', identity.documentKey));
+  const marks = engine.curation.adapterFingerprints('pi-session-digest').map(identity => engine.curation.watermark('pi-session-digest', identity.documentKey));
   assert.ok(marks.every(mark => mark?.outcome === 'published'));
   const second = await runCycle({ config, owner: 'session-daemon', engines: [engine], analyzer });
   assert.equal(second.modelCalls, 0);

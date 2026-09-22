@@ -11,6 +11,7 @@ import { jobIdFor, sanitizeDetail, stillHeld } from '../curation/store.ts';
 import type { CurationJob, CurationStats, JobStatus, SourceIdentity, Spend } from '../curation/types.ts';
 import { sha256 } from '../workspace/project-identity.ts';
 import { CompactAuthority, CompactCapacityError, type CompactState } from './compact-authority.ts';
+import { resign, withoutPurged } from '../retention/purge.ts';
 import type { StoredFact, SyncActivity, SyncRun } from './projection.ts';
 
 export class CompactConflictError extends Error {}
@@ -44,6 +45,8 @@ export type CompactDomainState = {
   activity: SyncActivity;
   sync: Record<string, SyncRun>;
   checkpoints: Record<string, { body: string; updatedAt: number }>;
+  /** Ids of purged facts, kept so no later event brings them back. */
+  purged?: Record<string, number>;
   curation: {
     fingerprints: Record<string, Fingerprint>;
     jobs: Record<string, CurationJob>;
@@ -270,7 +273,8 @@ const insertFact = (state: State, fact: TemporalFact, recordedAt: string): void 
   }
 };
 const applyToState = (state: State, event: MemoryEvent): void => {
-  const payload = event.payload;
+  const payload = withoutPurged(event.payload, new Set(Object.keys(state.purged ?? {})));
+  if (!payload) return;
   if (payload.type === 'document.upserted') upsertDocument(state, payload.document);
   if (payload.type === 'document.deleted') deleteDocumentKey(state, documentKey({ namespace: payload.namespace, externalId: payload.externalId }), event.recordedAt);
   if (payload.type === 'episode.recorded') {
@@ -309,6 +313,48 @@ export class CompactProjection {
 
   hasEvent(id: string): boolean { return Boolean(this.state.applied[id]); }
   apply(event: MemoryEvent): boolean { return this.store.applyEvent(event); }
+
+  purgedFacts(): Set<string> { return new Set(Object.keys(this.state.purged ?? {})); }
+
+  /** The compact twin of Projection.purgeFacts. History lives here too, so it is rewritten and re-signed here. */
+  purgeFacts(ids: readonly string[], _removedEvents: readonly string[] = [], at = Date.now()): { facts: number; documents: number; evidence: number } {
+    if (!ids.length) return { facts: 0, documents: 0, evidence: 0 };
+    return this.store.transaction(() => {
+      const state = this.state;
+      const gone = new Set(ids);
+      const counts = { facts: 0, documents: 0, evidence: 0 };
+      const cited = new Set(ids.flatMap(id => state.factEvidence[id] ?? []));
+      for (const id of ids) {
+        if (state.facts[id]) counts.facts += 1;
+        delete state.facts[id]; delete state.factEvidence[id]; delete state.factEntities[id];
+        delete state.factEpisodes[id]; delete state.usefulness[id];
+        const key = documentKey({ namespace: 'memory', externalId: id });
+        if (state.documents[key]) counts.documents += 1;
+        delete state.documents[key];
+        for (const chunk of Object.keys(state.chunks)) if (state.chunks[chunk]!.documentKey === key) dropChunk(state, chunk);
+        delete state.curation.dependencies[id];
+        state.purged = { ...state.purged ?? {}, [id]: at };
+      }
+      for (const fact of Object.values(state.facts)) if (fact.replacementId && gone.has(fact.replacementId)) delete fact.replacementId;
+      state.links = state.links.filter(link => !gone.has(link.from) && !gone.has(link.to));
+      for (const [key, dependency] of Object.entries(state.curation.dependencies)) if (gone.has(dependency.factId)) delete state.curation.dependencies[key];
+      for (const topic of Object.values(state.curation.topics)) topic.factIds = topic.factIds.filter(id => !gone.has(id));
+      const stillCited = new Set([...Object.values(state.factEvidence).flat(), ...Object.values(state.episodes).flatMap(episode => episode.evidenceIds)]);
+      for (const evidence of cited) if (!stillCited.has(evidence) && state.evidence[evidence]) { delete state.evidence[evidence]; counts.evidence += 1; }
+      // Rewrite history without them and re-sign each writer's chain, which promotion verifies.
+      const kept = state.history.flatMap(event => {
+        const payload = withoutPurged(event.payload, gone);
+        if (!payload) { delete state.applied[event.id]; return []; }
+        return [payload === event.payload ? event : { ...event, payload }];
+      });
+      const writers = new Map<string, MemoryEvent[]>();
+      for (const event of kept) writers.set(event.writerId, [...writers.get(event.writerId) ?? [], event]);
+      const signed = new Map([...writers.values()].flatMap(stream => resign(stream)).map(event => [event.id, event]));
+      state.history = kept.map(event => signed.get(event.id)!);
+      for (const event of state.history) if (state.applied[event.id]) state.applied[event.id] = event.eventHash;
+      return counts;
+    });
+  }
   transaction<T>(action: () => T): T { return this.store.transaction(action); }
 
   getFact(id: string): StoredFact | undefined {
@@ -333,6 +379,11 @@ export class CompactProjection {
   }
 
   getFacts(ids: readonly string[]): StoredFact[] { return ids.flatMap(id => this.getFact(id) ?? []); }
+
+  deadFactIds(scopeId: string): string[] {
+    return Object.values(this.state.facts).filter(fact => fact.scopeId === scopeId
+      && (fact.standing === 'superseded' || fact.standing === 'contradicted')).map(fact => fact.id);
+  }
 
   activeFacts(scopeId: string, limit = 1_000): StoredFact[] {
     return Object.values(this.state.facts)

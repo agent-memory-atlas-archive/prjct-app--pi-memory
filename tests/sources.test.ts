@@ -188,11 +188,11 @@ test('default source registration does not inspect or ingest prjct records', asy
   t.after(() => project.dispose());
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root });
-  assert.deepEqual(registry.list(), ['pi-session']);
+  assert.deepEqual(registry.list(), ['pi-session-digest'], 'la sesion completa es la unidad por defecto');
 
   const engines = scopedEngines('s1', project, { home: root });
   t.after(() => engines.dispose());
-  assert.deepEqual((await registry.syncAll(engines.resolve)).map(r => [r.adapter, r.indexed]), [['pi-session', 0]]);
+  assert.deepEqual((await registry.syncAll(engines.resolve)).map(r => [r.adapter, r.indexed]), [['pi-session-digest', 0]]);
   assert.equal(project.curation.stats().fingerprints, 0);
 });
 
@@ -205,14 +205,14 @@ test('the prjct compatibility adapter is explicit and idempotent', async t => {
   t.after(() => project.dispose());
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root, prjct: {} });
-  assert.deepEqual(registry.list(), ['pi-session', 'prjct-observations']);
+  assert.deepEqual(registry.list(), ['pi-session-digest', 'prjct-observations']);
 
   const engines = scopedEngines('s1', project, { home: root });
   t.after(() => engines.dispose());
   const first = await registry.syncAll(engines.resolve);
-  assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [['pi-session', 0], ['prjct-observations', 1]]);
+  assert.deepEqual(first.map(r => [r.adapter, r.indexed]), [['pi-session-digest', 0], ['prjct-observations', 1]]);
   const second = await registry.syncAll(engines.resolve);
-  assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [['pi-session', 0, 0], ['prjct-observations', 0, 1]]);
+  assert.deepEqual(second.map(r => [r.adapter, r.indexed, r.unchanged]), [['pi-session-digest', 0, 0], ['prjct-observations', 0, 1]]);
   assert.equal(project.projection.stats().documents, 0);
   assert.equal(project.curation.stats().fingerprints, 1);
   await assert.rejects(engines.resolve({ kind: 'team', id: 't_demo' }), /not this project's memory/);
@@ -225,7 +225,7 @@ test('an extra adapter can be registered without changing pi-memory', async t =>
     root, mapping: { namespace: 'my.source' } });
   const registry = new SourceRegistry();
   await registerKnownSources(registry, 'p_test', { home: root, extra: [custom] });
-  assert.deepEqual(registry.list(), ['my-source', 'pi-session']);
+  assert.deepEqual(registry.list(), ['my-source', 'pi-session-digest']);
 });
 
 test('the mailbox root follows the Pi agent directory, not PRJCT_HOME', () => {

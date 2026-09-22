@@ -33,6 +33,8 @@ export const runGc = async (engine: MemoryEngine, now = Date.now()): Promise<{
     plan.removeDocumentKeys.slice(index * 64, (index + 1) * 64));
   for (const batch of batches) await engine.recordGc(batch, plan.retainedDocumentKeys.length);
   engine.projection.gcProjection(new Set(plan.retainedDocumentKeys), engine.vector.provider.model);
+  // Facts deleted since the last pass leave the journal files here, in one rewrite.
+  await engine.compactJournal().catch(() => undefined);
   const after = engine.projection.stats();
   return { removed: plan.removeDocumentKeys.length, retained: plan.retainedDocumentKeys.length,
     bytesBefore: before.bytes, bytesAfter: after.bytes };

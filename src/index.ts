@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { checkpointAndEnqueueLegacy } from './curation/migrate.ts';
@@ -10,6 +11,9 @@ import type { ObservationPolicy } from './handoff/observations.ts';
 import type { HistoryPolicy } from './handoff/history.ts';
 import type { OutputCapPolicy } from './handoff/caps.ts';
 import { installMemoryTools } from './extension/tools.ts';
+import { createChildView, publishChildView } from './extension/child-view.ts';
+import { contextLine, contextPrune, queueContextPrune } from './extension/context-prune.ts';
+import { planSweep, runSweep } from './retention/sweep.ts';
 import { runGc } from './retention/gc.ts';
 import { registerKnownSources, scopedEngines, type SourceInstallOptions } from './sources/install.ts';
 import { SourceRegistry, type SourceSyncResult } from './sources/registry.ts';
@@ -22,6 +26,7 @@ import {
 } from './extension/panel.ts';
 import { memoryPanelSpec, type MemoryOps } from './extension/memory-panel.ts';
 import { brand, openPanel } from '@prjct.app/pi-tui-kit';
+import { ensureEvaluator, evaluatorLine } from './extension/evaluator.ts';
 
 export type MemoryExtensionOptions = Readonly<{
   home?: string; recallThreshold?: number;
@@ -39,10 +44,11 @@ export type MemoryExtensionOptions = Readonly<{
   sources?: Omit<SourceInstallOptions, 'home'>;
 }>;
 
-const USAGE = 'Usage: /memory init | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | checkpoint-wal | migrate-curated | checkpoint {json}';
-const ACTIONS = new Set(['init', 'status', 'sources', 'sync', 'index', 'replay', 'rebuild', 'gc', 'checkpoint-wal', 'migrate-curated', 'checkpoint']);
+const USAGE = 'Usage: /memory init | setup | status | sources | sync [adapter] | index {json} | replay | rebuild | gc | prune | purge [confirm] | checkpoint-wal | migrate-curated | checkpoint {json}';
+const ACTIONS = new Set(['init', 'setup', 'status', 'sources', 'sync', 'index', 'replay', 'rebuild', 'gc', 'prune', 'purge', 'checkpoint-wal', 'migrate-curated', 'checkpoint']);
 const ACTION_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: 'init', label: 'init', description: 'Initialize memory for this checkout' },
+  { value: 'setup', label: 'setup', description: 'Set or rotate the optional TypeSafe evaluator key' },
   { value: 'status', label: 'status', description: 'Show project memory status' },
   { value: 'sources', label: 'sources', description: 'Show source adapters and sync state' },
   { value: 'sync', label: 'sync', description: 'Scan all sources now, or choose an adapter' },
@@ -51,6 +57,8 @@ const ACTION_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: 'replay', label: 'replay', description: 'Replay durable memory history' },
   { value: 'rebuild', label: 'rebuild', description: 'Rebuild the searchable projection' },
   { value: 'gc', label: 'gc', description: 'Run bounded memory garbage collection' },
+  { value: 'prune', label: 'prune', description: 'Remove superseded memory from this session\'s context now' },
+  { value: 'purge', label: 'purge', description: 'Show what dead or junk memory would be deleted for good; purge confirm deletes it' },
   { value: 'checkpoint-wal', label: 'checkpoint-wal', description: 'Checkpoint the SQLite write-ahead log' },
   { value: 'migrate-curated', label: 'migrate-curated', description: 'Queue legacy documents for curation' },
 ];
@@ -167,6 +175,8 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     onSessionStart: () => syncToolVisibility(),
   });
   installMemoryTools(pi, runtime);
+  // Subagents and Team Experts start without extensions; their parent reads memory for them through this view.
+  publishChildView(createChildView({ engine: () => runtime.engine(), search: runtime.search }));
 
 
   const adapterIds = [...new Set([
@@ -176,7 +186,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
   ].filter(id => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id)))].sort();
 
   pi.registerCommand('memory', {
-    description: brand('project memory: panel, init, sync, gc, rebuild'),
+    description: brand('project memory: panel, init, sync, gc, prune, rebuild'),
     getArgumentCompletions: prefix => argumentCompletions(prefix, adapterIds),
     handler: async (args, ctx) => {
       const [first, second] = args.trim().split(/\s+/).filter(Boolean);
@@ -204,9 +214,18 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
                 last: engine.projection.syncState(adapter) ?? null,
               })),
               ...(lastFault.message ? { error: lastFault.message } : {}),
+              ...(contextPrune() ? { context: contextLine(contextPrune()?.status()) } : {}),
             };
           },
-          init: async () => { const done = await runtime.initialize(); return `${done.created ? 'Initialized' : 'Already initialized'} · project ${done.binding.projectId}`; },
+          // The panel is itself a custom screen, so it reports the evaluator
+          // state instead of opening the secret prompt inside it. /memory setup
+          // is the interactive path.
+          init: async () => {
+            const done = await runtime.initialize();
+            const evaluator = await ensureEvaluator({ ...ctx, mode: 'rpc' }, done.engine.root).catch(() => undefined);
+            return `${done.created ? 'Initialized' : 'Already initialized'} · project ${done.binding.projectId}`
+              + (evaluator ? ` · ${evaluatorLine(evaluator.resolved, evaluator.enabled)}` : '');
+          },
           sync: async adapter => {
             const engine = await runtime.engine();
             const results = await syncSources(await sources(engine), ctx.sessionManager.getSessionId(), engine, adapter, options);
@@ -219,6 +238,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
           gc: async () => `GC · ${summary(await runGc(await runtime.engine()))}`,
           checkpointWal: async () => `WAL checkpoint · ${summary((await runtime.engine()).projection.checkpointWal())}`,
           rebuild: async () => `Rebuilt · ${summary(await (await runtime.engine()).rebuild())}`,
+          ...(contextPrune() ? { prune: async () => queueContextPrune(ctx) } : {}),
         };
         try {
           await openPanel(ctx, memoryPanelSpec(ops, await ops.load()));
@@ -237,12 +257,72 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
       if (action === 'init') {
         if (target) throw new Error('Usage: /memory init');
         const initialized = await runtime.initialize();
+        // The evaluator is optional, so it is offered after memory already
+        // exists and never decides whether initialization succeeded. Declining
+        // the prompt leaves a working project, not a failed command.
+        const evaluator = await ensureEvaluator(ctx, initialized.engine.root)
+          .catch(() => undefined);
         await show(resultModel('memory · init', [
           `status ${initialized.created ? 'initialized' : 'already initialized'}`,
           `project ${initialized.binding.projectId}`,
           `checkout ${initialized.binding.checkoutId}`,
           `source ${initialized.binding.source}`,
           `location ${initialized.binding.location}`,
+          ...(evaluator ? [evaluatorLine(evaluator.resolved, evaluator.enabled)] : []),
+        ]));
+        return;
+      }
+      if (action === 'prune') {
+        if (target) throw new Error('Usage: /memory prune');
+        // Context, not the store: it needs no initialized project.
+        await show(resultModel('memory · prune', [queueContextPrune(ctx)]));
+        return;
+      }
+      if (action === 'purge') {
+        if (target && target !== 'confirm') throw new Error('Usage: /memory purge [confirm]');
+        const project = await runtime.engine();
+        const rerank = (await runtime.reranker?.())?.rerank;
+        const ask = rerank?.ask ? (state: Record<string, unknown>, questions: Readonly<Record<string, string>>, signal?: AbortSignal) =>
+          rerank.ask!(state, questions, signal ? { signal } : {}) : undefined;
+        const plan = await planSweep(project, ask);
+        const examples = plan.junk.slice(0, 5).map(item => `junk  ${item.statement.slice(0, 90)}`);
+        if (target !== 'confirm') {
+          await show(resultModel('memory · purge (preview)', [
+            `dead ${plan.dead.length} superseded or contradicted facts`,
+            `junk ${plan.junk.length} live failures that are one run's state${plan.judged ? '' : ' (raw output only: no Jev key)'}`,
+            ...examples,
+            'run /memory purge confirm to back up and delete them for good',
+          ]));
+          return;
+        }
+        const done = await runSweep(project, plan, join(home, 'backups', `purge-${new Date().toISOString().slice(0, 10)}`));
+        await show(resultModel('memory · purge', [
+          `deleted ${done.facts} facts · ${done.documents} documents · ${done.evidence} evidence · ${done.events} journal events`,
+          ...(done.deferred ? [`deferred ${done.deferred} journal streams another session is writing; the next GC finishes them`] : []),
+          `backup ${done.backup ?? 'none needed'}`,
+        ]));
+        return;
+      }
+      if (action === 'setup') {
+        if (target) throw new Error('Usage: /memory setup');
+        // The key is global but the switch that uses it is per project, so
+        // there has to be a project. Say that plainly instead of surfacing a
+        // raw "not initialized" through the host's extension error channel.
+        const project = await runtime.engine().catch(error => {
+          if (error instanceof Error && /not initialized/iu.test(error.message)) return undefined;
+          throw error;
+        });
+        if (!project) {
+          await show(resultModel('memory · setup', [
+            'status not initialized',
+            'run /memory init first — it offers the evaluator key as part of setup',
+          ]));
+          return;
+        }
+        const evaluator = await ensureEvaluator(ctx, project.root, { force: true });
+        await show(resultModel('memory · setup', [
+          evaluatorLine(evaluator.resolved, evaluator.enabled),
+          ...(evaluator.prompted ? [] : ['no terminal UI · set TYPESAFE_API_KEY or run /memory setup in a TUI session']),
         ]));
         return;
       }

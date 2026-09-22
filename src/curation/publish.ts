@@ -13,8 +13,8 @@ import { assertPublishable } from './validate.ts';
 
 const citation = (excerpt: string, identity: SourceIdentity): EvidenceRef => {
   const text = redactSecrets(excerpt).slice(0, 500);
-  const sessionDeclared = identity.adapter === 'pi-session' && identity.trust === 'user';
-  const sessionNative = identity.adapter === 'pi-session' && identity.trust === 'host';
+  const sessionDeclared = sessionDerived(identity) && identity.trust === 'user';
+  const sessionNative = sessionDerived(identity) && identity.trust === 'host';
   return {
     id: `ev_${sha256(`${identity.documentKey}\u0000${identity.revision}\u0000${text}`).slice(0, 24)}`,
     origin: sessionDeclared ? 'user_statement' : sessionNative ? 'host_observation' : 'imported_source',
@@ -46,8 +46,17 @@ export const topicIdFor = (scopeId: string, semanticKey: string): string =>
 export const curatedFactId = (scopeId: string, semanticKey: string, summaryHash: string): string =>
   `mem_${sha256(`curated:${scopeId}:${semanticKey}:${summaryHash}`).slice(0, 32)}`;
 
+/**
+ * Every adapter that derives from this project's own session log, whatever its
+ * granularity. Gating on the exact id let a session digest publish what a
+ * single observation could not, which is the same evidence with a different
+ * wrapper.
+ */
+const SESSION_ADAPTERS = new Set(['pi-session', 'pi-session-digest']);
+const sessionDerived = (identity: SourceIdentity): boolean => SESSION_ADAPTERS.has(identity.adapter);
+
 const sessionFactAllowed = (identity: SourceIdentity, fact: ProposedFact): boolean => {
-  if (identity.adapter !== 'pi-session') return true;
+  if (!sessionDerived(identity)) return true;
   if (fact.kind === 'decision') return false;
   if (identity.kind === 'failure') return ['failure', 'procedure', 'learning'].includes(fact.kind);
   return ['correction', 'constraint', 'preference', 'procedure', 'learning'].includes(fact.kind);
@@ -166,7 +175,7 @@ const prepareBatch = async (engine: MemoryEngine, identity: SourceIdentity,
       existing: [...active, ...facts].map(item => ({ statement: item.statement, kind: item.kind })),
     });
     if (!admission.accept) continue;
-    const sessionEvidence = identity.adapter === 'pi-session' && (identity.trust === 'user' || identity.trust === 'host');
+    const sessionEvidence = sessionDerived(identity) && (identity.trust === 'user' || identity.trust === 'host');
     const standing = fact.standing === 'supported' && !sessionEvidence ? 'needs_review' : fact.standing;
     const explicit = (fact.supersedes ?? []).filter(id => allowed.has(id) || (fact.id && id === fact.id));
     const revise = fact.action === 'revise' && fact.id && allowed.has(fact.id) && activeById.has(fact.id) ? [fact.id] : [];
@@ -336,6 +345,11 @@ export const invalidateDependents = async (engine: MemoryEngine, store: Curation
   standing: 'needs_review' | 'contradicted', rationale: string, revision?: string): Promise<number> => {
   const ids = store.dependents(documentKeyValue, revision);
   const count = { n: 0 };
+  // Read topics first: a contradicted fact is deleted on resolve, tags and all.
+  const topicIds = [...new Set(ids.flatMap(id => {
+    const fact = engine.projection.getFact(id);
+    return fact?.tags.topicId ? [fact.tags.topicId] : [];
+  }))];
   for (const id of ids) {
     const fact = engine.projection.getFact(id);
     if (!fact || fact.standing === 'superseded' || fact.standing === 'contradicted') continue;
@@ -344,10 +358,6 @@ export const invalidateDependents = async (engine: MemoryEngine, store: Curation
   }
   const remaining = engine.projection.activeFacts(engine.scopeId, 1000)
     .filter(fact => fact.tags.sourceDocumentKey !== documentKeyValue && (fact.standing !== 'superseded' && fact.standing !== 'contradicted'));
-  const topicIds = [...new Set(ids.flatMap(id => {
-    const fact = engine.projection.getFact(id);
-    return fact?.tags.topicId ? [fact.tags.topicId] : [];
-  }))];
   for (const topicId of topicIds) {
     const still = remaining.some(fact => fact.tags.topicId === topicId);
     const topic = engine.projection.documentByKey({ namespace: 'memory.topic', externalId: topicId });

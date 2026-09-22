@@ -15,6 +15,8 @@ export type MemoryQuery = Readonly<{
   maxBytes?: number;
   dense?: boolean;
   scoreThreshold?: number;
+  /** Opt out of the optional semantic rerank for this query; a configured provider runs by default. */
+  rerank?: boolean;
   signal?: AbortSignal;
 }>;
 

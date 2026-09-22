@@ -13,6 +13,7 @@ import {
   sessionObservationWorthy,
 } from '../src/sources/session-log.ts';
 import { MemoryEngine } from '../src/engine.ts';
+import { scriptedTranslator } from '../src/curation/translator.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
 
 const ctx = (cwd: string, sessionId = 's1') => ({
@@ -83,6 +84,7 @@ test('failed tools and learnable prompts persist for daemon scan without copying
     { toolName: 'bash', toolCallId: 'c2', isError: false, content: [{ type: 'text', text: 'ok' }] },
     ctx(cwd));
   await handlers.get('turn_end')!({}, ctx(cwd));
+  await runtime.flushed();
   const engine = await MemoryEngine.forProject(cwd, 's1', { home, provider: new TestEmbeddingProvider() });
   t.after(() => engine.dispose());
   const root = sessionLogRoot(engine.scopeId, home);
@@ -101,8 +103,9 @@ test('failed tools and learnable prompts persist for daemon scan without copying
   assert.doesNotMatch(body, /missing script/);
   assert.doesNotMatch(body, /"outcome":"succeeded"/);
   const registry = new SourceRegistry();
-  await registerKnownSources(registry, engine.scopeId, { home });
-  const synced = await registry.sync(async () => engine, 'pi-session');
+  // Sessions are ingested as one digest per session once idle; no wait in a test.
+  await registerKnownSources(registry, engine.scopeId, { home, sessionSettleMs: 0 });
+  const synced = await registry.sync(async () => engine, 'pi-session-digest');
   assert.ok(synced.queued >= 1);
   assert.ok([...engine.projection.eachActiveDocument()].every(document => document.namespace === 'memory'),
     'source sync must not project raw pi.session observations');
@@ -145,6 +148,7 @@ test('a declared correction is supported and recalled by the next session before
   await runtime.initialize();
   await handlers.get('before_agent_start')!({ prompt: 'Never use npm; use pnpm for this repository.', systemPrompt: 'Base' }, ctx(cwd, 'correction-session'));
   await handlers.get('turn_end')!({}, ctx(cwd, 'correction-session'));
+  await runtime.flushed();
   const first = await runtime.engine();
   const correction = first.projection.activeFacts(first.scopeId, 20).find(fact => fact.kind === 'correction');
   assert.equal(correction?.standing, 'supported');
@@ -169,9 +173,10 @@ test('an explicit recuerda declaration is supported and recalled by the next ses
   const runtime = installMemoryHooks(pi, { home });
   await handlers.get('session_start')!({}, ctx(cwd, 'remember-session'));
   await runtime.initialize();
-  const declaration = 'Recuerda usar Zod para validar los límites de la API.';
+  const declaration = 'Remember to use Zod for validating the API boundaries.';
   await handlers.get('before_agent_start')!({ prompt: declaration, systemPrompt: 'Base' }, ctx(cwd, 'remember-session'));
   await handlers.get('turn_end')!({}, ctx(cwd, 'remember-session'));
+  await runtime.flushed();
   const first = await runtime.engine();
   const remembered = first.projection.activeFacts(first.scopeId, 20).find(fact => fact.statement === declaration);
   assert.equal(remembered?.kind, 'procedure');
@@ -181,13 +186,45 @@ test('an explicit recuerda declaration is supported and recalled by the next ses
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'remember-session'));
   await handlers.get('session_start')!({}, ctx(cwd, 'new-session'));
   const recalled = await handlers.get('before_agent_start')!({
-    prompt: '¿Debemos usar Zod para validar los límites de la API?', systemPrompt: 'Base',
+    prompt: 'Should we use Zod for validating the API boundaries?', systemPrompt: 'Base',
   }, ctx(cwd, 'new-session'));
-  assert.match(recalled.message.content, /<project_memory trust="untrusted">[\s\S]*Recuerda usar Zod/);
+  assert.match(recalled.message.content, /<project_memory trust="untrusted">[\s\S]*Remember to use Zod/);
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-session'));
 });
 
-test('a compiler failure is a supported fact and is recalled without a daemon', async t => {
+test('a recuerda declaration is stored in English and recalled by the next session', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'pi-session-remember-es-'));
+  const cwd = join(home, 'work');
+  await mkdir(cwd, { recursive: true });
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const spoken = 'Recuerda usar Zod para validar los límites de la API.';
+  const english = 'Use Zod to validate the API boundaries.';
+  const handlers = new Map<string, (event: any, context: any) => Promise<any>>();
+  const pi = { on(name: string, handler: any) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+  const runtime = installMemoryHooks(pi, { home, translator: scriptedTranslator({ [spoken]: english }) });
+  await handlers.get('session_start')!({}, ctx(cwd, 'remember-es'));
+  await runtime.initialize();
+  await handlers.get('before_agent_start')!({ prompt: spoken, systemPrompt: 'Base' }, ctx(cwd, 'remember-es'));
+  await handlers.get('turn_end')!({}, ctx(cwd, 'remember-es'));
+  await runtime.flushed();
+  const project = await runtime.engine();
+  const fact = project.projection.activeFacts(project.scopeId, 20).find(item => item.statement === english);
+  assert.ok(fact, 'the declaration was translated on the way in');
+  assert.equal(fact.standing, 'supported');
+  assert.equal(fact.evidence[0]?.excerpt, spoken, 'the Spanish words remain the evidence');
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'remember-es'));
+  // Recalled from a Spanish prompt even though what is stored is English: the
+  // reading model matches across languages, which is the whole point of
+  // storing one language and quoting the other.
+  await handlers.get('session_start')!({}, ctx(cwd, 'new-es'));
+  const recalled = await handlers.get('before_agent_start')!({
+    prompt: 'Should we use Zod to validate the API boundaries?', systemPrompt: 'Base',
+  }, ctx(cwd, 'new-es'));
+  assert.match(recalled.message.content, /Use Zod to validate the API boundaries/u);
+  await handlers.get('session_shutdown')!({}, ctx(cwd, 'new-es'));
+});
+
+test('raw compiler output is captured, then retired by hygiene instead of recalled', async t => {
   const home = await mkdtemp(join(tmpdir(), 'pi-session-compiler-'));
   const cwd = join(home, 'work');
   await mkdir(cwd, { recursive: true });
@@ -202,19 +239,16 @@ test('a compiler failure is a supported fact and is recalled without a daemon', 
     content: [{ type: 'text', text: 'error TS2688: Cannot find type definition file for node. Command exited with code 2' }],
   }, ctx(cwd, 'fail-session'));
   await handlers.get('turn_end')!({}, ctx(cwd, 'fail-session'));
+  await runtime.flushed();
   const first = await runtime.engine();
-  const failure = first.projection.activeFacts(first.scopeId, 20).find(fact => fact.kind === 'failure');
-  assert.equal(failure?.standing, 'supported');
-  assert.equal(failure?.evidence[0]?.provenance, 'native_observation');
-  assert.match(failure?.statement ?? '', /error TS2688/);
-  assert.doesNotMatch(failure?.statement ?? '', /^bash failed/u);
-  assert.equal(first.projection.stats().vectors, 0);
+  assert.equal(first.projection.activeFacts(first.scopeId, 20).find(fact => fact.kind === 'failure'), undefined,
+    'raw command output never stays in memory');
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'fail-session'));
   await handlers.get('session_start')!({}, ctx(cwd, 'next-session'));
   const recalled = await handlers.get('before_agent_start')!({
     prompt: 'error TS2688 Cannot find type definition file for node', systemPrompt: 'Base',
   }, ctx(cwd, 'next-session'));
-  assert.match(recalled.message.content, /<project_memory trust="untrusted">[\s\S]*error TS2688/);
+  assert.doesNotMatch(recalled.message.content, /error TS2688/, 'raw command output is retired by hygiene after the turn');
   await handlers.get('session_shutdown')!({}, ctx(cwd, 'next-session'));
 });
 

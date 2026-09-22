@@ -347,7 +347,8 @@ test('publisher change during fat commit does not leave an obsolete fact current
   const job = f.engine.curation.claim('owner', 60_000)!;
   await processJob(f.engine, f.adapters, job, 'owner', options(), new Map());
   const key = f.engine.curation.adapterFingerprints('policies')[0]!.documentKey;
-  assert.ok(f.engine.curation.dependents(key).length >= 1, 'commitBatch did not persist dependencies in the sqlite commit point');
+  // The obsolete fact is deleted with its dependency; any dependency left must point at a fact that exists.
+  assert.ok(f.engine.curation.dependents(key).every(id => f.engine.projection.getFact(id)), 'a dependency outlived its deleted fact');
   const stale = f.engine.projection.activeFacts('p_review', 100).filter(fact => fact.statement.includes('SQLite'));
   assert.equal(stale.length, 0, `obsolete SQLite fact remained current after publisher moved: ${stale.map(fact => fact.id).join(',')}`);
   await f.engine.rebuild();

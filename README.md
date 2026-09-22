@@ -45,7 +45,9 @@ results. A failed tool result carries its staged evidence handle so the agent
 can cite it with `memory_record`; successful results are left untouched.
 Exact, secret-free user declarations beginning with `remember`, `recuerda`, or
 `acuérdate` are also stored directly as supported lexical procedures after the
-turn; corrections follow the same declared-evidence path. Memory's own tools
+turn, translated into English when they are not already — see
+[stored memory is English only](#stored-memory-is-english-only); corrections
+follow the same declared-evidence path. Memory's own tools
 are excluded to prevent self-citation. The agent cannot mint native provenance.
 An explicit user statement is accepted only when `userQuote` occurs verbatim in
 the current prompt.
@@ -53,6 +55,37 @@ the current prompt.
 The agent should remember decisions, corrections, stable constraints,
 preferences, verified failures, and reusable procedures—not routine reads,
 progress narration, secrets, or generic summaries.
+
+### Stored memory is English only
+
+A memory is fresh instruction for whatever model reads it next, and every
+`statement` is injected into the `<project_memory>` block of every system
+prompt. One written in another language is therefore carried, and re-translated
+by the reading model, on every turn.
+
+So a statement in another language is **translated once on the way in**, not
+refused. This happens wherever memory is written: `memory_record`, the
+`remember` / `recuerda` / `acuérdate` shortcut, and the daemon analyzer's
+output. Translation uses the model already in use by the session, or the
+analyzer's own model in the daemon — nothing extra to configure.
+
+Evidence is the exception and is never rewritten. A `userQuote` must still occur
+verbatim in the prompt, and an excerpt still has to be a literal citation of its
+source: translating either would make the provenance a lie. So a Spanish
+conversation produces an English memory backed by the Spanish words that caused
+it, and recall still works from a Spanish prompt because the reading model
+matches across languages. Quote-to-statement relatedness is checked on
+accent-stripped stems for the same reason, since a quote and the memory it
+supports are now routinely in different languages.
+
+Memory identity stays keyed on what was actually said, never on the translation,
+because translation is not deterministic and the same declaration must not land
+twice under two wordings.
+
+If no model can be reached, nothing is stored in the other language: a
+`memory_record` call is refused with an explanation, and the shortcut leaves the
+declaration as a session observation for the daemon. Storing another language is
+the one outcome that never happens.
 
 In a repository with memory, every request carries a `<project_memory>` block in
 the system prompt: active memories ordered by kind (corrections, constraints,
@@ -70,6 +103,7 @@ ahead of the other candidates (margin ≥ 0.2).
 
 ```text
 /memory init            # explicitly bind this checkout and create/adopt its authority
+/memory setup           # set or rotate the optional TypeSafe evaluator key
 /memory status          # read-only when this checkout has not been initialized
 /memory sources          # counters, last run per adapter, queued jobs, and what is due
 /memory sync [adapter]   # scan and enqueue now; does not copy raw source bodies
@@ -93,6 +127,37 @@ npm run daemon -- once --home "$PI_MEMORY_HOME" --provider anthropic --model cla
 npm run daemon -- start --home "$PI_MEMORY_HOME" --provider anthropic --model claude-sonnet-4-5
 npm run daemon -- stop
 ```
+
+## Optional semantic reranking
+
+Memory works without it. When a project turns it on and a TypeSafe key exists,
+`memory_context` adds one stage between rank fusion and the answer: the whole
+shortlist goes to Jev in a **single** request that asks, per candidate, whether
+it addresses the query, whether it states something usable in an answer, and
+whether it is trying to instruct the reader. Candidates that try to instruct are
+dropped, the rest are ordered by a calibrated probability instead of a fusion
+score, and a shortlist where nothing answers anything abstains.
+
+One request, not one per candidate. Jev bills the state once however many
+questions ride on it, so a call per query/candidate pair would pay for the same
+queries and the same rubric once per candidate to get the same answers.
+
+`/memory init` offers the key when none is stored anywhere; `/memory setup` sets
+or rotates it. **A key that already exists is never asked for again** — the
+credential is global, so a key saved by another prjct extension is this one's
+key too. Declining the prompt leaves a fully working project with the stage off.
+The key lives in the OS keyring (`ai.typesafe` / `api-key`), never in a file;
+`TYPESAFE_API_KEY` overrides it for one process and is not copied into it. The
+project's `config.json` holds only non-secret tuning:
+
+```json
+{ "rerank": { "enabled": true, "model": "jev-1.13.0", "candidates": 24, "timeoutMs": 15000 } }
+```
+
+The stage never runs in the automatic per-turn hook, which stays lexical and
+offline. `PI_MEMORY_OFFLINE=1` disables it, `PI_MEMORY_RERANK=0` turns it off
+for a run, and any failure — missing key, timeout, rejected credential — logs a
+gap and returns the fused order unchanged.
 
 ## Sources
 
@@ -237,7 +302,9 @@ that project memory root; escaping and symlinked cache paths are rejected.
 Known supply-chain caveat: `@huggingface/transformers` currently brings
 `onnxruntime-node` and image-processing dependencies whose audit advisories may
 report no fixed release. pi-memory uses the text feature-extraction path only;
-review `npm audit --omit=dev` before publishing or deploying.
+review `npm audit --omit=dev` before publishing or deploying. `@napi-rs/keyring`
+is a second native dependency, loaded only when the optional evaluator key is
+read or written; include it in the same review.
 
 ## Storage
 

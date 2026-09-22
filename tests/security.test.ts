@@ -25,12 +25,19 @@ test('redaction covers common structured secrets without damaging ordinary sk/pk
 });
 
 test('adversarial env-key redaction scales without quadratic growth', () => {
+  // Best of several runs after a warm-up: one sample under a loaded test suite
+  // measures GC pauses and JIT tiers, not the algorithm.
   const elapsed = (size: number): number => {
     const input = `A${'KEY'.repeat(size)}`;
-    const started = performance.now();
-    redactSecrets(input);
-    return Math.max(0.01, performance.now() - started);
+    let best = Infinity;
+    for (let run = 0; run < 5; run += 1) {
+      const started = performance.now();
+      redactSecrets(input);
+      best = Math.min(best, performance.now() - started);
+    }
+    return Math.max(0.01, best);
   };
+  elapsed(4_000);
   const small = elapsed(16_000);
   const large = elapsed(64_000);
   assert.ok(large / small < 12, `redaction scaling ratio ${large / small}`);

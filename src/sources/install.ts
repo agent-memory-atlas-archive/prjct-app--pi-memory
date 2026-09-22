@@ -1,5 +1,6 @@
 import type { MemoryEngine } from '../engine.ts';
 import { memoryHomeFor } from '../workspace/project-identity.ts';
+import { piSessionDigestSource } from './session-digest.ts';
 import { piSessionSource } from './presets.ts';
 import { prjctObservationSource } from './prjct.ts';
 import type { RecordMapping } from './records.ts';
@@ -24,13 +25,29 @@ export type SourceInstallOptions = Readonly<{
   prjct?: PrjctObservationOptions;
   /** Extra adapters registered alongside pi-memory's own session source. */
   extra?: readonly SourceAdapter[];
+  /**
+   * How much of a session the analyser sees at once. `digest` hands it the
+   * whole settled session, which is where the relation between what was tried
+   * and what it means for the repository lives. `observation` restores the
+   * per-record adapter, which can only ever restate one tool failure.
+   */
+  sessionGranularity?: 'digest' | 'observation' | 'both';
+  /** How long a session must be idle before its digest is analysed. */
+  sessionSettleMs?: number;
 }>;
 
 export const registerKnownSources = async (registry: SourceRegistry, projectId: string,
   options: SourceInstallOptions = {}): Promise<readonly string[]> => {
   const home = memoryHomeFor(options.home);
   const scope: AdapterScope = { kind: 'project', id: projectId };
-  registry.register(piSessionSource({ home, scope }));
+  // Medido sobre 85 observaciones reales: por observacion costo $1,54 y produjo
+  // 67 topics, un tercio de ellos reformulando que una ruta no existia. Por
+  // sesion costo $0,30 y produjo 9 hechos utilizables y ningun ruido. El
+  // adaptador por observacion sigue disponible, pero ya no es el de partida.
+  const granularity = options.sessionGranularity ?? 'digest';
+  if (granularity !== 'digest') registry.register(piSessionSource({ home, scope }));
+  if (granularity !== 'observation') registry.register(piSessionDigestSource({ home, scope,
+    ...(options.sessionSettleMs === undefined ? {} : { settleMs: options.sessionSettleMs }) }));
   if (options.prjct) registry.register(prjctObservationSource({
     home: options.prjct.home ?? home,
     scope,

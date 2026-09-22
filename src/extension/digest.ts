@@ -6,6 +6,15 @@ import { factIsValidAt, type MemoryKind, type TemporalFact } from '../contracts/
  * all facts fit. Stable ordering permits retained-context deduplication.
  */
 export const MEMORY_DIGEST_BYTES = 4_000;
+/**
+ * The always-present core: the kinds that shape behavior, bounded. Facts,
+ * learnings and failures reach the model only through per-prompt recall when
+ * they are relevant, so the snapshot stays small and changes rarely. The core
+ * cannot rely on recall: small memories search lexically, and a Spanish prompt
+ * does not lexically match an English rule.
+ */
+export const CORE_DIGEST_BYTES = 1_600;
+export const CORE_KINDS: readonly MemoryKind[] = ['correction', 'constraint', 'preference', 'decision', 'procedure'];
 const MAX_STATEMENT_CHARS = 500;
 
 // What should shape behavior first.
@@ -29,9 +38,11 @@ const line = (fact: TemporalFact): Readonly<{ text: string; whole: boolean }> =>
   return { text: `- ${fact.kind}${fact.standing === 'supported' ? '' : ' (unconfirmed)'}: ${shown}`, whole };
 };
 
-export const memoryDigest = (facts: readonly TemporalFact[], now = Date.now(), budget = MEMORY_DIGEST_BYTES): MemoryDigest => {
+export const memoryDigest = (facts: readonly TemporalFact[], now = Date.now(), budget = MEMORY_DIGEST_BYTES,
+  kinds?: readonly MemoryKind[]): MemoryDigest => {
   const eligible = facts
     .filter(fact => (fact.standing === 'supported' || fact.standing === 'needs_review') && factIsValidAt(fact, now))
+    .filter(fact => !kinds || kinds.includes(fact.kind))
     .sort((a, b) => KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind)
       || a.recordedAt.localeCompare(b.recordedAt) || a.id.localeCompare(b.id));
   if (!eligible.length) return { covered: new Set(), complete: true };

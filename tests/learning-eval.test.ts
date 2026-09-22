@@ -23,17 +23,22 @@ test('four session corrections become supported facts and are recalled after a d
   })) });
   const first = await MemoryEngine.forScope('project', 'p_learning', 'daemon', { home, provider: new TestEmbeddingProvider() });
   const config = await loadDaemonConfig({ home, maxCallsPerDay: 20, maxTokensPerDay: 50_000 });
-  const analyzer = scriptedAnalyzer(bundle => ({
-    noChange: false,
-    topic: { id: bundle.identity.externalId, title: 'Declared correction', summary: bundle.text },
-    facts: [{ action: 'create', kind: 'correction', epistemic: 'correction', statement: bundle.text,
-      confidence: 1, standing: 'supported', semanticKey: bundle.identity.metadata.semanticKey ?? bundle.identity.externalId,
-      excerpt: bundle.text, sourceRefs: [{ adapter: bundle.identity.adapter, namespace: bundle.identity.namespace,
-        externalId: bundle.identity.externalId, revision: bundle.identity.revision, observedAt: bundle.identity.observedAt }] }],
-    conflicts: [],
-  }));
+  // One session is one digest document: its corrections arrive together and
+  // come back as one fact each, never as a copy of the whole body.
+  const analyzer = scriptedAnalyzer(bundle => {
+    const lines = bundle.text.split('\n').filter(line => line.startsWith('- [')).map(line => line.replace(/^- \[[^\]]+\] /u, ''));
+    return {
+      noChange: false,
+      topic: { id: bundle.identity.externalId, title: 'Declared corrections', summary: `${lines.length} corrections declared in one session.` },
+      facts: lines.map((line, index) => ({ action: 'create', kind: 'correction', epistemic: 'correction', statement: line,
+        confidence: 1, standing: 'supported', semanticKey: `${bundle.identity.metadata.semanticKey ?? bundle.identity.externalId}:${index}`,
+        excerpt: line, sourceRefs: [{ adapter: bundle.identity.adapter, namespace: bundle.identity.namespace,
+          externalId: bundle.identity.externalId, revision: bundle.identity.revision, observedAt: bundle.identity.observedAt }] })),
+      conflicts: [],
+    };
+  });
   const report = await runCycle({ config, owner: 'learning-daemon', engines: [first], analyzer });
-  assert.equal(report.modelCalls, cases.length);
+  assert.equal(report.modelCalls, 1, 'one session, one analysis call');
   await first.dispose();
 
   const nextSession = await MemoryEngine.forScope('project', 'p_learning', 'new-session', {

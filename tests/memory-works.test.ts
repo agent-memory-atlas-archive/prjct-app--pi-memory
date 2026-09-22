@@ -8,13 +8,14 @@ import { gitRoot, installMemoryHooks } from '../src/extension/hooks.ts';
 import { installMemoryTools } from '../src/extension/tools.ts';
 import { sessionFailureStatement } from '../src/sources/session-log.ts';
 import { resolveMemoryProject } from '../src/workspace/memory-registry.ts';
+import { scriptedTranslator, type Translator } from '../src/curation/translator.ts';
 import { TestEmbeddingProvider } from './helpers.ts';
 
 process.env.PI_MEMORY_OFFLINE = '1';
 
 type Handler = (event: any, ctx: any) => any;
 
-const harness = async (t: { after(fn: () => unknown): void }, options: { git: boolean }) => {
+const harness = async (t: { after(fn: () => unknown): void }, options: { git: boolean; translator?: Translator }) => {
   const root = await mkdtemp(join(tmpdir(), 'pi-memory-works-'));
   const repo = join(root, 'repo');
   const cwd = join(repo, 'packages', 'app');
@@ -23,16 +24,19 @@ const harness = async (t: { after(fn: () => unknown): void }, options: { git: bo
   const home = join(root, 'home');
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, any>();
+  const sent: any[] = [];
   const pi = {
     on(name: string, handler: Handler) { handlers.set(name, handler); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
+    sendMessage(message: any, sendOptions: any) { sent.push({ message, options: sendOptions }); },
   } as unknown as ExtensionAPI;
-  const runtime = installMemoryHooks(pi, { home, embeddingProvider: new TestEmbeddingProvider() });
+  const runtime = installMemoryHooks(pi, { home, embeddingProvider: new TestEmbeddingProvider(),
+    ...(options.translator ? { translator: options.translator } : {}) });
   installMemoryTools(pi, runtime);
   const ctx = { cwd, sessionManager: { getSessionId: () => 'works-session' }, getContextUsage: () => undefined };
   await handlers.get('session_start')!({}, ctx);
   t.after(async () => { await handlers.get('session_shutdown')!({}, ctx); await rm(root, { recursive: true, force: true }); });
-  return { root, repo, cwd, home, handlers, tools, runtime, ctx };
+  return { root, repo, cwd, home, handlers, tools, runtime, ctx, sent };
 };
 
 test('a subdirectory resolves to its repository root, and home is never a repository', async () => {
@@ -93,14 +97,106 @@ test('a remember declaration initializes repository memory; a tool failure alone
   await failing.handlers.get('tool_result')!({ toolName: 'bash', toolCallId: 'f1', isError: true,
     content: [{ type: 'text', text: 'Error: EACCES: permission denied, open /etc/hosts' }] }, failing.ctx);
   await failing.handlers.get('turn_end')!({}, failing.ctx);
+  await failing.runtime.flushed();
   assert.equal(await resolveMemoryProject(failing.repo, failing.home), undefined);
 
   const declaring = await harness(t, { git: true });
+  await declaring.handlers.get('before_agent_start')!({ prompt: 'remember that we never publish releases without warning', systemPrompt: 'base' }, declaring.ctx);
+  await declaring.handlers.get('turn_end')!({}, declaring.ctx);
+  await declaring.runtime.flushed();
+  assert.ok(await resolveMemoryProject(declaring.repo, declaring.home));
+  const found = await declaring.tools.get('memory_context').execute('c', { action: 'lookup', queries: ['publish releases'] });
+  assert.match(JSON.stringify(found.details.items), /never publish releases/);
+});
+
+test('a declaration in another language is stored translated, quoting what was actually said', async t => {
+  const spoken = 'recuerda que nunca publicamos releases sin avisar';
+  const english = 'Never publish releases without warning first.';
+  const declaring = await harness(t, { git: true, translator: scriptedTranslator({ [spoken]: english }) });
+  await declaring.handlers.get('before_agent_start')!({ prompt: spoken, systemPrompt: 'base' }, declaring.ctx);
+  await declaring.handlers.get('turn_end')!({}, declaring.ctx);
+  await declaring.runtime.flushed();
+  const engine = await declaring.runtime.engine();
+  const fact = engine.projection.activeFacts(engine.scopeId, 20).find(item => item.statement === english);
+  assert.ok(fact, 'the shortcut stored the translation, not the original words');
+  assert.equal(fact.evidence[0]?.provenance, 'declared');
+  assert.equal(fact.evidence[0]?.excerpt, spoken, 'evidence quotes what was actually said');
+});
+
+test('a declaration is not stored untranslated when no model can be reached', async t => {
+  const declaring = await harness(t, { git: true });
   await declaring.handlers.get('before_agent_start')!({ prompt: 'recuerda que nunca publicamos releases sin avisar', systemPrompt: 'base' }, declaring.ctx);
   await declaring.handlers.get('turn_end')!({}, declaring.ctx);
-  assert.ok(await resolveMemoryProject(declaring.repo, declaring.home));
-  const found = await declaring.tools.get('memory_context').execute('c', { action: 'lookup', queries: ['publicamos releases'] });
-  assert.match(JSON.stringify(found.details.items), /nunca publicamos releases/);
+  await declaring.runtime.flushed();
+  const engine = await declaring.runtime.engine().catch(() => undefined);
+  const facts = engine?.projection.activeFacts(engine.scopeId, 20) ?? [];
+  assert.equal(facts.some(fact => /nunca publicamos/u.test(fact.statement)), false);
+});
+
+test('a memory written in another language is translated on the way in', async t => {
+  const spoken = 'El daemon nunca se inicia solo, hay que configurarlo antes de que sincronice.';
+  const english = 'The daemon never starts on its own; configure it before it can sync.';
+  const h = await harness(t, { git: true, translator: scriptedTranslator({ [spoken]: english }) });
+  const recorded = await h.tools.get('memory_record').execute('es', {
+    action: 'remember', kind: 'decision', statement: spoken,
+  });
+  assert.equal(recorded.details.status, 'ok');
+  const engine = await h.runtime.engine();
+  const facts = engine.projection.activeFacts(engine.scopeId, 20);
+  assert.equal(facts.some(fact => fact.statement === english), true, 'the English translation is what is stored');
+  assert.equal(facts.some(fact => /El daemon nunca/u.test(fact.statement)), false);
+});
+
+test('with no model to translate with, the memory is refused rather than stored in another language', async t => {
+  const h = await harness(t, { git: true });
+  await assert.rejects(h.tools.get('memory_record').execute('es', {
+    action: 'remember', kind: 'decision',
+    statement: 'El daemon nunca se inicia solo, hay que configurarlo antes de que sincronice.',
+  }), error => {
+    assert.match((error as Error).message, /must be written in English/u);
+    assert.match((error as Error).message, /userQuote/u);
+    return true;
+  });
+});
+
+test('a translation that is itself not English is rejected instead of trusted', async t => {
+  const spoken = 'El daemon nunca se inicia solo, hay que configurarlo antes de que sincronice.';
+  const h = await harness(t, { git: true, translator: scriptedTranslator({ [spoken]: 'Le daemon ne demarre jamais tout seul, il faut le configurer avant.' }) });
+  await assert.rejects(h.tools.get('memory_record').execute('es', {
+    action: 'remember', kind: 'decision', statement: spoken,
+  }), /must be written in English/u);
+});
+
+test('a Spanish conversation still produces an English memory with the original words as evidence', async t => {
+  const h = await harness(t, { git: true });
+  const spoken = 'recuerda que nunca publicamos releases sin avisar al equipo';
+  await h.handlers.get('before_agent_start')!({ prompt: spoken, systemPrompt: 'base' }, h.ctx);
+  const recorded = await h.tools.get('memory_record').execute('mix', {
+    action: 'remember', kind: 'constraint',
+    statement: 'Never publish a release without warning the team first.',
+    userQuote: spoken,
+  });
+  assert.equal(recorded.details.status, 'ok');
+  const engine = await h.runtime.engine();
+  const fact = engine.projection.activeFacts(engine.scopeId, 20)
+    .find(item => /Never publish a release/u.test(item.statement));
+  assert.ok(fact, 'the English statement is what gets stored and re-injected');
+  // Evidence is the record of what was actually said. Translating it would
+  // make the provenance a lie, so it stays exactly as spoken.
+  assert.equal(fact.evidence.some(item => item.excerpt === spoken), true);
+});
+
+test('an unrelated sentence from the same prompt is still refused as evidence', async t => {
+  const h = await harness(t, { git: true });
+  const prompt = 'recuerda que nunca publicamos releases sin avisar al equipo, y el cafe de la maquina esta horrible';
+  await h.handlers.get('before_agent_start')!({ prompt, systemPrompt: 'base' }, h.ctx);
+  // Loosening relatedness to work across languages must not turn the quote
+  // check into a formality: an unrelated clause still cannot back a memory.
+  await assert.rejects(h.tools.get('memory_record').execute('wrong', {
+    action: 'remember', kind: 'constraint',
+    statement: 'Never publish a release without warning the team first.',
+    userQuote: 'el cafe de la maquina esta horrible',
+  }), /related to the memory statement/u);
 });
 
 test('failure statements keep the diagnosis and drop red tests and runner framing', () => {
@@ -128,9 +224,9 @@ test('memory larger than the digest gets vectors in the background and per-promp
   while (engine.projection.stats().vectors === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   assert.ok(engine.projection.stats().vectors > 0, 'vectors once memory exceeds the digest');
   const result = await h.handlers.get('before_agent_start')!({ prompt: 'why do deploys to the staging cluster fail?', systemPrompt: 'base' }, h.ctx);
-  assert.match(result.message.content, /<project_memory/);
-  assert.doesNotMatch(result.systemPrompt, /kubeconfig context/, 'failures come last and did not fit');
-  assert.match(result.message?.content ?? '', /kubeconfig context points at production/);
+  assert.doesNotMatch(result.message.content, /Service \d+ runbook/, 'facts are not in the core snapshot');
+  assert.doesNotMatch(result.systemPrompt, /kubeconfig context/, 'failures never ride in the system prompt');
+  assert.match(result.message?.content ?? '', /<retained_memory[\s\S]*kubeconfig context points at production/);
 });
 
 test('memory tools are hidden outside repositories and restored inside one', async t => {
@@ -183,4 +279,45 @@ test('a close and distinctive dense match passes the relevance gate for a long n
   assert.deepEqual([...relevantKeys(query, candidates, statistics, new Map([['builds', 0.69], ['pnpm', 0.62], ['theme', 0.61]]))], [],
     'an encoder that scores everything alike proves nothing');
   assert.deepEqual([...relevantKeys(query, candidates, statistics, new Map([['builds', 0.69]]))], [], 'one scored candidate cannot show discrimination');
+});
+
+test('the core snapshot carries rules only, and a new fact does not resend it', async t => {
+  const h = await harness(t, { git: true });
+  await h.tools.get('memory_record').execute('r1', {
+    action: 'remember', kind: 'constraint', statement: 'Open every pull request against the develop branch, never main.',
+  });
+  const first = await h.handlers.get('before_agent_start')!({ prompt: 'ship it', systemPrompt: 'base' }, h.ctx);
+  assert.match(first.message.content, /constraint[^\n]*develop branch/);
+  await h.tools.get('memory_record').execute('f1', {
+    action: 'remember', kind: 'fact', statement: 'The staging database snapshot is refreshed every Monday at noon.',
+  });
+  const second = await h.handlers.get('before_agent_start')!({ prompt: 'ship it again', systemPrompt: 'base' }, h.ctx);
+  assert.doesNotMatch(second.message.content, /<project_memory[^]*staging database/, 'facts never ride in the core');
+  assert.equal(second.message.details.memory.revision, first.message.details.memory.revision,
+    'the revision follows the core, so uniqueMemory drops the repeated snapshot');
+});
+
+test('after a compaction the core goes back in without waiting for a typed prompt', async t => {
+  const h = await harness(t, { git: true });
+  await h.tools.get('memory_record').execute('r1', {
+    action: 'remember', kind: 'procedure', statement: 'After merging, label the Linear ticket ready to verify instead of moving it to Done.',
+  });
+  await h.handlers.get('session_compact')!({}, h.ctx);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].message.customType, 'pi-memory-recall');
+  assert.match(h.sent[0].message.content, /ready to verify/);
+  assert.equal(h.sent[0].options.triggerTurn, false, 'restoring memory never starts a turn');
+});
+
+test('a declaration that restates a stored rule is not stored twice', async t => {
+  const h = await harness(t, { git: true });
+  await h.handlers.get('before_agent_start')!({ prompt: 'remember that we never bulk-generate a content calendar before one representative article passes review', systemPrompt: 'base' }, h.ctx);
+  await h.handlers.get('turn_end')!({}, h.ctx);
+  await h.runtime.flushed();
+  await h.handlers.get('before_agent_start')!({ prompt: 'remember that we do not bulk-generate the content calendar until one representative article has passed review', systemPrompt: 'base' }, h.ctx);
+  await h.handlers.get('turn_end')!({}, h.ctx);
+  await h.runtime.flushed();
+  const engine = await h.runtime.engine();
+  const stored = engine.projection.activeFacts(engine.scopeId, 50).filter(fact => /content calendar/.test(fact.statement));
+  assert.equal(stored.length, 1);
 });
