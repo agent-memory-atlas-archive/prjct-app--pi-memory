@@ -8,7 +8,8 @@ import { factIsValidAt, type MemoryKind } from '../contracts/memory.ts';
 import { renderMemoryEnvelope, type MemoryEnvelope } from '../handoff/memory-envelope.ts';
 import { hostEvidence, MemoryEngine } from '../engine.ts';
 import type { EmbeddingProvider } from '../vector/providers.ts';
-import { CORE_DIGEST_BYTES, CORE_KINDS, memoryDigest } from './digest.ts';
+import { CORE_DIGEST_BYTES, CORE_KINDS, memoryDigest, memoryStatusLine } from './digest.ts';
+import { setMode } from '@prjct.app/pi-tui-kit';
 import { createHandoffController, installHandoffHooks } from '../handoff/hooks.ts';
 import type { HandoffBudget } from '../handoff/select.ts';
 import type { ObservationPolicy } from '../handoff/observations.ts';
@@ -606,8 +607,10 @@ export const installMemoryHooks = (pi: ExtensionAPI, options: {
     // L0 is policy only. Changing facts belong at the append-only message tail,
     // not in the early system prefix. Include empty snapshots to revoke memory.
     const systemPrompt = base;
-    const deliver = (recall?: string, items = 0, omitted = 0) => ({ systemPrompt,
-      message: memoryMessage(revision, digest.block, recall, items, omitted) });
+    const deliver = (recall?: string, items = 0, omitted = 0) => {
+      try { setMode(ctx, 'memory', memoryStatusLine(digest, facts.length, items)); } catch { /* the status line must not cost the prompt */ }
+      return { systemPrompt, message: memoryMessage(revision, digest.block, recall, items, omitted) };
+    };
     // The snapshot already carries all of memory: nothing to search, no encoder.
     if (facts.every(fact => digest.covered.has(fact.id))) return deliver();
     // Search the rest. Small memories stay lexical; for larger ones dense joins
