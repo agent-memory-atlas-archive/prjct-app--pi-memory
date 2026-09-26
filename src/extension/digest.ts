@@ -62,3 +62,16 @@ export const memoryDigest = (facts: readonly TemporalFact[], now = Date.now(), b
     complete: selected.ids.length === eligible.length,
   };
 };
+
+/**
+ * The line above the composer, in words: how many memories the model has in
+ * context this turn, out of how many, and how many were recalled for the
+ * prompt. A token count of the snapshot said nothing to the person.
+ */
+export const memoryStatusLine = (digest: MemoryDigest, total: number, recalled: number): string | undefined => {
+  if (!total) return undefined;
+  const listed = digest.block ? digest.block.split('\n').filter(entry => entry.startsWith('- ')).length : 0;
+  const noun = (count: number): string => count === 1 ? 'memory' : 'memories';
+  const inContext = listed === total ? `${listed} ${noun(listed)} in context` : `${listed} of ${total} ${noun(total)} in context`;
+  return `memory · ${inContext}${recalled ? ` · ${recalled} recalled for this prompt` : ''}`;
+};
