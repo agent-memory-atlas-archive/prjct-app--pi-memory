@@ -18,6 +18,21 @@ const fixture = (text = 'job started', session = 'session-one') => {
   return { messages, entries, manager, resolver, id: resolver(manager, 1, messages[0])! };
 };
 
+/** Reads the paged reference from `id` until it runs out (at most 1000 pages), checking each page fits 512 bytes. */
+/** A counter for side effects observed through a spy; the only mutable state, behind tick() and count(). */
+const counter = () => {
+  const ticks: true[] = [];
+  return { tick: () => { ticks.push(true); }, count: () => ticks.length };
+};
+
+function readPages(manager: any, id: string | undefined, n = 0, parts: readonly string[] = []): { parts: readonly string[]; id: string | undefined } {
+  if (!id || n >= 1000) return { parts, id };
+  const page: any = inspectSessionReferences(manager, [id], 512);
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 512);
+  assert.ok(page.items.length);
+  return readPages(manager, page.items[0].nextId, n + 1, [...parts, page.items[0].data]);
+}
+
 test('complete side-effect invocations recover data only, with stable scoped references and no reasoning or credentials', () => {
   const f = fixture('token=abcdefghijk');
   assert.ok(f.id && Buffer.byteLength(f.id) <= 100);
@@ -68,17 +83,9 @@ test('pending, orphan, duplicate, changed context/source and ambiguous packs can
 test('strict final encoded byte bounds and paging reassemble redacted data, including escapes and Unicode', () => {
   const f = fixture(('😀漢字\\\"\n\t'.repeat(250)) + ' token=abcdefghijk');
   const full: any = inspectSessionReferences(f.manager, [f.id], 32768);
-  const parts: string[] = [];
-  let id: string | undefined = f.id;
-  for (let n = 0; id && n < 1000; n++) {
-    const page: any = inspectSessionReferences(f.manager, [id], 512);
-    assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 512);
-    assert.ok(page.items.length);
-    parts.push(page.items[0].data);
-    id = page.items[0].nextId;
-  }
-  assert.equal(id, undefined);
-  assert.equal(parts.join(''), full.items[0].data);
+  const pages = readPages(f.manager, f.id);
+  assert.equal(pages.id, undefined);
+  assert.equal(pages.parts.join(''), full.items[0].data);
   for (const max of [512, 513, 1024, 4096, 32768]) {
     const multi: any = inspectSessionReferences(f.manager, Array(32).fill(f.id), max);
     assert.ok(Buffer.byteLength(JSON.stringify(multi)) <= max);
@@ -134,26 +141,25 @@ test('verified whole side-effect packs retire without arguments; no backing keep
 
 test('220-round lookup reads target bodies, not all branch bodies', () => {
   const f = fixture();
-  const state = { reads: 0 };
-  const messages: any[] = []; const entries: any[] = [];
-  for (let i = 0; i < 220; i++) {
+  const reads = counter();
+  const built = Array.from({ length: 220 }).reduce<{ messages: any[]; entries: any[] }>((acc, _, i) => {
     const pair = structuredClone(f.messages.slice(0, 2));
     pair[0].content = [pair[0].content[1]]; pair[0].content[0].id = `call${i}`;
     pair[1].toolCallId = `call${i}`;
-    for (const message of pair) {
-      messages.push(message);
+    return pair.reduce((into, message) => {
       const content = message.content;
-      Object.defineProperty(message, 'content', { get: () => { state.reads++; return content; } });
-      entries.push({ type: 'message', id: `e${entries.length}`, parentId: entries.at(-1)?.id ?? null, message });
-    }
-  }
+      Object.defineProperty(message, 'content', { get: () => { reads.tick(); return content; } });
+      return { messages: [...into.messages, message], entries: [...into.entries, { type: 'message', id: `e${into.entries.length}`, parentId: into.entries.at(-1)?.id ?? null, message }] };
+    }, acc);
+  }, { messages: [], entries: [] });
+  const { messages, entries } = built;
   const manager: any = { getSessionId: () => 'large', getBranch: () => entries };
   const resolver = createSessionReferenceResolver(manager, messages, 1);
-  assert.equal(state.reads, 0, 'building the resolver reads no bodies: most requests never look one up');
+  assert.equal(reads.count(), 0, 'building the resolver reads no bodies: most requests never look one up');
   assert.ok(resolver(manager, 1, messages[0]), 'the first lookup indexes the branch once');
-  state.reads = 0;
-  for (let i = 0; i < 20; i++) assert.ok(resolver(manager, 1, messages[0]));
-  assert.ok(state.reads < 500, `target-only content accesses: ${state.reads}`);
+  const afterFirst = reads.count();
+  Array.from({ length: 20 }).forEach(() => assert.ok(resolver(manager, 1, messages[0])));
+  assert.ok(reads.count() - afterFirst < 500, `target-only content accesses: ${reads.count() - afterFirst}`);
 });
 
 

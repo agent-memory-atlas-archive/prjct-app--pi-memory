@@ -29,13 +29,12 @@ test('adversarial env-key redaction scales without quadratic growth', () => {
   // measures GC pauses and JIT tiers, not the algorithm.
   const elapsed = (size: number): number => {
     const input = `A${'KEY'.repeat(size)}`;
-    let best = Infinity;
-    for (let run = 0; run < 5; run += 1) {
+    const samples = Array.from({ length: 5 }, () => {
       const started = performance.now();
       redactSecrets(input);
-      best = Math.min(best, performance.now() - started);
-    }
-    return Math.max(0.01, best);
+      return performance.now() - started;
+    });
+    return Math.max(0.01, Math.min(...samples));
   };
   elapsed(4_000);
   const small = elapsed(16_000);

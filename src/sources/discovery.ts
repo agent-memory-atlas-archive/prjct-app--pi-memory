@@ -1,6 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { homedir } from 'node:os';
 
 /**
  * Scopes are discovered from the marker files prjct publishes, not from
@@ -14,12 +14,11 @@ const TEAM_ID = /^t_[A-Za-z0-9_-]+$/;
 const TEAM_NAME = /^[a-z][a-z0-9-]{0,47}$/;
 
 /**
- * Where pi-team keeps the mailbox and its journal. This is the Pi agent
- * directory, NOT `$PRJCT_HOME`: the durable team store lives under prjct, but
- * the mailbox is agent-local runtime state.
+ * Where pi-team keeps the mailbox and its journal: `$PRJCT_HOME/teams`, the same
+ * store the team markers live in. Pi's own folder is never used for data.
  */
 export const teamMailboxRoot = (override?: string): string =>
-  override ?? join(getAgentDir(), 'teams');
+  override ?? join(process.env.PRJCT_HOME ?? join(homedir(), '.prjct'), 'teams');
 
 const readTeamMarker = async (home: string, id: string): Promise<TeamScope | undefined> => {
   const raw = await readFile(join(home, 'teams', id, 'settings.json'), 'utf8').catch(() => undefined);

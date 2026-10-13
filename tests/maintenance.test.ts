@@ -18,10 +18,10 @@ const engineFor = async (t: { after(fn: () => unknown): void }): Promise<MemoryE
 /** Evidence matters here: a fact recorded without any starts life in
  * `needs_review`, so a pass that only escalates would be indistinguishable from
  * doing nothing. These arrive `supported`, the way a captured user statement does. */
-let evidenceSeq = 0;
+const evidenceSeq = { value: 0 };
 const record = (engine: MemoryEngine, statement: string, kind: string, recordedAt: string) =>
   engine.recordFact({ kind: kind as never, statement, entities: [], episodeIds: [],
-    evidence: [{ id: `ev_declared${(evidenceSeq += 1).toString().padStart(2, '0')}`, origin: 'user_statement',
+    evidence: [{ id: `ev_declared${(evidenceSeq.value += 1).toString().padStart(2, '0')}`, origin: 'user_statement',
       provenance: 'declared', contentHash: '0'.repeat(64), excerpt: statement, observedAt: recordedAt }],
     confidence: 0.8, recordedAt, tags: {} });
 

@@ -1,3 +1,8 @@
+## 0.3.1 (2026-10-12)
+
+- Team discovery reads team markers from `${PRJCT_HOME:-~/.prjct}/teams`, where pi-team writes them, instead of Pi's own folder.
+- Tests run with temporary Pi and prjct folders.
+
 ## 0.3.0 (2026-10-09)
 
 - Memory is on demand. Before a turn nothing is injected: no snapshot, no recall, and no restore after compaction or a tree move. The agent reads memory with `memory_context`, whose description now says what memory holds and when to look it up.
