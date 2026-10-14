@@ -24,6 +24,7 @@
     "./sources": "./src/sources/index.ts"
   },
   "scripts": {
+    "prepublishOnly": "node -e \"if (process.env.GITHUB_ACTIONS !== 'true') { console.error('Publish only from the Release workflow: merge to main.'); process.exit(1); }\"",
     "build": "rm -rf build && mkdir -p build && npm pack --ignore-scripts --pack-destination build >/dev/null && tar -xzf build/*.tgz -C build --strip-components=1 && rm -f build/*.tgz",
     "check": "tsc --noEmit && npm run check:immutable",
     "check:immutable": "node --import tsx scripts/check-immutable.ts",
