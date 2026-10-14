@@ -1,3 +1,16 @@
+## [1.0.0](https://github.com/prjct-app/pi-memory/compare/v0.3.1...v1.0.0) (2026-10-14)
+
+### ⚠ BREAKING CHANGES
+
+* curated facts, memory_record, curation, the daemon,
+retention, handoff masking, embeddings and the child view are removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+* session-history memory with on-demand search, read and summaries ([a6bc833](https://github.com/prjct-app/pi-memory/commit/a6bc833c5a8473dceaf6adaddaff5f982875e5bc))
+
 ## Unreleased
 
 - Breaking: pi-memory is now session-history memory. It indexes Pi's session journals (contentless SQLite FTS5 plus byte pointers; the journals stay the only source of truth) and offers one on-demand tool, `memory_context`: `search` (words, local-day or ISO `since`/`until`, `project`/`session`/`global` scope, kind), `read` (an entry by id, paged) and `summaries` (past compaction summaries).
