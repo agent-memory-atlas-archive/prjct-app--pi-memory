@@ -1,6 +1,6 @@
 {
   "name": "@prjct.app/pi-memory",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi extension: searchable session history — what compaction removed and earlier sessions — read by id or date. Adds one on-demand tool.",
   "type": "module",
   "keywords": [

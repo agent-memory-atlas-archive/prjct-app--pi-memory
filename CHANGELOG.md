@@ -1,3 +1,9 @@
+## [1.0.1](https://github.com/prjct-app/pi-memory/compare/v1.0.0...v1.0.1) (2026-10-15)
+
+### Bug Fixes
+
+* **memory_context:** compact terminal view and exact ticket search ([5a2a360](https://github.com/prjct-app/pi-memory/commit/5a2a36092b616fe42c833bfc5aa36067fc7f7320))
+
 ## [1.0.0](https://github.com/prjct-app/pi-memory/compare/v0.3.1...v1.0.0) (2026-10-14)
 
 ### ⚠ BREAKING CHANGES
