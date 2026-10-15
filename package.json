@@ -35,7 +35,8 @@
   "dependencies": {},
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=1.0.4",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.0.4",
@@ -43,7 +44,8 @@
     "@types/node": "^22.19.0",
     "esbuild": "^0.28.1",
     "typescript": "^5.9.3",
-    "tsx": "^4.20.0"
+    "tsx": "^4.20.0",
+    "@earendil-works/pi-tui": "1.0.4"
   },
   "license": "MIT",
   "repository": {

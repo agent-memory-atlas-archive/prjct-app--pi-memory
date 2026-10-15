@@ -178,8 +178,49 @@ test('the extension adds one tool and one command, and nothing to the context', 
     assert.equal(registered.events.includes(event), false, `${event} is not hooked`);
   }
   assert.ok(registered.tools[0].description.length < 200, 'the description stays short; it rides every request');
-  const ctx = { cwd: f.cwd.be, sessionManager: { getSessionFile: () => path, getSessionId: () => 'live', getCwd: () => f.cwd.be } };
+  const ctx = { cwd: f.cwd.be, sessionManager: { getSessionFile: () => path, getSessionId: () => 'live', getCwd: () => f.cwd.be, getLeafEntry: () => undefined } };
   const result = await registered.tools[0].execute('call', { action: 'search', query: 'autorización' }, undefined, undefined, ctx);
   assert.equal(result.details.entries[0].entryId, 'u1', 'the current journal is indexed before the query');
   await assert.rejects(registered.tools[0].execute('call', { action: 'read' }, undefined, undefined, ctx), /read needs entryId/u);
+});
+
+test('a word joined by punctuation is one phrase, not loose terms', async t => {
+  const f = await fixture(t);
+  await f.journal('be', 's.jsonl', header('s', f.cwd.be)
+    + user('u1', 'revisa el ticket SHIELD-2368 y su adjunto', '2026-10-01T10:00:00.000Z')
+    + toolResult('r1', 'drwxr-xr-x 74 jj staff 2368 Oct 13 (shield) app', '2026-10-01T10:01:00.000Z'));
+  await backfill(f.store, f.sessions);
+  const found = await runHistory(f.store, { action: 'search', query: 'SHIELD-2368' }, { sessionId: 's', cwd: f.cwd.be, home: f.home }) as any;
+  assert.deepEqual(found.entries.map((entry: any) => entry.entryId), ['u1'], 'shield and 2368 far apart do not match');
+});
+
+test('search skips the entry that issued the call and earlier memory_context results', async t => {
+  const f = await fixture(t);
+  await f.journal('be', 'live.jsonl', header('live', f.cwd.be)
+    + user('u1', 'revisa SHIELD-2368', '2026-10-01T10:00:00.000Z')
+    + assistant('a1', 'memory_context search SHIELD-2368', '2026-10-01T10:00:05.000Z')
+    + line({ type: 'message', id: 'r1', parentId: null, timestamp: '2026-10-01T10:00:06.000Z',
+      message: { role: 'toolResult', toolCallId: 'm1', toolName: 'memory_context', content: [{ type: 'text', text: '{"excerpt":"revisa SHIELD-2368"}' }] } }));
+  await backfill(f.store, f.sessions);
+  const context = { sessionId: 'live', cwd: f.cwd.be, home: f.home, callerEntryId: 'a1' };
+  const found = await runHistory(f.store, { action: 'search', query: 'SHIELD-2368' }, context) as any;
+  assert.deepEqual(found.entries.map((entry: any) => entry.entryId), ['u1']);
+  assert.equal(found.totalMatches, 1);
+});
+
+test('the terminal shows one row; entries only when expanded; the model still gets JSON', async () => {
+  const { memoryView } = await import('../src/view.ts');
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+  const details = { status: 'ok', scope: 'project', match: 'all', totalMatches: 2, nextOffset: null,
+    entries: [{ entryId: 'u1', timestamp: '2026-10-15T20:27:42.000Z', kind: 'user', excerpt: 'revisa SHIELD-2368\n con el HTML' },
+      { entryId: 'a1', timestamp: '2026-10-15T20:29:05.000Z', kind: 'assistant', currentSession: true, excerpt: 'No pude leer el HTML' }] };
+  const result = { content: [{ type: 'text', text: JSON.stringify(details) }], details };
+  const context = { args: { action: 'search', query: 'SHIELD-2368' }, isError: false, isPartial: false, executionStarted: true } as any;
+  const collapsed = memoryView.renderResult!(result as any, { expanded: false, isPartial: false }, theme, context).render(120);
+  assert.deepEqual(collapsed, ['✓ MEMORY  search "SHIELD-2368" · 2 matches · project']);
+  const expanded = memoryView.renderResult!(result as any, { expanded: true, isPartial: false }, theme, context).render(120);
+  assert.equal(expanded.length, 5);
+  assert.ok(expanded.every(row => !row.includes('{')), 'no raw JSON on screen');
+  assert.ok(expanded.every(row => row.length <= 120), 'rows fit the width');
+  assert.deepEqual(memoryView.renderCall!(context.args, theme, context).render(120), [], 'the result row replaces the call row');
 });

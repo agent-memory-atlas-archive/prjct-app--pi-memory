@@ -24,7 +24,11 @@ export type HistoryRequest = Readonly<{
   offset?: number;
 }>;
 
-export type HistoryContext = Readonly<{ sessionId: string; cwd: string; home?: string; indexing?: Readonly<{ done: number; files: number }> }>;
+export type HistoryContext = Readonly<{
+  sessionId: string; cwd: string; home?: string; indexing?: Readonly<{ done: number; files: number }>;
+  /** The current-session entry that issued this call; it only echoes the query, so search skips it. */
+  callerEntryId?: string;
+}>;
 
 export const PAGE = 20;
 export const READ_CHARS = 16_000;
@@ -138,7 +142,13 @@ export const runHistory = async (store: HistoryStore, request: HistoryRequest, c
       entries: await Promise.all(hits.map(hit => view(hit, context))),
       nextOffset: offset + hits.length < total ? offset + hits.length : null };
   }
-  const { hits, total, match } = store.search(query, filters, Math.max(CANDIDATES, offset + PAGE));
+  const found = store.search(query, filters, Math.max(CANDIDATES, offset + PAGE));
+  // Earlier memory_context results and the call being answered only repeat entries the search already returns.
+  const isEcho = (hit: EntryHit): boolean => (hit.kind === 'tool_result' && hit.name === 'memory_context')
+    || (hit.entryId === context.callerEntryId && hit.sessionId === context.sessionId);
+  const hits = found.hits.filter(hit => !isEcho(hit));
+  const total = found.total - (found.hits.length - hits.length);
+  const match = found.match;
   const page = rerank(hits, now).slice(offset, offset + PAGE);
   const ranked = Math.min(total, hits.length);
   return { status: page.length ? 'ok' : 'empty', ...scope, match, totalMatches: total, ...indexing,
