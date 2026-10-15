@@ -9,6 +9,7 @@ import { collect, describeCandidates, gcCandidates, type Candidate } from './his
 import { backfill, indexFile, type BackfillProgress } from './history/indexer.ts';
 import { runHistory, type HistoryRequest } from './history/query.ts';
 import { openHistoryStore, type HistoryStore } from './history/store.ts';
+import { memoryView } from './view.ts';
 
 /**
  * Session-history memory. Pi keeps every session journal; this indexes them
@@ -135,8 +136,12 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
     description: 'Search and read session history, including what compaction removed and earlier sessions of this project. '
       + 'Actions: search, read, summaries.',
     parameters,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    ...memoryView,
+    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
       remember(ctx);
+      const leaf = ctx.sessionManager.getLeafEntry();
+      const issuedHere = leaf?.type === 'message' && leaf.message.role === 'assistant'
+        && leaf.message.content.some(part => part.type === 'toolCall' && part.id === toolCallId);
       await indexCurrent();
       const request = params as HistoryRequest;
       if (request.action === 'read' && !request.entryId) {
@@ -144,7 +149,7 @@ export const installMemory = (pi: ExtensionAPI, options: MemoryExtensionOptions 
           + 'scope project (default) | session | global, kind, offset. summaries: since/until, scope, sessionId.');
       }
       const result = await runHistory(store(), request, {
-        sessionId: R.sessionId, cwd: R.cwd,
+        sessionId: R.sessionId, cwd: R.cwd, ...(issuedHere ? { callerEntryId: leaf.id } : {}),
         ...(R.backfill && R.progress ? { indexing: { done: R.progress.done, files: R.progress.files } } : {}),
       });
       return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], details: result };

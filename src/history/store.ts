@@ -67,10 +67,14 @@ const where = (filters: Filters): { sql: string; args: SQLInputValue[] } => {
   return { sql: parts.length ? ` AND ${parts.join(' AND ')}` : '', args };
 };
 
-/** FTS5 query from free text: every term quoted, so punctuation and operators are literal. */
+/**
+ * FTS5 query from free text: every word quoted, so punctuation and operators are literal.
+ * A word joined by punctuation (SHIELD-2368, pi-memory, src/index.ts) is one phrase:
+ * its parts must be adjacent, not anywhere in the entry.
+ */
 export const matchExpression = (query: string, any = false): string | undefined => {
-  const terms = query.match(/[\p{L}\p{N}]+/gu) ?? [];
-  return terms.length ? [...new Set(terms)].map(term => `"${term}"`).join(any ? ' OR ' : ' ') : undefined;
+  const phrases = query.split(/\s+/u).map(word => (word.match(/[\p{L}\p{N}]+/gu) ?? []).join(' ')).filter(Boolean);
+  return phrases.length ? [...new Set(phrases)].map(phrase => `"${phrase}"`).join(any ? ' OR ' : ' ') : undefined;
 };
 
 export const openHistoryStore = (path: string) => {
